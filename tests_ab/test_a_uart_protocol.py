@@ -6,6 +6,7 @@ import pytest
 
 from maixcam2_app_A_quad.serial_protocol import (
     FLAG_ACK_REQUIRED,
+    FLAG_RETRY,
     FRAME_SOF,
     MAX_PAYLOAD_LENGTH,
     MSG_ACK,
@@ -14,6 +15,7 @@ from maixcam2_app_A_quad.serial_protocol import (
     MSG_PUZZLE_RESULT,
     PROTOCOL_VERSION,
     FrameStreamParser,
+    VisionSerialRuntime,
     crc16_ccitt_false,
     decode_ack_payload,
     decode_paper_payload,
@@ -36,6 +38,63 @@ def _make_placements(piece_count):
         )
         for index in range(1, piece_count + 1)
     ]
+
+
+class _FakeClock:
+    """提供可手动推进的单调毫秒时钟，避免可靠性测试依赖真实等待。"""
+
+    def __init__(self, now_ms=0):
+        self.now_ms = int(now_ms)
+
+    def __call__(self):
+        """返回当前测试毫秒值。"""
+        return self.now_ms
+
+    def advance(self, delta_ms):
+        """把测试时间向前推进指定毫秒数。"""
+        self.now_ms += int(delta_ms)
+
+
+class _FakeUart:
+    """模拟Maix UART非阻塞read、完整write和close接口。"""
+
+    def __init__(self, short_write=False):
+        self.writes = []
+        self.reads = []
+        self.short_write = bool(short_write)
+        self.closed = False
+
+    def write(self, data):
+        """记录发送帧；short_write模式故意少报一个字节。"""
+        raw = bytes(data)
+        self.writes.append(raw)
+        return max(0, len(raw) - 1) if self.short_write else len(raw)
+
+    def read(self):
+        """没有测试输入时立即返回空bytes，模拟官方非阻塞read()。"""
+        return self.reads.pop(0) if self.reads else b""
+
+    def close(self):
+        """记录资源释放状态。"""
+        self.closed = True
+
+
+def _decode_writes(fake_uart):
+    """把FakeUart记录的每次完整write解析成协议帧列表。"""
+    parser = FrameStreamParser()
+    frames = []
+    for raw in fake_uart.writes:
+        frames.extend(parser.feed(raw))
+    return frames
+
+
+def _ack_frame(acked_frame, status=0):
+    """为指定发送帧构造F4返回的合法ACK通用帧。"""
+    return encode_frame(
+        MSG_ACK,
+        encode_ack_payload(acked_frame.message_type, acked_frame.sequence, status),
+        sequence=0x9000,
+    )
 
 
 def test_crc16_matches_ccitt_false_standard_vector():
@@ -207,3 +266,216 @@ def test_parser_rejects_wrong_version_and_continues_with_next_frame():
 
     assert len(parsed) == 1
     assert parsed[0].sequence == 3
+
+
+def test_runtime_sends_heartbeat_every_500ms_without_blocking_reads():
+    """轮询可立即返回，且心跳在0、500、1000ms各发送一次。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    runtime = VisionSerialRuntime(lambda: fake_uart, clock_ms=clock)
+
+    runtime.poll(app_state=2)
+    assert [frame.message_type for frame in _decode_writes(fake_uart)] == [MSG_HEARTBEAT]
+
+    fake_uart.writes.clear()
+    clock.advance(499)
+    runtime.poll(app_state=2)
+    assert fake_uart.writes == []
+
+    clock.advance(1)
+    runtime.poll(app_state=3)
+    heartbeat = _decode_writes(fake_uart)
+    assert len(heartbeat) == 1
+    assert heartbeat[0].message_type == MSG_HEARTBEAT
+    assert heartbeat[0].flags == FLAG_ACK_REQUIRED
+
+
+def test_runtime_becomes_online_after_matching_ack_and_offline_after_1500ms():
+    """只有匹配已发送帧的ACK能置在线，ACK超时后自动恢复离线。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    runtime = VisionSerialRuntime(lambda: fake_uart, clock_ms=clock)
+
+    runtime.poll()
+    heartbeat = _decode_writes(fake_uart)[0]
+    assert runtime.link_text == "UART:OFFLINE"
+
+    fake_uart.reads.append(_ack_frame(heartbeat))
+    runtime.poll()
+    assert runtime.link_text == "UART:OK"
+
+    clock.advance(1501)
+    runtime.poll()
+    assert runtime.link_text == "UART:OFFLINE"
+
+
+def test_unmatched_ack_does_not_create_false_online_state():
+    """随机序号ACK不能伪造链路在线状态。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    runtime = VisionSerialRuntime(lambda: fake_uart, clock_ms=clock)
+
+    runtime.poll()
+    fake_uart.reads.append(
+        encode_frame(MSG_ACK, encode_ack_payload(MSG_HEARTBEAT, 0x4321, 0), sequence=2)
+    )
+    runtime.poll()
+
+    assert runtime.link_text == "UART:OFFLINE"
+
+
+def test_reliable_paper_message_retries_same_sequence_and_stops_after_ack():
+    """A4可靠帧250ms后用同序号和RETRY标志重发，ACK后立即移出队列。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    runtime = VisionSerialRuntime(lambda: fake_uart, clock_ms=clock)
+    runtime.poll()
+    fake_uart.writes.clear()
+
+    queued_sequence = runtime.queue_paper_frame("portrait")
+    runtime.poll()
+    first = _decode_writes(fake_uart)[0]
+    assert first.message_type == MSG_PAPER_FRAME
+    assert first.sequence == queued_sequence
+    assert first.flags == FLAG_ACK_REQUIRED
+
+    fake_uart.writes.clear()
+    clock.advance(249)
+    runtime.poll()
+    assert fake_uart.writes == []
+
+    clock.advance(1)
+    runtime.poll()
+    retry = _decode_writes(fake_uart)[0]
+    assert retry.sequence == first.sequence
+    assert retry.flags == FLAG_ACK_REQUIRED | FLAG_RETRY
+
+    fake_uart.reads.append(_ack_frame(retry))
+    runtime.poll()
+    assert runtime.pending_count == 0
+    assert runtime.last_event_text == "A4 ACK"
+
+
+def test_nack_keeps_reliable_message_pending_but_proves_link_is_alive():
+    """F4返回非零状态时保留待发消息，同时确认物理链路确实连通。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    runtime = VisionSerialRuntime(lambda: fake_uart, clock_ms=clock)
+    runtime.poll()
+    fake_uart.writes.clear()
+    runtime.queue_paper_frame("landscape")
+    runtime.poll()
+    paper_frame = _decode_writes(fake_uart)[0]
+
+    fake_uart.reads.append(_ack_frame(paper_frame, status=2))
+    runtime.poll()
+
+    assert runtime.pending_count == 1
+    assert runtime.link_text == "UART:OK"
+    assert runtime.last_event_text == "A4 NACK 2"
+
+
+def test_puzzle_result_is_queued_only_once_per_capture_context():
+    """同一次START即使每帧看到相同规划，也只能创建一个结果序号。"""
+    clock = _FakeClock()
+    runtime = VisionSerialRuntime(lambda: _FakeUart(), clock_ms=clock)
+    placements = _make_placements(3)
+
+    assert runtime.queue_puzzle_result_once("unknown", "portrait", placements) is True
+    assert runtime.queue_puzzle_result_once("unknown", "portrait", placements) is False
+    assert runtime.pending_count == 1
+
+    runtime.reset_result_context()
+    assert runtime.pending_count == 0
+    assert runtime.queue_puzzle_result_once("unknown", "portrait", placements) is True
+
+
+def test_reset_result_context_preserves_pending_manual_a4_frame():
+    """重新START只取消旧机械结果，用户手动发送的A4调试帧仍等待ACK。"""
+    clock = _FakeClock()
+    runtime = VisionSerialRuntime(lambda: _FakeUart(), clock_ms=clock)
+    runtime.queue_paper_frame("portrait")
+    runtime.queue_puzzle_result_once("unknown", "portrait", _make_placements(2))
+
+    runtime.reset_result_context()
+
+    assert runtime.pending_message_types == (MSG_PAPER_FRAME,)
+
+
+def test_factory_failure_retries_later_without_raising_into_visual_loop():
+    """UART打开失败后1000ms重试，poll本身不得把异常抛给相机主循环。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    attempts = []
+
+    def factory():
+        attempts.append(clock())
+        if len(attempts) == 1:
+            raise RuntimeError("busy")
+        return fake_uart
+
+    runtime = VisionSerialRuntime(factory, clock_ms=clock)
+    runtime.poll()
+    assert runtime.link_text == "UART:ERROR"
+    assert attempts == [0]
+
+    clock.advance(999)
+    runtime.poll()
+    assert attempts == [0]
+
+    clock.advance(1)
+    runtime.poll()
+    assert attempts == [0, 1000]
+    assert len(fake_uart.writes) == 1
+
+
+def test_short_write_keeps_message_pending_and_reopens_uart_later():
+    """短写不能被当成成功发送，可靠帧必须保留并等待重新打开串口。"""
+    clock = _FakeClock()
+    short_uart = _FakeUart(short_write=True)
+    good_uart = _FakeUart()
+    devices = [short_uart, good_uart]
+    runtime = VisionSerialRuntime(lambda: devices.pop(0), clock_ms=clock)
+    runtime.queue_paper_frame("portrait")
+
+    runtime.poll()
+    assert runtime.pending_count == 1
+    assert runtime.link_text == "UART:ERROR"
+    assert short_uart.closed is True
+
+    clock.advance(1000)
+    runtime.poll()
+    assert any(frame.message_type == MSG_PAPER_FRAME for frame in _decode_writes(good_uart))
+
+
+def test_sequence_wraps_from_65535_to_zero_without_reusing_pending_frame():
+    """uint16序号达到65535后自然回到0，既有待确认帧仍保留原序号。"""
+    clock = _FakeClock()
+    runtime = VisionSerialRuntime(lambda: _FakeUart(), clock_ms=clock)
+    runtime._next_sequence_value = 0xFFFF
+
+    first = runtime.queue_paper_frame("portrait")
+    second = runtime.queue_paper_frame("landscape")
+
+    assert first == 0xFFFF
+    assert second == 0
+
+
+def test_close_releases_uart_and_stops_future_polling():
+    """应用退出后必须释放设备，后续误调用poll也不能重新打开串口。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return fake_uart
+
+    runtime = VisionSerialRuntime(factory, clock_ms=clock)
+    runtime.poll()
+    runtime.close()
+    clock.advance(1000)
+    runtime.poll()
+
+    assert fake_uart.closed is True
+    assert len(calls) == 1

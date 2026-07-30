@@ -2,6 +2,7 @@
 
 import math
 import struct
+import time as _python_time
 
 
 # 通用帧常量集中定义，F4端必须使用完全相同的数值和小端字节序。
@@ -397,3 +398,362 @@ class FrameStreamParser:
             frames.append(ProtocolFrame(message_type, flags, sequence, payload))
             del self._buffer[:frame_length]
         return frames
+
+
+class _PendingMessage:
+    """保存一条等待ACK的可靠逻辑消息及其下一次发送时刻。"""
+
+    def __init__(self, message_type, sequence, payload, next_send_ms):
+        """初始化待发消息；send_count只在UART完整写入后增加。"""
+        self.message_type = int(message_type)
+        self.sequence = int(sequence)
+        self.payload = bytes(payload)
+        self.send_count = 0
+        self.next_send_ms = int(next_send_ms)
+
+
+class VisionSerialRuntime:
+    """在相机主循环中非阻塞维护UART4心跳、ACK和可靠结果重发。"""
+
+    HEARTBEAT_INTERVAL_MS = 500
+    LINK_TIMEOUT_MS = 1500
+    FAST_RETRY_INTERVAL_MS = 250
+    SLOW_RETRY_INTERVAL_MS = 1000
+    REOPEN_INTERVAL_MS = 1000
+
+    def __init__(self, uart_factory, clock_ms=None):
+        """创建尚未打开串口的通信运行器。
+
+        关键参数uart_factory为无参工厂，成功返回具有read/write/close的UART对象；
+        clock_ms为空时使用Python单调时钟，测试可注入可控时钟。构造过程不打开硬件，
+        第一次poll才尝试初始化，避免模块导入影响PC测试和Maix相机启动。
+        """
+        if not callable(uart_factory):
+            raise ValueError("uart_factory必须可调用")
+        if clock_ms is not None and not callable(clock_ms):
+            raise ValueError("clock_ms必须可调用")
+        self._uart_factory = uart_factory
+        self._clock_ms = clock_ms or (
+            lambda: int(round(_python_time.monotonic() * 1000.0))
+        )
+        started_ms = int(self._clock_ms())
+        self._started_ms = started_ms
+        self._uart = None
+        self._parser = FrameStreamParser()
+        self._next_open_ms = started_ms
+        self._next_heartbeat_ms = started_ms
+        self._next_sequence_value = 0
+        self._pending = {}
+        self._recent_heartbeats = {}
+        self._last_ack_ms = None
+        self._last_event_text = "UART INIT"
+        self._result_queued = False
+        self._closed = False
+
+    def _now_ms(self):
+        """读取并规范化单调毫秒时钟，异常值直接暴露为ValueError。"""
+        try:
+            return int(self._clock_ms())
+        except (TypeError, ValueError) as error:
+            raise ValueError("通信时钟必须返回整数毫秒") from error
+
+    def _next_sequence(self):
+        """分配uint16序号并在65535后自然回到0。"""
+        sequence = self._next_sequence_value
+        self._next_sequence_value = (self._next_sequence_value + 1) & 0xFFFF
+        return sequence
+
+    def _close_uart_after_error(self, now_ms, event_text="UART ERROR"):
+        """发送或读取异常后安全关闭UART，并安排稍后重开。
+
+        待确认消息不会在这里清除，因为重新打开设备后仍需继续发送同一逻辑结果。
+        close本身的异常被忽略，避免资源清理错误覆盖最初通信故障。
+        """
+        uart_object = self._uart
+        self._uart = None
+        if uart_object is not None:
+            try:
+                uart_object.close()
+            except Exception:
+                pass
+        self._next_open_ms = int(now_ms) + self.REOPEN_INTERVAL_MS
+        self._last_event_text = str(event_text)
+
+    def _ensure_uart(self, now_ms):
+        """到达重试时刻时调用硬件工厂；失败只更新状态并返回False。"""
+        if self._uart is not None:
+            return True
+        if now_ms < self._next_open_ms:
+            return False
+        try:
+            uart_object = self._uart_factory()
+            if uart_object is None:
+                raise RuntimeError("UART工厂返回None")
+        except Exception:
+            self._next_open_ms = now_ms + self.REOPEN_INTERVAL_MS
+            self._last_event_text = "UART ERROR"
+            return False
+        self._uart = uart_object
+        self._last_event_text = "UART READY"
+        # 重连后立即发心跳，让F4无需等待旧周期即可确认链路。
+        self._next_heartbeat_ms = now_ms
+        return True
+
+    def _write_complete(self, frame_bytes, now_ms):
+        """执行一次UART写入，只有返回完整长度才视为成功。
+
+        官方write返回实际发送字节数；负值、短写和异常都可能造成F4收到残帧，因此统一
+        关闭设备并稍后重开。返回True表示整帧已经交给驱动，False表示调用方不得推进
+        发送计数或重试阶段。
+        """
+        if self._uart is None:
+            return False
+        try:
+            written = int(self._uart.write(frame_bytes))
+        except Exception:
+            self._close_uart_after_error(now_ms)
+            return False
+        if written != len(frame_bytes):
+            self._close_uart_after_error(now_ms, "UART WRITE ERROR")
+            return False
+        return True
+
+    def _send_heartbeat_if_due(self, now_ms, app_state):
+        """到期时发送一个新心跳，不追赶主循环阻塞期间错过的多个周期。"""
+        if self._uart is None or now_ms < self._next_heartbeat_ms:
+            return
+        payload = encode_heartbeat_payload(
+            (now_ms - self._started_ms) & 0xFFFFFFFF,
+            app_state,
+            0,
+        )
+        sequence = self._next_sequence()
+        frame = encode_frame(
+            MSG_HEARTBEAT,
+            payload,
+            sequence=sequence,
+            flags=FLAG_ACK_REQUIRED,
+        )
+        if self._write_complete(frame, now_ms):
+            self._recent_heartbeats[sequence] = now_ms + self.LINK_TIMEOUT_MS
+            self._next_heartbeat_ms = now_ms + self.HEARTBEAT_INTERVAL_MS
+
+    def _send_pending_if_due(self, now_ms):
+        """按稳定副本遍历所有到期可靠消息，避免ACK处理期间修改字典。"""
+        if self._uart is None:
+            return
+        for pending in tuple(self._pending.values()):
+            if self._uart is None:
+                break
+            if now_ms < pending.next_send_ms:
+                continue
+            flags = FLAG_ACK_REQUIRED
+            if pending.send_count > 0:
+                flags |= FLAG_RETRY
+            frame = encode_frame(
+                pending.message_type,
+                pending.payload,
+                sequence=pending.sequence,
+                flags=flags,
+            )
+            if not self._write_complete(frame, now_ms):
+                break
+            pending.send_count += 1
+            interval_ms = (
+                self.FAST_RETRY_INTERVAL_MS
+                if pending.send_count <= 3
+                else self.SLOW_RETRY_INTERVAL_MS
+            )
+            pending.next_send_ms = now_ms + interval_ms
+
+    def _event_prefix(self, message_type):
+        """把可靠消息类型转换为屏幕使用的短事件名称。"""
+        if message_type == MSG_PAPER_FRAME:
+            return "A4"
+        if message_type == MSG_PUZZLE_RESULT:
+            return "RESULT"
+        if message_type == MSG_HEARTBEAT:
+            return "HEARTBEAT"
+        return f"TYPE {message_type:02X}"
+
+    def _handle_ack(self, frame, now_ms):
+        """验证ACK是否匹配近期心跳或待确认消息，并更新链路与队列。
+
+        随机TYPE/SEQ不会置在线。非零status证明链路存在但表示F4拒绝业务载荷，因此
+        保留可靠消息继续重发；status=0才从队列移除。返回值表示ACK是否匹配。
+        """
+        try:
+            ack = decode_ack_payload(frame.payload)
+        except ValueError:
+            return False
+        acked_type = ack["acked_type"]
+        acked_sequence = ack["acked_sequence"]
+        status = ack["status"]
+        pending_key = (acked_type, acked_sequence)
+
+        matched_heartbeat = (
+            acked_type == MSG_HEARTBEAT
+            and acked_sequence in self._recent_heartbeats
+        )
+        pending = self._pending.get(pending_key)
+        if not matched_heartbeat and pending is None:
+            return False
+
+        self._last_ack_ms = now_ms
+        if matched_heartbeat:
+            self._recent_heartbeats.pop(acked_sequence, None)
+        if pending is not None:
+            prefix = self._event_prefix(acked_type)
+            if status == 0:
+                self._pending.pop(pending_key, None)
+                self._last_event_text = f"{prefix} ACK"
+            else:
+                self._last_event_text = f"{prefix} NACK {status}"
+        return True
+
+    def _read_available(self, now_ms):
+        """执行一次官方非阻塞read，并解析本批次全部ACK帧。"""
+        if self._uart is None:
+            return
+        try:
+            data = self._uart.read()
+        except Exception:
+            self._close_uart_after_error(now_ms)
+            return
+        if not data:
+            return
+        try:
+            frames = self._parser.feed(data)
+        except ValueError:
+            self._last_event_text = "UART RX ERROR"
+            return
+        for frame in frames:
+            if frame.message_type == MSG_ACK:
+                self._handle_ack(frame, now_ms)
+
+    def _prune_heartbeat_sequences(self, now_ms):
+        """删除超过链路窗口的旧心跳序号，限制长期运行内存。"""
+        expired = [
+            sequence
+            for sequence, expires_ms in self._recent_heartbeats.items()
+            if now_ms > expires_ms
+        ]
+        for sequence in expired:
+            self._recent_heartbeats.pop(sequence, None)
+
+    def _queue_reliable(self, message_type, payload, event_text):
+        """替换同类型旧消息并创建一个立即到期的新可靠消息。"""
+        now_ms = self._now_ms()
+        for key in tuple(self._pending):
+            if key[0] == message_type:
+                self._pending.pop(key, None)
+        sequence = self._next_sequence()
+        pending = _PendingMessage(message_type, sequence, payload, now_ms)
+        self._pending[(message_type, sequence)] = pending
+        self._last_event_text = str(event_text)
+        return sequence
+
+    def queue_paper_frame(self, paper_orientation):
+        """排队发送当前方向的完整A4毫米边界，返回分配的uint16序号。"""
+        payload = encode_paper_payload(paper_orientation)
+        return self._queue_reliable(MSG_PAPER_FRAME, payload, "A4 QUEUED")
+
+    def queue_puzzle_result_once(self, mode, paper_orientation, placements):
+        """在当前采集上下文中最多排队一次完整拼图结果。
+
+        返回True表示本次新建了结果，False表示同一START已经排过结果。编码失败会在
+        设置去重标记前抛出，使调用方修正数据后仍可重试。
+        """
+        if self._result_queued:
+            return False
+        payload = encode_puzzle_result_payload(mode, paper_orientation, placements)
+        self._queue_reliable(MSG_PUZZLE_RESULT, payload, "RESULT QUEUED")
+        self._result_queued = True
+        return True
+
+    def reset_result_context(self):
+        """开始新采集上下文时取消旧结果，但保留用户手动A4帧和心跳状态。"""
+        for key in tuple(self._pending):
+            if key[0] == MSG_PUZZLE_RESULT:
+                self._pending.pop(key, None)
+        self._result_queued = False
+
+    def poll(self, app_state=0):
+        """推进一次非阻塞接收、心跳和可靠重发状态机。
+
+        关键参数app_state为心跳携带的uint8界面状态。函数最多执行一次非阻塞read和
+        有限次短帧write，不等待ACK、不sleep；UART打开、读写异常均转为内部状态，
+        不抛入视觉主循环。已调用close后本函数直接返回。
+        """
+        if self._closed:
+            return
+        normalized_state = _validate_uint(app_state, 0xFF, "应用状态")
+        now_ms = self._now_ms()
+        if not self._ensure_uart(now_ms):
+            return
+        self._read_available(now_ms)
+        if self._uart is None:
+            return
+        self._send_heartbeat_if_due(now_ms, normalized_state)
+        self._send_pending_if_due(now_ms)
+        self._prune_heartbeat_sequences(now_ms)
+
+    @property
+    def link_text(self):
+        """返回屏幕使用的UART:OK、UART:OFFLINE或UART:ERROR短状态。"""
+        if self._uart is None:
+            if "ERROR" in self._last_event_text:
+                return "UART:ERROR"
+            return "UART:OFFLINE"
+        now_ms = self._now_ms()
+        if self._last_ack_ms is not None and now_ms - self._last_ack_ms <= self.LINK_TIMEOUT_MS:
+            return "UART:OK"
+        return "UART:OFFLINE"
+
+    @property
+    def last_event_text(self):
+        """返回最近一次通信动作的短文本，供调参按钮反馈使用。"""
+        return self._last_event_text
+
+    @property
+    def pending_count(self):
+        """返回当前等待ACK的A4和结果逻辑消息总数。"""
+        return len(self._pending)
+
+    @property
+    def pending_message_types(self):
+        """返回按数值排序的待确认消息类型，主要用于状态和单元测试。"""
+        return tuple(sorted(key[0] for key in self._pending))
+
+    def close(self):
+        """释放UART并永久停止本运行器后续重开尝试。"""
+        if self._closed:
+            return
+        self._closed = True
+        uart_object = self._uart
+        self._uart = None
+        if uart_object is not None:
+            try:
+                uart_object.close()
+            except Exception:
+                pass
+
+
+def create_maix_uart4():
+    """按Sipeed官方MaixCAM2示例映射并打开UART4。
+
+    主要流程：延迟导入maix模块，把A21/A22分别设为UART4_TX/UART4_RX，再以官方
+    推荐115200波特率打开/dev/ttyS4。默认构造参数即8N1、无流控。返回UART对象；
+    引脚或设备错误由调用方VisionSerialRuntime捕获并转为UART:ERROR。
+    """
+    from maix import err, pinmap, uart
+
+    err.check_raise(
+        pinmap.set_pin_function("A21", "UART4_TX"),
+        "Failed set pin A21 function to UART4_TX",
+    )
+    err.check_raise(
+        pinmap.set_pin_function("A22", "UART4_RX"),
+        "Failed set pin A22 function to UART4_RX",
+    )
+    return uart.UART("/dev/ttyS4", 115200)
