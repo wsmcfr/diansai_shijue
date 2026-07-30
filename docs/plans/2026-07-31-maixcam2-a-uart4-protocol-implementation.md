@@ -69,7 +69,7 @@ Expected: FAIL，原因是 `maixcam2_app_A_quad.serial_protocol` 尚不存在。
 
 ```python
 FRAME_SOF = b"\xAA\x55"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_PAYLOAD_LENGTH = 64
 MSG_HEARTBEAT = 0x01
 MSG_PAPER_FRAME = 0x10

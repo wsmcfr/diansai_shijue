@@ -1,13 +1,15 @@
 """MaixCAM2与STM32F4之间的UART4二进制协议和可靠发送状态机。"""
 
 import math
+import os
 import struct
 import time as _python_time
 
 
 # 通用帧常量集中定义，F4端必须使用完全相同的数值和小端字节序。
 FRAME_SOF = b"\xAA\x55"
-PROTOCOL_VERSION = 1
+# 版本2引入10字节会话心跳；与旧版6字节心跳不兼容，F4必须按版本拒绝混用。
+PROTOCOL_VERSION = 2
 MAX_PAYLOAD_LENGTH = 64
 MAX_RX_BUFFER_LENGTH = 256
 
@@ -180,14 +182,44 @@ def decode_ack_payload(payload):
     }
 
 
-def encode_heartbeat_payload(uptime_ms, app_state, last_error=0):
-    """编码6字节心跳载荷，运行毫秒数按uint32自然回绕。"""
+def encode_heartbeat_payload(session_id, uptime_ms, app_state, last_error=0):
+    """编码10字节心跳载荷，会话ID与运行毫秒数均按uint32发送。"""
     return struct.pack(
-        "<IBB",
+        "<IIBB",
+        _validate_uint(session_id, 0xFFFFFFFF, "启动会话ID"),
         _validate_uint(uptime_ms, 0xFFFFFFFF, "运行毫秒数"),
         _validate_uint(app_state, 0xFF, "应用状态"),
         _validate_uint(last_error, 0xFF, "通信错误码"),
     )
+
+
+def decode_heartbeat_payload(payload):
+    """解析固定10字节心跳，并返回F4去重和状态判断所需字段。"""
+    raw = bytes(payload)
+    if len(raw) != 10:
+        raise ValueError("心跳载荷长度必须是10字节")
+    session_id, uptime_ms, app_state, last_error = struct.unpack("<IIBB", raw)
+    if session_id == 0:
+        raise ValueError("启动会话ID不能为0")
+    return {
+        "session_id": session_id,
+        "uptime_ms": uptime_ms,
+        "app_state": app_state,
+        "last_error": last_error,
+    }
+
+
+def _normalize_session_id(session_id):
+    """生成或校验非零uint32启动会话ID。
+
+    测试可传固定值；设备默认读取4字节系统随机数。随机结果或显式输入为0时统一改为1，
+    确保F4可以把0保留为“尚未收到合法心跳”的哨兵值。返回1至0xFFFFFFFF整数。
+    """
+    if session_id is None:
+        normalized = int.from_bytes(os.urandom(4), "little")
+    else:
+        normalized = _validate_uint(session_id, 0xFFFFFFFF, "启动会话ID")
+    return 1 if normalized == 0 else normalized
 
 
 def encode_paper_payload(paper_orientation):
@@ -421,12 +453,12 @@ class VisionSerialRuntime:
     SLOW_RETRY_INTERVAL_MS = 1000
     REOPEN_INTERVAL_MS = 1000
 
-    def __init__(self, uart_factory, clock_ms=None):
+    def __init__(self, uart_factory, clock_ms=None, session_id=None):
         """创建尚未打开串口的通信运行器。
 
         关键参数uart_factory为无参工厂，成功返回具有read/write/close的UART对象；
-        clock_ms为空时使用Python单调时钟，测试可注入可控时钟。构造过程不打开硬件，
-        第一次poll才尝试初始化，避免模块导入影响PC测试和Maix相机启动。
+        clock_ms为空时使用Python单调时钟，测试可注入可控时钟；session_id为空时生成
+        随机非零uint32，测试可注入固定值。构造过程不打开硬件，第一次poll才初始化。
         """
         if not callable(uart_factory):
             raise ValueError("uart_factory必须可调用")
@@ -438,6 +470,7 @@ class VisionSerialRuntime:
         )
         started_ms = int(self._clock_ms())
         self._started_ms = started_ms
+        self._session_id = _normalize_session_id(session_id)
         self._uart = None
         self._parser = FrameStreamParser()
         self._next_open_ms = started_ms
@@ -523,6 +556,7 @@ class VisionSerialRuntime:
         if self._uart is None or now_ms < self._next_heartbeat_ms:
             return
         payload = encode_heartbeat_payload(
+            self._session_id,
             (now_ms - self._started_ms) & 0xFFFFFFFF,
             app_state,
             0,
@@ -661,12 +695,18 @@ class VisionSerialRuntime:
     def queue_puzzle_result_once(self, mode, paper_orientation, placements):
         """在当前采集上下文中最多排队一次完整拼图结果。
 
-        返回True表示本次新建了结果，False表示同一START已经排过结果。编码失败会在
-        设置去重标记前抛出，使调用方修正数据后仍可重试。
+        返回True表示本次新建了结果，False表示同一START已经排过结果或输入无法编码。
+        NaN、字段缺失和定点溢出会转换为RESULT ERROR，且不会消耗本次结果上下文，
+        防止异常穿透相机主循环，同时允许调用方修正数据后再次排队。
         """
         if self._result_queued:
             return False
-        payload = encode_puzzle_result_payload(mode, paper_orientation, placements)
+        try:
+            payload = encode_puzzle_result_payload(mode, paper_orientation, placements)
+        except Exception:
+            # 协议边界必须吸收任何规划对象结构异常；机械端不会收到半帧或错误目标。
+            self._last_event_text = "RESULT ERROR"
+            return False
         self._queue_reliable(MSG_PUZZLE_RESULT, payload, "RESULT QUEUED")
         self._result_queued = True
         return True
@@ -697,6 +737,11 @@ class VisionSerialRuntime:
         self._send_heartbeat_if_due(now_ms, normalized_state)
         self._send_pending_if_due(now_ms)
         self._prune_heartbeat_sequences(now_ms)
+
+    @property
+    def session_id(self):
+        """返回本次视觉应用启动期间固定不变的非零uint32会话ID。"""
+        return self._session_id
 
     @property
     def link_text(self):
@@ -739,21 +784,63 @@ class VisionSerialRuntime:
                 pass
 
 
+class _MaixUart4Lease:
+    """包装应用独占的UART4对象，并在关闭时恢复Maix默认通信监听。"""
+
+    def __init__(self, uart_object, restore_listener):
+        """保存底层UART和无参恢复回调；两者分别负责数据收发与系统资源归还。"""
+        self._uart_object = uart_object
+        self._restore_listener = restore_listener
+        self._closed = False
+
+    def read(self):
+        """转发官方无参数非阻塞read调用，返回当前可用字节或空值。"""
+        return self._uart_object.read()
+
+    def write(self, data):
+        """转发UART写入并返回底层驱动报告的实际字节数。"""
+        return self._uart_object.write(data)
+
+    def close(self):
+        """只执行一次底层关闭，并在任何关闭结果下尝试恢复默认监听。"""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._uart_object.close()
+        finally:
+            try:
+                self._restore_listener()
+            except Exception:
+                # 应用退出或错误重开时，恢复监听失败不能覆盖最初的UART异常。
+                pass
+
+
 def create_maix_uart4():
     """按Sipeed官方MaixCAM2示例映射并打开UART4。
 
-    主要流程：延迟导入maix模块，把A21/A22分别设为UART4_TX/UART4_RX，再以官方
-    推荐115200波特率打开/dev/ttyS4。默认构造参数即8N1、无流控。返回UART对象；
-    引脚或设备错误由调用方VisionSerialRuntime捕获并转为UART:ERROR。
+    主要流程：延迟导入maix模块，先停止占用UART4的默认Maix Comm监听，再映射
+    A21/A22并以115200打开/dev/ttyS4。打开失败立即恢复监听；成功返回租约包装对象，
+    其close会关闭UART并归还默认监听。默认构造参数即8N1、无流控。
     """
-    from maix import err, pinmap, uart
+    from maix import comm, err, pinmap, uart
 
-    err.check_raise(
-        pinmap.set_pin_function("A21", "UART4_TX"),
-        "Failed set pin A21 function to UART4_TX",
-    )
-    err.check_raise(
-        pinmap.set_pin_function("A22", "UART4_RX"),
-        "Failed set pin A22 function to UART4_RX",
-    )
-    return uart.UART("/dev/ttyS4", 115200)
+    comm.rm_default_comm_listener()
+    try:
+        err.check_raise(
+            pinmap.set_pin_function("A21", "UART4_TX"),
+            "Failed set pin A21 function to UART4_TX",
+        )
+        err.check_raise(
+            pinmap.set_pin_function("A22", "UART4_RX"),
+            "Failed set pin A22 function to UART4_RX",
+        )
+        uart_object = uart.UART("/dev/ttyS4", 115200)
+    except Exception:
+        try:
+            comm.add_default_comm_listener()
+        except Exception:
+            # 原始打开异常决定现场诊断；恢复失败不能把它替换成次生异常。
+            pass
+        raise
+    return _MaixUart4Lease(uart_object, comm.add_default_comm_listener)

@@ -243,24 +243,27 @@ def _cyclic_edge_lengths(vertices):
 
 
 def test_white_solver_cleanup_macro_and_device_short_edges():
-    """默认12mm宏必须清除实机U2/U3伪短边，且不修改输入数组。"""
+    """当前现场宏必须清除实机U2/U3伪短边，且不修改输入数组。"""
     from maixcam2_app_A_quad import assembly_planner
 
-    assert assembly_planner.UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM == pytest.approx(12.0)
+    threshold_mm = assembly_planner.UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM
+    # 该值是用户现场可调宏；测试约束题目20mm真实边以下的安全范围和实际清理行为，
+    # 不再把某一次调参值写死为发布接口。
+    assert 0.0 < threshold_mm < 20.0
     for original in _device_short_edge_pieces():
         before = original.copy()
 
         cleaned, cleanup = assembly_planner._clean_solver_short_edges(
             original,
-            min_edge_mm=assembly_planner.UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM,
+            min_edge_mm=threshold_mm,
         )
 
         assert np.array_equal(original, before)
         assert cleaned is not original
         assert 3 <= len(cleaned) < len(original)
         assert cleanup["removed_count"] == len(original) - len(cleaned)
-        assert cleanup["original_min_edge_mm"] < 12.0
-        assert np.min(_cyclic_edge_lengths(cleaned)) >= 12.0 - 1e-6
+        assert cleanup["original_min_edge_mm"] < threshold_mm
+        assert np.min(_cyclic_edge_lengths(cleaned)) >= threshold_mm - 1e-6
 
 
 def test_white_solver_cleanup_preserves_real_pentagon_and_zero_disables():

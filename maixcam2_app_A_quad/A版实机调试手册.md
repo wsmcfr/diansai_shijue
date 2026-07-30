@@ -1,8 +1,8 @@
 # A版（四边形掩膜）MaixCAM2实机调试手册
 
-> 适用程序：`maixcam2_app_A_quad` v2.0.0
+> 适用程序：`maixcam2_app_A_quad` v2.0.1
 > 适用结构：固定MaixCAM2、横放或竖放黑色A4纸、白色碎片、230×230mm电机范围  
-> 发布包：`dist/diansai_quad-v2.0.0.zip`
+> 发布包：`dist/diansai_quad-v2.0.1.zip`
 
 ## 1. 调试目标
 
@@ -43,17 +43,17 @@
 1. 先固定相机，再固定黑纸，最后调整光源。
 2. 调焦时以碎片边缘清晰为准，不要只看纸张边缘。
 3. 让完整A4尽量占满画面，但四个角不能跑出画面。
-4. 黑纸长边比230mm行程多67mm是已知机械约束；v2.0.0视觉黄色区域默认仍覆盖完整A4，机械可达范围和越界拒绝由F4按实际零点处理。
+4. 黑纸长边比230mm行程多67mm是已知机械约束；v2.0.1视觉黄色区域默认仍覆盖完整A4，机械可达范围和越界拒绝由F4按实际零点处理。
 5. 标定完成后，相机、镜头焦距、黑纸位置或分辨率只要有一个发生变化，就必须重新执行`AUTO ROI`和后续验收。
 
 ## 3. 安装和启动A版
 
-1. 使用`maixcam2_app_A_quad/dist/diansai_quad-v2.0.0.zip`，不要误用历史包或B版压缩包。
+1. 使用`maixcam2_app_A_quad/dist/diansai_quad-v2.0.1.zip`，不要误用历史包或B版压缩包。
 2. 在MaixVision中打开解压后的A版目录作为一个完整工程。
 3. 确认`main.py`、`serial_protocol.py`、`config.py`、`puzzle_vision.py`、`paper_locator.py`、`assembly_planner.py`、`calibration_ui.py`、`settings_store.py`、`template_store.py`、`touch_ui.py`位于同一工程中。
 4. 运行`main.py`。程序正常启动后默认选择`UNKNOWN`的`WHITE`子模式并显示`PRESS START`，此时不会检测碎片。
 
-如果出现`ModuleNotFoundError`，通常是只上传了`main.py`、使用了旧包，或`serial_protocol.py`等模块没有和入口一起部署。重新解压v2.0.0并上传整个A版工程，不要只复制入口文件。
+如果出现`ModuleNotFoundError`，通常是只上传了`main.py`、使用了旧包，或`serial_protocol.py`等模块没有和入口一起部署。重新解压v2.0.1并上传整个A版工程，不要只复制入口文件。
 
 设备上的持久化文件如下：
 
@@ -75,7 +75,7 @@
 | `START` | 按当前模式和材料开始检测；再次点击会清空旧快照并从下一帧重新采集 |
 | `CAL` | 进入调参界面；再次点击退出，保留模式选择但回到待机，必须重新START |
 
-正常识别页和CAL页的画面范围不同：正常页已有ROI时只显示等比例A4纸面，纸外区域为纯黑；CAL页仍显示原始相机画面，便于观察完整A4四角、龙门架遮挡和AUTO ROI候选。正常页只检测黄色框以内；v2.0.0黄色框可等于完整蓝框，但这只扩大视觉检测和目标显示范围，不代表F4机械一定可达。
+正常识别页和CAL页的画面范围不同：正常页已有ROI时只显示等比例A4纸面，纸外区域为纯黑；CAL页仍显示原始相机画面，便于观察完整A4四角、龙门架遮挡和AUTO ROI候选。正常页只检测黄色框以内；v2.0.1黄色框可等于完整蓝框，但这只扩大视觉检测和目标显示范围，不代表F4机械一定可达。
 
 ### 4.2 单次快照状态
 
@@ -320,7 +320,7 @@ TH参数中间值按钮的操作：
 
 ## 8. KNOWN模式调试
 
-KNOWN模式适用于题目图2中形状固定、目标尺寸固定为100×60mm的四片碎片。v2.0.0的`SAVE`不再猜拼法：赛前先把四片按题图正确拼在红线下方，按`KNOWN → START → SAVE`同步验收联合矩形并登记K1～K4；正式运行时再把四片随机放在红线上方，点击START后最多比较24种模板分配并输出下半区目标。
+KNOWN模式适用于题目图2中形状固定、目标尺寸固定为100×60mm的四片碎片。v2.0.1的`SAVE`不再猜拼法：赛前先把四片按题图正确拼在红线下方，按`KNOWN → START → SAVE`同步验收联合矩形并登记K1～K4；正式运行时再把四片随机放在红线上方，点击START后最多比较24种模板分配并输出下半区目标。
 
 ### 8.1 首次自动登记
 
@@ -367,7 +367,7 @@ SAVE内部依次执行：筛选四片下半区完整轮廓、验证联合矩形�
 KNOWN N=4 EDGE=0 TH=... PLAN KNOWN_NEEDS_FOUR
 ```
 
-v2.0.0中它表示当前没有四个可用于KNOWN运行规划的上半区碎片，或设备载入的模板不足四个：
+v2.0.1中它表示当前没有四个可用于KNOWN运行规划的上半区碎片，或设备载入的模板不足四个：
 
 - `N=4`不等于“上半区可规划碎片为4片”，它只说明识别层找到了4个完整轮廓。
 - `N=4`只统计整张黄色区域中4个`complete=True`的完整轮廓，不区分上半区、下半区或跨线。
@@ -393,7 +393,7 @@ v2.0.0中它表示当前没有四个可用于KNOWN运行规划的上半区碎片
 4. 静止后观察`STABLE 1/3 → STABLE 2/3 → PLAN OK N=4`；已保存KNOWN模板只做最多24种匹配，通常不会停留在`SOLVING`。
 5. 检查每片的橙色箭头、彩色目标轮廓、目标中心坐标和`R±角度`是否合理。
 
-KNOWN运行时最多比较`4! = 24`种模板分配。v2.0.0会把每个闭合轮廓等弧长重采样为32点，所以小毛刺造成4/5顶点跳变时不会立刻清零；中心稳定容差为3mm，仍严格要求连续3帧。形状匹配阈值为1.60，允许约2mm边缘反光误差，但不允许镜像或明显异形。若仍显示`LOCKED PLAN KNOWN_MATCH_FAILED`，通常是蓝框方向/毫米换算不准、轮廓变化已经超过小毛刺、碎片翻面，或模板不是当前四片；处理后再次点击START重拍。
+KNOWN运行时最多比较`4! = 24`种模板分配。v2.0.1会把每个闭合轮廓等弧长重采样为32点，所以小毛刺造成4/5顶点跳变时不会立刻清零；中心稳定容差为3mm，仍严格要求连续3帧。形状匹配阈值为1.60，允许约2mm边缘反光误差，但不允许镜像或明显异形。若仍显示`LOCKED PLAN KNOWN_MATCH_FAILED`，通常是蓝框方向/毫米换算不准、轮廓变化已经超过小毛刺、碎片翻面，或模板不是当前四片；处理后再次点击START重拍。
 
 ## 9. UNKNOWN模式调试
 
@@ -404,19 +404,19 @@ UNKNOWN模式支持1～4片、每片3～5边，尝试把碎片拼成约90×50mm�
 | `WHITE` | 白纸覆膜、局部露铁、反光但没有需要连续匹配的印刷图案 | 找到第一个通过尺寸、填充和重叠硬条件的矩形立即结束，速度最快 |
 | `CARD` | 扑克牌或其他必须比较接缝花纹的印刷碎片 | 找到首解后继续有限比较花纹；达到截止线时返回当前最优合法解 |
 
-v2.0.0继续使用v1.9.2的三层WHITE求解器，不修改三片和四片算法。第一层执行K230参考算法思路的`GRAPH_AUTO`：先在不修改屏幕轮廓的求解副本中合并小于12mm的反光伪短边，再最多保留32条整边候选、枚举最多90组连通关系。第二层只在恰好四片且GRAPH无解时执行`FOUR_FAST`：恢复原始锁定顶点，复用整边与T形`segmented`分段接缝，按两片、三片、四片逐层全局排序，每层保留最多32个父状态，并在工作量预算内逐个实际展开；日志中的`parents`记录真正开始展开的数量，而不是保留数量。FOURFAST另有默认1.5秒CPU活动子预算，达到后正常结束快路径，下一帧进入原FALLBACK，不会把整个UNKNOWN任务判成超时。中间判断优先用凸多边形/耳切三角形几何求交代替反复创建MASK。CARD跳过前两层，始终使用原始顶点和纹理择优。
+v2.0.1继续使用v1.9.2的三层WHITE求解器，不修改三片和四片算法。第一层执行K230参考算法思路的`GRAPH_AUTO`：先在不修改屏幕轮廓的求解副本中合并小于现场宏`UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM`的反光伪短边，再最多保留32条整边候选、枚举最多90组连通关系。第二层只在恰好四片且GRAPH无解时执行`FOUR_FAST`：恢复原始锁定顶点，复用整边与T形`segmented`分段接缝，按两片、三片、四片逐层全局排序，每层保留最多32个父状态，并在工作量预算内逐个实际展开；日志中的`parents`记录真正开始展开的数量，而不是保留数量。FOURFAST另有默认1.5秒CPU活动子预算，达到后正常结束快路径，下一帧进入原FALLBACK，不会把整个UNKNOWN任务判成超时。中间判断优先用凸多边形/耳切三角形几何求交代替反复创建MASK。CARD跳过前两层，始终使用原始顶点和纹理择优。
 
-三层最终都执行同一机械硬验收：先要求填充率不低于92%、总重叠不超过3%且尺寸在题目范围；只有WHITE严格轮无解时，才允许填充率不低于86%，并额外要求每片至少一条边属于目标矩形外框。FOUR_FAST和WHITE FALLBACK的4%中间门预先计算“最终全部碎片总面积”，再用当前累计交叠估算最终联合面积；这样两片、三片阶段不会因为分母太小误删最终可通过3%硬门的正确路径。自交、退化或OpenCV异常轮廓会使用相同总面积口径回退MASK，而不是中断整个任务。
+三层最终都执行同一机械硬验收：当前现场宏先要求填充率不低于90%、总重叠不超过3%且尺寸在题目范围；只有WHITE严格轮无解时，才允许填充率不低于84%，并额外要求每片至少一条边属于目标矩形外框。FOUR_FAST和WHITE FALLBACK的4%中间门预先计算“最终全部碎片总面积”，再用当前累计交叠估算最终联合面积；这样两片、三片阶段不会因为分母太小误删最终可通过3%硬门的正确路径。自交、退化或OpenCV异常轮廓会使用相同总面积口径回退MASK，而不是中断整个任务。
 
 ### 9.1 现场可调常量
 
-下列值集中位于`assembly_planner.py`文件最前部的“现场调试常量”区域。下面行号对应v2.0.0源码；若以后增加文件头注释，以常量名搜索结果为准。修改后必须重新把完整A版工程部署到MaixCAM2，不能只改设备持久化JSON。
+下列值集中位于`assembly_planner.py`文件最前部的“现场调试常量”区域。下面行号对应v2.0.1源码；若以后增加文件头注释，以常量名搜索结果为准。修改后必须重新把完整A版工程部署到MaixCAM2，不能只改设备持久化JSON。
 
 | 常量与位置 | 默认值 | 作用 | 现场调整原则 |
 |---|---:|---|---|
-| `UNKNOWN_STRICT_MIN_FILL_RATIO`，第14行 | `0.92` | 第一轮严格矩形最低填充率，WHITE、CARD和KNOWN登记共用严格逻辑 | 一般保持不动；提高会更严格，降低会增加错误拼法风险 |
-| `UNKNOWN_RELAXED_MIN_FILL_RATIO`，第16行 | `0.86` | 仅WHITE严格填充不足时的第二轮最低填充率 | 轮廓正确但角点缺口导致`fill_reject`时可每次降低`0.01`；不建议低于`0.82` |
-| `UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM`，第19行 | `12.0` | 仅WHITE GRAPH求解副本合并伪短边；不改变显示、CARD和兜底顶点 | `0.0`完全关闭；真实边不短于20mm时建议先在8～14mm范围小步调整，不应达到20mm |
+| `UNKNOWN_STRICT_MIN_FILL_RATIO`，第14行 | `0.90` | 第一轮严格矩形最低填充率，WHITE、CARD和KNOWN登记共用严格逻辑 | 当前为现场放宽值；提高会更严格，降低会增加错误拼法风险 |
+| `UNKNOWN_RELAXED_MIN_FILL_RATIO`，第16行 | `0.84` | 仅WHITE严格填充不足时的第二轮最低填充率 | 当前为现场放宽值；轮廓正确但角点缺口导致`fill_reject`时可每次降低`0.01`，不建议低于`0.82` |
+| `UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM`，第19行 | `8.0` | 仅WHITE GRAPH求解副本合并伪短边；不改变显示、CARD和兜底顶点 | `0.0`完全关闭；真实边不短于20mm时建议先在8～14mm范围小步调整，不应达到20mm |
 | `UNKNOWN_FOUR_FAST_ENABLED`，第21行 | `True` | GRAPH失败后是否启用WHITE四片分层快路径 | 现场验证完成前保持True；改False可完全恢复旧四片FALLBACK行为 |
 | `UNKNOWN_FOUR_FAST_BEAM_WIDTH`，第23行 | `32` | FOUR_FAST每层保留状态数 | 默认已覆盖本次现场正确路径；增大提高特殊布局召回但会变慢 |
 | `UNKNOWN_FOUR_FAST_RELATION_LIMIT`，第25行 | `6` | 每个有向片对展开的最优接缝关系数 | 本次正确分段关系排名为2和5；不建议低于6 |
@@ -435,7 +435,7 @@ v2.0.0继续使用v1.9.2的三层WHITE求解器，不修改三片和四片算法
 | `[ROI] AUTO` | `result`、`orientation`、`confidence`、`threshold`、`edges_px` | H/V必须符合实物；四边长度用于发现错误候选和严重透视 |
 | `[SOLVER] SNAPSHOT` | `mode`、`profile`、`count`、两个填充门 | 确认本次锁定材料模式和片数正确 |
 | `[SOLVER] PIECE` | `center_mm`、`vertices_mm`、`edges_mm` | 核对毫米映射、错误角点、过短边和粘连轮廓 |
-| `[SOLVER] CLEAN` | `vertices=A→B`、`removed`、`min_edge`、`cleaned_min` | 只说明WHITE图快路径清理了几个伪角；B不得小于3，清理后最短边通常应达到12mm |
+| `[SOLVER] CLEAN` | `vertices=A→B`、`removed`、`min_edge`、`cleaned_min` | 只说明WHITE图快路径清理了几个伪角；B不得小于3，当前清理阈值为8mm，以文件顶部宏为准 |
 | `[SOLVER] GRAPH` | `edges`、`sets`、`layouts`、`strict`、`relaxed`、拒绝数 | `layouts=0`通常是边匹配失败；`fill_reject`高说明候选有缺口；`outer_reject`说明容错拼法不满足每片外边 |
 | `[SOLVER] FOUR_FAST` | `pairs`、`triples`、`complete`、`parents`、`units`、`limit`、`time_limit`、`active_ms`、`segmented`、`triangles`、`raster` | `limit=1`表示2400候选工作量触顶；`time_limit=1`表示1.5秒子预算到期，随后应看到FALLBACK，不是整个任务超时；`active_ms`只记录FOURFAST活动计算。四片成功时`result=OK`；`segmented>0`说明使用T形接缝；`raster`应远小于`triangles` |
 | `[SOLVER] FALLBACK` | `nodes`、`frontier`、`first`、各类`reject` | 判断兜底是尺寸、填充、重叠还是边连接失败 |
@@ -538,7 +538,7 @@ motor_y = work_height - (paper_y - work_y)
 
 ### 11.1 UART4通信调试
 
-完整字节协议、CRC C函数、F4环形缓冲解析流程和十六进制示例见`MaixCAM2与STM32F4串口协议说明.md`。现场先记住以下状态：
+完整字节协议、CRC C函数、F4环形缓冲解析流程和十六进制示例见`MaixCAM2与STM32F4串口协议说明.md`。当前线协议版本固定为2，旧6字节心跳版本不能混用。现场先记住以下状态：
 
 | 屏幕文字 | 含义 | 处理 |
 |---|---|---|
@@ -549,6 +549,8 @@ motor_y = work_height - (paper_y - work_y)
 | `A4 ACK` | F4已确认当前A4帧 | 对照F4打印的方向和四角毫米值 |
 | `RESULT QUEUED` | 成功规划已整体排队 | F4先解析全部1～4片，不要逐片立即启动 |
 | `RESULT ACK` | F4已确认结果帧 | F4必须用TYPE+SEQ去重，重发不能重复动作 |
+
+应用打开UART4前会暂时停止Maix默认Comm监听，关闭UART或打开失败时再恢复；因此应用运行期间A21/A22和`/dev/ttyS4`必须只供本协议使用。每个应用启动周期都会生成新的非零`session_id`，F4收到新会话心跳后必须清空旧TYPE+SEQ去重记录；首个合法心跳前不得执行A4或拼图业务帧。
 
 正常页和CAL页都会在状态末尾显示一个最新UART后缀。UART离线或错误不会停止相机、触摸和求解；成功规划也只在当前START上下文排队一次。再次点击START、切换模式/材料或进出CAL会取消尚未确认的旧结果，避免F4晚收到上一轮目标。
 
@@ -577,7 +579,7 @@ motor_y = work_height - (paper_y - work_y)
 
 | 现象/状态 | 根因定位 | 先看哪个页面 | 只做的第一项调整 | 调整后的合格标准 |
 |---|---|---|---|---|
-| `PRESS START`且没有碎片轮廓 | 当前处于v2.0.0完全待机，不是漏检 | 正常页 | 确认KNOWN/UNKNOWN和WHITE/CARD后点击START | 出现实时轮廓和`STABLE 1/3` |
+| `PRESS START`且没有碎片轮廓 | 当前处于v2.0.1完全待机，不是漏检 | 正常页 | 确认KNOWN/UNKNOWN和WHITE/CARD后点击START | 出现实时轮廓和`STABLE 1/3` |
 | `AUTO ROI FAIL` | 没有找到可靠A4四边形 | ROI | 清除四角遮挡并让完整纸边进入画面，然后重按一次AUTO ROI | `AUTO ROI OK H/V xx%`且方向正确、蓝框贴边 |
 | AUTO ROI成功但黄框不合适 | A4四角正确，视觉毫米区域参数不合适 | ROI | 选择X/Y/W/H/SPLIT，每次调0.5mm；机械限位在F4设置 | 黄框位于完整A4内，红线位置正确 |
 | 两片距离看着足够仍然粘连 | 高分辨率MASK中的黑缝像素太少，CLOSE或阈值形成白色连接桥 | MEASURE、MASK | 先确认`SCALE≥2px/mm`和`GAP≥4px`；默认保持`CLOSE=1`，再单独调TH | 两片之间出现连续黑缝并形成两个白块 |
@@ -593,7 +595,7 @@ motor_y = work_height - (paper_y - work_y)
 | `SOLVING N/E/F/S`但画面仍刷新 | 正在按帧推进拼装搜索，这是正常状态 | 正常页 | WHITE关注S是否从0变1；CARD允许S=1后继续短暂择优 | 出现`PLAN OK`或具体失败原因 |
 | 四片FOURFAST约1.5秒后仍无解 | 快路径活动子预算已到，或某个底层几何调用尚未返回 | 控制台、RESULT | 查看`FOUR_FAST time_limit/active_ms`；`time_limit=1`后应明确进入FALLBACK，若单个工作单元长期不返回则保存完整日志 | 正常情况是FOURFAST成功，或输出`time_limit=1`后继续FALLBACK |
 | 四片总求解超过5秒仍没有结果 | FOURFAST已经让出，但FALLBACK仍在大量错误边和轮廓候选中搜索 | 控制台、RESULT | 先确认FOURFAST已有结束日志，再看FALLBACK的`nodes/fill_reject/overlap_reject`；修复自交角点和错误短边，不要盲目增大1.5秒子预算 | 在统一8秒活动预算内得到PLAN，或输出明确失败原因 |
-| 显示`LOCKED SOLVING`后画面和触摸同时停止超过2秒 | 可能运行旧包，或当前单个底层工作单元异常慢 | 启动工程和版本 | 重新部署完整v2.0.0 ZIP；若仍复现，保存控制台日志和当时画面 | 正常候选间画面持续刷新，工作单元返回后按预算结束或输出当前最优解 |
+| 显示`LOCKED SOLVING`后画面和触摸同时停止超过2秒 | 可能运行旧包，或当前单个底层工作单元异常慢 | 启动工程和版本 | 重新部署完整v2.0.1 ZIP；若仍复现，保存控制台日志和当时画面 | 正常候选间画面持续刷新，工作单元返回后按预算结束或输出当前最优解 |
 | `N=4`但`PLAN KNOWN_NEEDS_FOUR` | 上半区有效片不足4，或模板数量不是4 | 正常页 | 若未登记，先在下半区正确拼好并SAVE；已登记则把四片拆开全部放上半区 | `KNOWN SAVED PLAN OK`后随机摆放得到`PLAN OK N=4` |
 | 点击SAVE后下半区没有目标 | 正确布局验收或文件保存失败 | 正常页 | 读取完整`SAVE ...`状态，重点区分`KNOWN_LAYOUT_MUST_BE_LOWER`和`KNOWN_LAYOUT_INVALID` | 保存成功状态与目标同时出现 |
 | `PLAN KNOWN_MATCH_FAILED` | 当前轮廓与已保存模板差异过大 | RESULT | 核对蓝框和轮廓；必要时用当前实物重新登记KNOWN布局 | 四片得到K编号并规划成功 |
@@ -640,7 +642,7 @@ motor_y = work_height - (paper_y - work_y)
 | `STABLE 1/3`、`2/3` | 正在等待连续稳定帧 | 保持碎片静止，不要遮挡画面 |
 | WHITE经过短暂`LOCKED SOLVING`到`PLAN OK` | 统一跨帧任务中的`GRAPH_AUTO`或四片`FOUR_FAST`已经成功，没有进入FALLBACK | 看控制台`RESULT source`并核对紫框、单片轮廓、箭头和角度 |
 | `SOLVING N=... E=... F=... S=...` | UNKNOWN正在跨帧搜索；S=1表示已有可返回首解 | WHITE在S=1立即结束；CARD可继续短暂择优；画面持续刷新表示正常 |
-| `SAVE SOLVING N=...` | 仅旧兼容接口可能出现；v2.0.0实机KNOWN SAVE不进入UNKNOWN搜索 | 确认部署的是完整v2.0.0包；不要混用旧main.py或assembly_planner.py |
+| `SAVE SOLVING N=...` | 仅旧兼容接口可能出现；v2.0.1实机KNOWN SAVE不进入UNKNOWN搜索 | 确认部署的是完整v2.0.1包；不要混用旧main.py或assembly_planner.py |
 | `PLAN OK N=...` | 已生成并缓存N片目标位姿 | 核对箭头、坐标和角度 |
 | `NO TEMPLATE` | KNOWN模板不存在 | 在红线下方按题图正确拼成100×60mm后点击SAVE |
 | `KNOWN SAVED PLAN OK` | 下半区正确布局验收、模板保存和即时规划均成功 | 拆开四片并随机移到上半区验证KNOWN匹配 |
@@ -694,6 +696,9 @@ motor_y = work_height - (paper_y - work_y)
 ### 14.3 串口验收
 
 - [ ] A21 TX接F4 RX、A22 RX接F4 TX并共地，双方均为3.3V TTL。
+- [ ] F4通用帧只接受`VERSION=0x02`，旧版`VERSION=0x01`不得进入业务解析。
+- [ ] F4把HEARTBEAT按10字节解析，识别0～4完整状态码；首个合法心跳前不提交PAPER/RESULT。
+- [ ] 保持F4运行并重启Maix后，F4看到新的非零`session_id`并清空旧TYPE+SEQ去重记录。
 - [ ] F4持续ACK心跳时屏幕稳定显示`UART:OK`，断开ACK后约1.5秒变为`UART:OFFLINE`。
 - [ ] CAL页`SEND A4`能得到`A4 QUEUED`和`A4 ACK`，F4解析的V/H、宽高和四角正确。
 - [ ] 一次成功规划只发送一帧含全部1～4片的结果，源中心、目标中心和旋转角与屏幕一致。
@@ -702,7 +707,7 @@ motor_y = work_height - (paper_y - work_y)
 
 ### 14.4 比赛现场最终检查
 
-- [ ] 使用的是A版v2.0.0，不是历史包或B版。
+- [ ] 使用的是A版v2.0.1，不是历史包或B版。
 - [ ] 龙门架停在标定时的固定停车位。
 - [ ] A4纸没有移动、卷边或被遮挡。
 - [ ] 倾斜相机已经用100×60mm标准卡完成中心加四角五点RECT检查，五处误差均不超过2mm。

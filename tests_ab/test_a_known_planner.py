@@ -113,6 +113,19 @@ def _correct_lower_known_pieces():
     return pieces
 
 
+def _correct_landscape_lower_known_pieces():
+    """把固定四片布局放到横纸下半区，供横放SAVE方向传播测试使用。"""
+    offset = np.asarray((98.5, 127.5), dtype=np.float64)
+    pieces = [
+        _piece_from_mm(np.asarray(vertices, dtype=np.float64) + offset)
+        for vertices in TARGET_LAYOUT
+    ]
+    for piece in pieces:
+        piece["region"] = "lower"
+        piece["complete"] = True
+    return pieces
+
+
 def _rotate_vertices(vertices, angle_deg, target_center):
     """将原始毫米顶点绕自身均值旋转并平移，保留测试指定的4/5顶点数量。"""
     vertices = np.asarray(vertices, dtype=np.float64)
@@ -422,6 +435,30 @@ def test_direct_known_save_never_constructs_incremental_registration_job(
     assert runtime.snapshot_locked is True
     assert len(runtime.locked_pieces) == 4
     assert all(piece["region"] == "lower" for piece in runtime.locked_pieces)
+    assert template_store.load_templates(template_path) == templates
+
+
+def test_direct_known_save_accepts_full_landscape_a4_context(tmp_path):
+    """横放SAVE必须按297x210mm纸面登记并绑定成功规划缓存。"""
+    from maixcam2_app_A_quad.assembly_planner import AssemblyRuntime
+
+    template_path = tmp_path / "known_templates.json"
+    runtime = AssemblyRuntime(stable_frames=3)
+
+    templates, plan, status = main.perform_known_save_action(
+        _correct_landscape_lower_known_pieces(),
+        current_templates=[],
+        template_path=template_path,
+        work_region_mm=(0.0, 0.0, 297.0, 210.0),
+        split_y_mm=105.0,
+        planner_runtime=runtime,
+        paper_orientation="landscape",
+    )
+
+    assert status == "KNOWN SAVED PLAN OK"
+    assert plan.success is True
+    assert plan.target_rect_mm == (98.5, 127.5, 100.0, 60.0)
+    assert runtime.plan is plan
     assert template_store.load_templates(template_path) == templates
 
 

@@ -775,6 +775,27 @@ def test_failed_or_incomplete_plan_is_never_sent(plan):
     ) is False
 
 
+def test_result_encoding_error_becomes_visible_normal_page_status():
+    """成功规划编码失败时状态栏必须显示RESULT ERROR，不能只剩UART链路状态。"""
+    from maixcam2_app_A_quad.main import select_result_serial_status
+
+    successful_plan = SimpleNamespace(success=True, placements=[object()])
+    failed_plan = SimpleNamespace(success=False, placements=[])
+    serial_runtime = SimpleNamespace(last_event_text="RESULT ERROR")
+
+    assert (
+        select_result_serial_status("PLAN OK", successful_plan, serial_runtime)
+        == "RESULT ERROR"
+    )
+    assert select_result_serial_status("PLAN FAIL", failed_plan, serial_runtime) == "PLAN FAIL"
+
+    serial_runtime.last_event_text = "RESULT QUEUED"
+    assert (
+        select_result_serial_status("PLAN OK", successful_plan, serial_runtime)
+        == "PLAN OK"
+    )
+
+
 def test_uart_status_replaces_previous_suffix_without_repetition():
     """每帧状态只保留一个最新UART后缀，避免不断拼接导致文字溢出。"""
     from maixcam2_app_A_quad.main import append_uart_status
@@ -782,6 +803,21 @@ def test_uart_status_replaces_previous_suffix_without_repetition():
     assert append_uart_status("PLAN OK", "UART:OFFLINE") == "PLAN OK UART:OFFLINE"
     assert append_uart_status("PLAN OK UART:OFFLINE", "UART:OK") == "PLAN OK UART:OK"
     assert append_uart_status("UART:ERROR", "UART:OK") == "UART:OK"
+
+
+def test_heartbeat_app_state_distinguishes_calibration_solving_and_ready_result():
+    """心跳状态必须完整表达待机、CAL、采集、求解和结果就绪五种阶段。"""
+    from maixcam2_app_A_quad.main import select_serial_app_state
+
+    idle_runtime = SimpleNamespace(is_solving=False)
+    solving_runtime = SimpleNamespace(is_solving=True)
+    successful_plan = SimpleNamespace(success=True, placements=[object()])
+
+    assert select_serial_app_state(False, False, idle_runtime, None) == 0
+    assert select_serial_app_state(True, True, solving_runtime, successful_plan) == 1
+    assert select_serial_app_state(False, True, idle_runtime, None) == 2
+    assert select_serial_app_state(False, True, solving_runtime, None) == 3
+    assert select_serial_app_state(False, True, idle_runtime, successful_plan) == 4
 
 
 def test_main_imports_serial_protocol_in_package_and_flat_modes():

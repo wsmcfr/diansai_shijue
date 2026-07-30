@@ -89,6 +89,71 @@ def test_unknown_runtime_defaults_give_locked_solver_more_cpu_time():
     assert assembly_planner.UNKNOWN_SOLVER_WALL_TIMEOUT_SECONDS == 30.0
 
 
+def test_runtime_accepts_full_landscape_a4_when_orientation_is_explicit():
+    """横放完整A4必须按297x210mm校验，并在下半区生成目标。"""
+    from maixcam2_app_A_quad.assembly_planner import AssemblyRuntime
+
+    runtime = AssemblyRuntime(stable_frames=1)
+
+    plan = runtime.update(
+        mode="unknown",
+        pieces=[_unknown_rectangle(center=(80.0, 60.0))],
+        templates=[],
+        work_region_mm=(0.0, 0.0, 297.0, 210.0),
+        split_y_mm=105.0,
+        paper_orientation="landscape",
+    )
+
+    assert plan.success is True
+    target_x, target_y, target_width, target_height = plan.target_rect_mm
+    assert 0.0 <= target_x < target_x + target_width <= 297.0
+    assert 105.0 < target_y < target_y + target_height <= 210.0
+
+
+def test_known_runtime_accepts_full_landscape_a4_when_orientation_is_explicit():
+    """KNOWN横放规划必须复用同一纸张方向，不能退回竖放宽度校验。"""
+    from maixcam2_app_A_quad.assembly_planner import AssemblyRuntime
+    from tests_ab.test_a_known_planner import _registered_layout
+
+    templates, pieces = _registered_layout()
+    for piece in pieces:
+        piece["region"] = "upper"
+        piece["complete"] = True
+    runtime = AssemblyRuntime(stable_frames=1)
+
+    plan = runtime.update(
+        mode="known",
+        pieces=pieces,
+        templates=templates,
+        work_region_mm=(0.0, 0.0, 297.0, 210.0),
+        split_y_mm=105.0,
+        paper_orientation="landscape",
+    )
+
+    assert plan.success is True
+    assert plan.target_rect_mm == (98.5, 127.5, 100.0, 60.0)
+
+
+def test_cache_plan_accepts_full_landscape_a4_context():
+    """横放KNOWN保存后的成功规划必须能够绑定到297x210mm运行上下文。"""
+    from maixcam2_app_A_quad.assembly_planner import AssemblyPlan, AssemblyRuntime
+
+    runtime = AssemblyRuntime(stable_frames=3)
+    plan = AssemblyPlan(True, placements=[], target_rect_mm=(98.5, 127.5, 100.0, 60.0))
+
+    cached = runtime.cache_plan(
+        mode="known",
+        plan=plan,
+        templates=[],
+        work_region_mm=(0.0, 0.0, 297.0, 210.0),
+        split_y_mm=105.0,
+        paper_orientation="landscape",
+    )
+
+    assert cached is plan
+    assert runtime.plan is plan
+
+
 def test_runtime_waits_three_stable_frames_then_caches_single_solve():
     """连续三帧稳定前不得搜索，成功后即使碎片开始移动也保持同一规划。"""
     from maixcam2_app_A_quad.assembly_planner import AssemblyRuntime
@@ -1067,6 +1132,18 @@ def test_main_source_connects_runtime_update_and_plan_overlay():
     assert "planner_runtime.update(" in source
     assert "assembly_plan=assembly_plan" in source
     assert "planner_runtime.reset(" in source
+
+
+def test_main_source_passes_saved_paper_orientation_into_planner_runtime():
+    """设备主循环必须把当前横竖方向传入规划器，不能依赖竖放默认值。"""
+    from maixcam2_app_A_quad import main
+
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    call_start = source.index("assembly_plan = planner_runtime.update(")
+    call_end = source.index("status_message = select_planning_status(", call_start)
+    runtime_call = source[call_start:call_end]
+
+    assert 'paper_orientation=runtime_settings["paper_orientation"]' in runtime_call
 
 
 def test_planning_status_displays_incremental_solver_progress():

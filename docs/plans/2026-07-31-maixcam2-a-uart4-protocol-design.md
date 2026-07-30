@@ -32,7 +32,7 @@ MaixCAM2 通过 UART4 向 STM32F4 发送三类信息：
 | 波特率 | `115200` |
 | 数据格式 | `8N1`，无流控 |
 
-MaixPy 使用官方 `maix.uart` 和 `maix.pinmap` API。应用构造同一个 UART4 设备时，MaixCDK 会释放默认 Maix Comm Protocol 对 UART4 的监听，因此无需修改系统全局通信配置。
+MaixPy 使用官方 `maix.uart`、`maix.pinmap` 和 `maix.comm` API。应用打开UART4前显式调用`comm.rm_default_comm_listener()`停止默认Maix Comm监听，再映射引脚并构造UART对象；打开失败或包装UART关闭时调用`comm.add_default_comm_listener()`归还默认监听。应用运行期间UART4由本协议独占，不能依赖UART构造函数隐式释放系统监听。
 
 ## 4. 通用帧格式
 
@@ -41,7 +41,7 @@ MaixPy 使用官方 `maix.uart` 和 `maix.pinmap` API。应用构造同一个 UA
 | 偏移 | 长度 | 字段 | 说明 |
 |---:|---:|---|---|
 | 0 | 2 | SOF | 固定 `0xAA 0x55` |
-| 2 | 1 | VERSION | 固定 `0x01` |
+| 2 | 1 | VERSION | 固定 `0x02`；版本2引入10字节会话心跳，不兼容旧版6字节心跳 |
 | 3 | 1 | TYPE | 消息类型 |
 | 4 | 1 | FLAGS | bit0=`ACK_REQUIRED`，bit1=`RETRY` |
 | 5 | 2 | SEQ | `uint16` 序号，循环递增 |
@@ -66,11 +66,14 @@ CRC 参数固定为：多项式 `0x1021`、初值 `0xFFFF`、不反射、结果�
 
 | 载荷偏移 | 类型 | 字段 | 说明 |
 |---:|---|---|---|
-| 0 | `uint32` | `uptime_ms` | 视觉应用运行毫秒数，允许回绕 |
-| 4 | `uint8` | `app_state` | 0待机、1调参、2采集、3求解、4结果就绪 |
-| 5 | `uint8` | `last_error` | 0表示无通信错误，其他值保留 |
+| 0 | `uint32` | `session_id` | 每次视觉应用启动生成的随机非零会话ID |
+| 4 | `uint32` | `uptime_ms` | 本次视觉应用运行毫秒数，允许回绕 |
+| 8 | `uint8` | `app_state` | 0待机、1调参、2采集、3求解、4结果就绪 |
+| 9 | `uint8` | `last_error` | 0表示无通信错误，其他值保留 |
 
-每 500 ms 发送一帧。MaixCAM2 在 1500 ms 内收到任何 CRC 正确且字段匹配的 ACK 即显示 `UART:OK`，否则显示 `UART:OFFLINE`。心跳收发不得阻塞相机、触摸和增量求解主循环。
+每 500 ms 发送一帧。同一轮`poll()`先写HEARTBEAT，再写已排队的业务帧。MaixCAM2在1500ms内收到任何CRC正确且字段匹配的ACK即显示`UART:OK`，否则显示`UART:OFFLINE`。心跳收发不得阻塞相机、触摸和增量求解主循环。
+
+F4在接收首个合法10字节心跳前不得提交PAPER_FRAME或PUZZLE_RESULT。`session_id`变化表示视觉程序已重启，F4必须清空旧会话的`(TYPE, SEQ)`去重记录并作废未执行旧方案，再接受新会话业务；这样SEQ从0重新开始也不会与旧缓存冲突。
 
 ### 5.2 PAPER_FRAME
 
@@ -124,7 +127,7 @@ ACK 载荷固定为4字节：
 
 MaixCAM2 对 `PAPER_FRAME` 和 `PUZZLE_RESULT` 保存原始逻辑消息。在未收到匹配 ACK 时使用相同 TYPE 和 SEQ 重发，并设置 `RETRY` 标志。首次三次重发间隔为 250 ms；仍未确认时降为每 1000 ms 重发，直到收到 ACK、产生新结果或用户切换采集上下文。
 
-F4 必须使用 `(TYPE, SEQ)` 去重：重复帧只重发 ACK，不得再次执行机械动作。CRC错误、长度错误、版本错误或字段范围错误的帧不得执行。
+F4必须在当前`session_id`范围内使用`(TYPE, SEQ)`去重：重复帧只重发ACK，不得再次执行机械动作。首个合法心跳前业务帧不得执行；CRC错误、长度错误、版本错误或字段范围错误的帧不得执行。
 
 ## 7. 视觉端模块边界
 
@@ -168,7 +171,8 @@ PC自动测试必须覆盖：
 
 - CRC标准向量、各消息逐字节黄金数据、负数角度和序号回绕。
 - 流式解析的单字节断包、多帧粘包、噪声、非法长度和CRC错误恢复。
-- 心跳周期、在线/离线切换、ACK匹配、重发标志和结果只创建一次。
+- 10字节心跳黄金数据、非零会话ID、0～4状态、心跳先于业务帧、在线/离线切换、ACK匹配、重发标志和结果只创建一次。
+- UART4打开前停止默认监听、打开失败恢复监听、关闭租约恢复监听。
 - 1至4片结果帧及KNOWN/UNKNOWN模式。
 - ROI页六槽触摸命中、SEND按钮启用条件和其他页面禁用条件。
 - 横竖完整A4黄色区域、分界线和设置持久化。

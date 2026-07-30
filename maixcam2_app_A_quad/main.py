@@ -37,6 +37,7 @@ try:
         PERSISTENT_TEMPLATE_PATH,
     )
     from maixcam2_app_A_quad.paper_locator import (
+        PAPER_ORIENTATION_PORTRAIT,
         build_work_quad,
         image_point_to_paper_mm,
         image_points_to_paper_mm,
@@ -100,6 +101,7 @@ except ModuleNotFoundError as error:
     )
     from config import DEFAULT_CONFIG, PERSISTENT_SETTINGS_PATH, PERSISTENT_TEMPLATE_PATH
     from paper_locator import (
+        PAPER_ORIENTATION_PORTRAIT,
         build_work_quad,
         image_point_to_paper_mm,
         image_points_to_paper_mm,
@@ -312,6 +314,57 @@ def append_uart_status(status_text, link_text):
     return " ".join(status_tokens)
 
 
+def select_calibration_serial_status(status_text, serial_runtime):
+    """在SEND A4流程中选择需要显示的最新业务通信事件。
+
+    主要流程：仅当当前状态仍属于A4/UART发送反馈时，才读取运行器最近事件；A4的
+    ACK/NACK以及UART错误会替换旧的A4 QUEUED。普通调参页面状态原样返回，避免心跳
+    或后台通信覆盖用户刚执行的ROI、MASK、RESULT等操作。返回值为新的状态字符串。
+    """
+    current_status = str(status_text).strip()
+    if not current_status.startswith(("A4 ", "UART ")):
+        return current_status
+    event_text = str(getattr(serial_runtime, "last_event_text", "")).strip()
+    if event_text.startswith("A4 ") or "ERROR" in event_text:
+        return event_text
+    return current_status
+
+
+def select_result_serial_status(status_text, assembly_plan, serial_runtime):
+    """把成功规划的本地协议编码错误转换为正常页可见状态。
+
+    只有成功且包含碎片的规划才检查通信事件，防止上一轮残留的RESULT ERROR覆盖当前
+    几何失败原因。运行器报告其他事件时保留原规划状态。返回值为新的状态字符串。
+    """
+    if assembly_plan is None or not bool(getattr(assembly_plan, "success", False)):
+        return str(status_text)
+    if not getattr(assembly_plan, "placements", None):
+        return str(status_text)
+    if str(getattr(serial_runtime, "last_event_text", "")) == "RESULT ERROR":
+        return "RESULT ERROR"
+    return str(status_text)
+
+
+def select_serial_app_state(is_calibrating, capture_armed, planner_runtime, assembly_plan):
+    """把视觉主循环状态映射为心跳载荷中的0至4状态码。
+
+    优先级依次为CAL、结果就绪、正在求解、已开始采集和完全待机。CAL优先可让F4在
+    用户调参时禁止机械动作；成功规划只有包含实际碎片位姿时才报告结果就绪。
+    返回0待机、1调参、2采集、3求解或4结果就绪。
+    """
+    if bool(is_calibrating):
+        return 1
+    if (
+        assembly_plan is not None
+        and bool(getattr(assembly_plan, "success", False))
+        and bool(getattr(assembly_plan, "placements", None))
+    ):
+        return 4
+    if bool(getattr(planner_runtime, "is_solving", False)):
+        return 3
+    return 2 if bool(capture_armed) else 0
+
+
 def select_display_pieces(live_pieces, planner_runtime):
     """为正常界面选择实时轮廓或已锁定轮廓。
 
@@ -447,6 +500,7 @@ def register_and_save_known_layout(
     work_region_mm,
     split_y_mm,
     max_nodes=12000,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
 ):
     """从下半区已正确拼好的四片同步登记KNOWN布局并原子保存模板。
 
@@ -459,6 +513,7 @@ def register_and_save_known_layout(
         work_region_mm,
         split_y_mm,
         max_nodes=max_nodes,
+        paper_orientation=paper_orientation,
     )
     if plan.success:
         save_templates(template_path, templates)
@@ -473,6 +528,7 @@ def perform_known_save_action(
     split_y_mm,
     planner_runtime,
     max_nodes=12000,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
 ):
     """执行一次KNOWN触摸保存，并保持内存、磁盘和规划缓存一致。
 
@@ -487,6 +543,7 @@ def perform_known_save_action(
             work_region_mm,
             split_y_mm,
             max_nodes=max_nodes,
+            paper_orientation=paper_orientation,
         )
     except Exception as error:
         # 写文件失败时register_and_save_known_layout不会返回，内存继续使用旧模板。
@@ -501,6 +558,7 @@ def perform_known_save_action(
         work_region_mm,
         split_y_mm,
         pieces=pieces,
+        paper_orientation=paper_orientation,
     )
     return new_templates, plan, "KNOWN SAVED PLAN OK"
 
@@ -514,6 +572,7 @@ def perform_known_save_request(
     split_y_mm,
     planner_runtime,
     max_nodes=12000,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
 ):
     """处理带START确认门的KNOWN保存请求。
 
@@ -535,6 +594,7 @@ def perform_known_save_request(
         split_y_mm,
         planner_runtime,
         max_nodes=max_nodes,
+        paper_orientation=paper_orientation,
     )
 
 
@@ -1336,9 +1396,14 @@ def run_app():
         camera_image = cam.read()
         frame_bgr = image.image2cv(camera_image, ensure_bgr=False, copy=False)
 
-        # 每帧只推进一次非阻塞UART状态机。心跳状态0=待机、1=CAL、2=已START，
-        # F4可据此区分视觉在线但尚未开始识别的正常情况。
-        serial_app_state = 1 if interface_state.is_calibrating else (2 if capture_armed else 0)
+        # 每帧只推进一次非阻塞UART状态机；完整状态码让F4区分待机、调参、采集、
+        # 求解和结果就绪，同时不改变相机主循环的非阻塞顺序。
+        serial_app_state = select_serial_app_state(
+            interface_state.is_calibrating,
+            capture_armed,
+            planner_runtime,
+            planner_runtime.plan,
+        )
         serial_runtime.poll(app_state=serial_app_state)
 
         # CAL使用未保存工作副本，RUN只使用已经保存并生效的参数。
@@ -1493,6 +1558,7 @@ def run_app():
                     work_region_mm,
                     runtime_settings["split_y_mm"],
                     planner_runtime,
+                    paper_orientation=runtime_settings["paper_orientation"],
                 )
                 preserve_planning_status = True
 
@@ -1503,7 +1569,11 @@ def run_app():
                 calibration_session,
                 detection,
             )
-            display_status = status_message
+            # SEND A4后的ACK/NACK和写失败发生在后续poll帧，必须在绘制前动态同步。
+            display_status = select_calibration_serial_status(
+                status_message,
+                serial_runtime,
+            )
             if resolution_fallback and "RES LOW" not in display_status:
                 display_status = f"{display_status} RES LOW".strip()
             display_status = append_uart_status(display_status, serial_runtime.link_text)
@@ -1548,6 +1618,7 @@ def run_app():
                     runtime_settings["split_y_mm"],
                     known_match_threshold=float(DEFAULT_CONFIG["known_match_threshold"]),
                     unknown_profile=unknown_profile,
+                    paper_orientation=runtime_settings["paper_orientation"],
                 )
                 status_message = select_planning_status(
                     status_message,
@@ -1567,6 +1638,11 @@ def run_app():
                     assembly_plan,
                     mode,
                     runtime_settings["paper_orientation"],
+                )
+                status_message = select_result_serial_status(
+                    status_message,
+                    assembly_plan,
+                    serial_runtime,
                 )
 
             # 稳定门达到前画实时轮廓；达到后始终画运行器深复制的同一快照，使屏幕

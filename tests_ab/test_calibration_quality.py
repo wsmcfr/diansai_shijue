@@ -400,3 +400,25 @@ def test_send_a4_without_paper_quad_returns_roi_not_set():
 
     assert unchanged is runtime_settings
     assert status == "ROI NOT SET"
+
+
+def test_calibration_serial_status_tracks_a4_ack_nack_and_write_error():
+    """SEND A4后必须动态显示业务ACK/NACK和写失败，普通页面状态不得被覆盖。"""
+    from types import SimpleNamespace
+
+    from maixcam2_app_A_quad.main import select_calibration_serial_status
+
+    serial_runtime = SimpleNamespace(last_event_text="A4 ACK")
+    assert select_calibration_serial_status("A4 QUEUED", serial_runtime) == "A4 ACK"
+
+    serial_runtime.last_event_text = "A4 NACK 2"
+    assert select_calibration_serial_status("A4 QUEUED", serial_runtime) == "A4 NACK 2"
+
+    serial_runtime.last_event_text = "UART WRITE ERROR"
+    assert (
+        select_calibration_serial_status("A4 QUEUED", serial_runtime)
+        == "UART WRITE ERROR"
+    )
+
+    serial_runtime.last_event_text = "A4 ACK"
+    assert select_calibration_serial_status("RESULT", serial_runtime) == "RESULT"

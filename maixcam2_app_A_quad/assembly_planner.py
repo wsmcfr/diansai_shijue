@@ -11,12 +11,12 @@ import numpy as np
 
 # ======================== 现场调试常量（用户可直接修改） ========================
 # 第一轮严格矩形验收的最低填充率。提高会减少误接受，降低会容忍更多角点缺口。
-UNKNOWN_STRICT_MIN_FILL_RATIO = 0.92
+UNKNOWN_STRICT_MIN_FILL_RATIO = 0.90
 # 仅WHITE严格轮失败后使用的最低填充率；尺寸、重叠和逐片外边约束不会随之放宽。
-UNKNOWN_RELAXED_MIN_FILL_RATIO = 0.86
+UNKNOWN_RELAXED_MIN_FILL_RATIO = 0.84
 # UNKNOWN WHITE求解副本允许合并的伪短边上限，单位mm；设为0.0可完全关闭清理。
-# 题目真实边不短于20mm，默认12mm为远距离角点误差保留8mm安全余量。
-UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM = 12.0
+# 题目真实边不短于20mm，当前8mm为远距离角点误差保留12mm安全余量。
+UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM = 8.0
 # True时在WHITE四片的整边GRAPH失败后启用分层Beam快路径；False可恢复旧FALLBACK。
 UNKNOWN_FOUR_FAST_ENABLED = True
 # FOUR_FAST每层全局保留的状态数；增大可提高复杂轮廓召回，但会增加候选检查量。
@@ -374,9 +374,15 @@ def register_known_layout(
 
 
 def _target_rect_in_lower_region(work_region_mm, split_y_mm, target_size_mm):
-    """把目标矩形居中放入黄色区域下半区，空间不足时返回None。"""
-    work_x, work_y, work_width, work_height = validate_work_region_mm(work_region_mm)
-    split_y = validate_split_y_mm(work_region_mm, split_y_mm)
+    """把目标矩形居中放入已校验区域的下半区，空间不足时返回None。
+
+    区域和分界线必须由公共入口按当前纸张方向预先校验。本函数只做目标放置，避免
+    横放297mm宽区域在内部再次套用竖放210mm默认宽度。
+    """
+    work_x, work_y, work_width, work_height = (
+        float(value) for value in work_region_mm
+    )
+    split_y = float(split_y_mm)
     target_width, target_height = (float(value) for value in target_size_mm)
     lower_height = work_y + work_height - split_y
     if target_width > work_width + 1e-6 or target_height > lower_height + 1e-6:
@@ -409,12 +415,24 @@ def solve_known_layout(
     work_region_mm,
     split_y_mm,
     max_match_score=1.2,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
 ):
     """匹配已知四片并直接生成固定100×60mm下半区目标位姿。
 
     主要流程：检查模板布局字段，计算下半区目标框，复用最多24种全局模板分配，
     再逐片执行无镜像刚体配准。返回AssemblyPlan；任何不安全条件返回结构化失败。
     """
+    # 公共入口按当前横竖方向完成唯一一次区域规范化，后续步骤只复用该结果。
+    try:
+        work_region_mm = validate_work_region_mm(work_region_mm, paper_orientation)
+        split_y_mm = validate_split_y_mm(
+            work_region_mm,
+            split_y_mm,
+            paper_orientation,
+        )
+    except ValueError:
+        return AssemblyPlan.failed("target_out_of_work_region")
+
     pieces = list(pieces)
     templates = list(templates)
     if len(pieces) != 4 or len(templates) != 4:
@@ -3046,6 +3064,7 @@ class UnknownSolveJob:
         timeout_seconds=None,
         clock=None,
         four_fast_active_budget_seconds=UNKNOWN_FOUR_FAST_ACTIVE_BUDGET_SECONDS,
+        paper_orientation=PAPER_ORIENTATION_PORTRAIT,
     ):
         """创建尚未执行的求解任务并复制调用参数。
 
@@ -3098,6 +3117,13 @@ class UnknownSolveJob:
                 raise ValueError
         except (TypeError, ValueError):
             raise ValueError("FOURFAST活动预算必须是有限正数")
+        # GRAPH、FOURFAST和FALLBACK共享同一份按纸张方向校验后的毫米区域。
+        work_region_mm = validate_work_region_mm(work_region_mm, paper_orientation)
+        split_y_mm = validate_split_y_mm(
+            work_region_mm,
+            split_y_mm,
+            paper_orientation,
+        )
         self._active_elapsed_seconds = 0.0
         # WHITE把两个快路径与旧FALLBACK放入同一生成器，三阶段从任务创建起共享预算；
         # CARD仍直接使用原增量核心，保持纹理择优和MASK重叠语义不变。
@@ -3365,6 +3391,7 @@ def solve_unknown_layout(
     wall_timeout_seconds=UNKNOWN_SOLVER_WALL_TIMEOUT_SECONDS,
     timeout_seconds=None,
     four_fast_active_budget_seconds=UNKNOWN_FOUR_FAST_ACTIVE_BUDGET_SECONDS,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
 ):
     """同步求解未知布局，内部完整消费与主循环相同的增量搜索核心。
 
@@ -3387,6 +3414,7 @@ def solve_unknown_layout(
         wall_timeout_seconds=wall_timeout_seconds,
         timeout_seconds=timeout_seconds,
         four_fast_active_budget_seconds=four_fast_active_budget_seconds,
+        paper_orientation=paper_orientation,
     )
     return job.run_to_completion()
 
@@ -3595,6 +3623,7 @@ def solve_and_register_known_layout(
     pixels_per_mm=2.0,
     max_match_score=1.2,
     texture_refinement_nodes=400,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
 ):
     """从下半区已经拼好的四片布局同步生成模板和即时规划。
 
@@ -3689,6 +3718,7 @@ def solve_and_register_known_layout(
         work_region_mm,
         split_y_mm,
         max_match_score=max_match_score,
+        paper_orientation=paper_orientation,
     )
     if not known_plan.success:
         if known_plan.reason == "target_out_of_work_region":
@@ -4088,6 +4118,7 @@ class AssemblyRuntime:
         work_region_mm,
         split_y_mm,
         unknown_profile=UNKNOWN_PROFILE_WHITE,
+        paper_orientation=PAPER_ORIENTATION_PORTRAIT,
     ):
         """校验规划上下文并生成决定缓存是否仍可复用的稳定键。
 
@@ -4104,8 +4135,8 @@ class AssemblyRuntime:
             UNKNOWN_PROFILE_CARD,
         ):
             raise ValueError("UNKNOWN子模式必须是white或card")
-        work_region = validate_work_region_mm(work_region_mm)
-        split_y = validate_split_y_mm(work_region, split_y_mm)
+        work_region = validate_work_region_mm(work_region_mm, paper_orientation)
+        split_y = validate_split_y_mm(work_region, split_y_mm, paper_orientation)
         template_key = (
             _template_context_fingerprint(templates)
             if normalized_mode == "known"
@@ -4113,6 +4144,7 @@ class AssemblyRuntime:
         )
         context_key = (
             normalized_mode,
+            str(paper_orientation).strip().lower(),
             (
                 normalized_unknown_profile
                 if normalized_mode == "unknown"
@@ -4138,6 +4170,7 @@ class AssemblyRuntime:
         work_region_mm,
         split_y_mm,
         pieces=None,
+        paper_orientation=PAPER_ORIENTATION_PORTRAIT,
     ):
         """预装一次已经验收成功的规划，供SAVE后立即显示并跨帧复用。
 
@@ -4153,6 +4186,7 @@ class AssemblyRuntime:
             templates,
             work_region_mm,
             split_y_mm,
+            paper_orientation=paper_orientation,
         )
         if self._solve_job is not None:
             self._solve_job.cancel()
@@ -4215,6 +4249,7 @@ class AssemblyRuntime:
         known_match_threshold=1.6,
         unknown_max_nodes=12000,
         unknown_profile=UNKNOWN_PROFILE_WHITE,
+        paper_orientation=PAPER_ORIENTATION_PORTRAIT,
     ):
         """接收一帧识别数据，在稳定门满足后求解一次并返回缓存。
 
@@ -4229,6 +4264,7 @@ class AssemblyRuntime:
             work_region_mm,
             split_y_mm,
             unknown_profile=unknown_profile,
+            paper_orientation=paper_orientation,
         )
         if context_key != self._context_key:
             self._context_key = context_key
@@ -4283,6 +4319,7 @@ class AssemblyRuntime:
                 work_region,
                 split_y,
                 max_match_score=known_match_threshold,
+                paper_orientation=paper_orientation,
             )
             self._debug_result(self.plan, "known")
         else:
@@ -4296,6 +4333,7 @@ class AssemblyRuntime:
                 max_nodes=unknown_max_nodes,
                 texture_refinement_nodes=self.texture_refinement_nodes,
                 stop_at_first_solution=(unknown_profile == UNKNOWN_PROFILE_WHITE),
+                paper_orientation=paper_orientation,
             )
             # UNKNOWN结束结果是否进入长期缓存由_advance_unknown_job统一决定；这里若把
             # 它的单帧超时返回值再次赋给self.plan，会破坏“无首解自动重试”语义。

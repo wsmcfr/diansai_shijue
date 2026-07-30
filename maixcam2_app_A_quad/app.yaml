@@ -15,7 +15,7 @@ files:
   - touch_ui.py
 id: diansai_quad
 name: diansai_quad
-version: 2.0.0
+version: 2.0.1
 author: CFR
 icon: ''
 desc: MaixCAM2 puzzle recognition with reliable UART4 result protocol

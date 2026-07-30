@@ -1,5 +1,7 @@
 """验证A版UART4二进制协议、可靠发送和Maix硬件适配边界。"""
 
+import sys
+from types import ModuleType
 from types import SimpleNamespace
 
 import pytest
@@ -16,12 +18,15 @@ from maixcam2_app_A_quad.serial_protocol import (
     PROTOCOL_VERSION,
     FrameStreamParser,
     VisionSerialRuntime,
+    create_maix_uart4,
     crc16_ccitt_false,
     decode_ack_payload,
+    decode_heartbeat_payload,
     decode_paper_payload,
     decode_puzzle_result_payload,
     encode_ack_payload,
     encode_frame,
+    encode_heartbeat_payload,
     encode_paper_payload,
     encode_puzzle_result_payload,
 )
@@ -104,6 +109,7 @@ def test_crc16_matches_ccitt_false_standard_vector():
 
 def test_frame_encoding_uses_little_endian_header_length_and_crc():
     """通用帧头、序号、长度和CRC必须完全符合协议文档的字节顺序。"""
+    assert PROTOCOL_VERSION == 2
     frame = encode_frame(
         MSG_PAPER_FRAME,
         b"\x01\x02",
@@ -111,8 +117,38 @@ def test_frame_encoding_uses_little_endian_header_length_and_crc():
         flags=FLAG_ACK_REQUIRED,
     )
 
-    assert frame[:9] == b"\xAA\x55\x01\x10\x01\x34\x12\x02\x00"
+    assert frame[:9] == b"\xAA\x55\x02\x10\x01\x34\x12\x02\x00"
     assert int.from_bytes(frame[-2:], "little") == crc16_ccitt_false(frame[2:-2])
+
+
+def test_heartbeat_payload_carries_session_id_before_uptime_and_state():
+    """心跳必须先发送非零启动会话ID，供F4在Maix重启后清空旧去重缓存。"""
+    payload = encode_heartbeat_payload(
+        session_id=0x12345678,
+        uptime_ms=0x89ABCDEF,
+        app_state=3,
+        last_error=4,
+    )
+
+    assert payload == b"\x78\x56\x34\x12\xEF\xCD\xAB\x89\x03\x04"
+    assert decode_heartbeat_payload(payload) == {
+        "session_id": 0x12345678,
+        "uptime_ms": 0x89ABCDEF,
+        "app_state": 3,
+        "last_error": 4,
+    }
+
+    # 完整黄金帧同时锁定协议版本2、10字节长度和CRC，供F4文档逐字节核对。
+    frame = encode_frame(
+        MSG_HEARTBEAT,
+        encode_heartbeat_payload(0x12345678, 1000, 3, 0),
+        sequence=0x0001,
+        flags=FLAG_ACK_REQUIRED,
+    )
+    assert frame == bytes.fromhex(
+        "AA 55 02 01 01 01 00 0A 00 "
+        "78 56 34 12 E8 03 00 00 03 00 64 66"
+    )
 
 
 def test_stream_parser_recovers_from_noise_split_frames_and_bad_crc():
@@ -290,6 +326,36 @@ def test_runtime_sends_heartbeat_every_500ms_without_blocking_reads():
     assert heartbeat[0].flags == FLAG_ACK_REQUIRED
 
 
+def test_runtime_sends_session_heartbeat_before_queued_business_frame():
+    """首次轮询必须先声明当前会话，再发送同序号空间中的A4或机械业务帧。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    runtime = VisionSerialRuntime(
+        lambda: fake_uart,
+        clock_ms=clock,
+        session_id=0x10203040,
+    )
+    runtime.queue_paper_frame("portrait")
+
+    runtime.poll(app_state=2)
+
+    frames = _decode_writes(fake_uart)
+    assert [frame.message_type for frame in frames] == [MSG_HEARTBEAT, MSG_PAPER_FRAME]
+    assert decode_heartbeat_payload(frames[0].payload)["session_id"] == 0x10203040
+    assert runtime.session_id == 0x10203040
+
+
+def test_zero_session_id_is_replaced_with_nonzero_value():
+    """零值不能作为有效会话标识，测试注入零时必须规范为1。"""
+    runtime = VisionSerialRuntime(
+        lambda: _FakeUart(),
+        clock_ms=_FakeClock(),
+        session_id=0,
+    )
+
+    assert runtime.session_id == 1
+
+
 def test_runtime_becomes_online_after_matching_ack_and_offline_after_1500ms():
     """只有匹配已发送帧的ACK能置在线，ACK超时后自动恢复离线。"""
     clock = _FakeClock()
@@ -390,6 +456,31 @@ def test_puzzle_result_is_queued_only_once_per_capture_context():
     assert runtime.queue_puzzle_result_once("unknown", "portrait", placements) is True
 
 
+def test_runtime_rejects_invalid_plan_without_raising_or_consuming_context():
+    """NaN等结果编码错误必须留在通信层，并允许修正后的同次结果再次排队。"""
+    clock = _FakeClock()
+    runtime = VisionSerialRuntime(lambda: _FakeUart(), clock_ms=clock)
+    invalid = SimpleNamespace(
+        piece_id="U1",
+        source_center_mm=(float("nan"), 20.0),
+        target_center_mm=(100.0, 160.0),
+        rotation_delta_deg=30.0,
+    )
+
+    assert runtime.queue_puzzle_result_once("unknown", "portrait", [invalid]) is False
+    assert runtime.last_event_text == "RESULT ERROR"
+    assert runtime.pending_count == 0
+
+    assert (
+        runtime.queue_puzzle_result_once(
+            "unknown",
+            "portrait",
+            _make_placements(1),
+        )
+        is True
+    )
+
+
 def test_reset_result_context_preserves_pending_manual_a4_frame():
     """重新START只取消旧机械结果，用户手动发送的A4调试帧仍等待ACK。"""
     clock = _FakeClock()
@@ -479,3 +570,68 @@ def test_close_releases_uart_and_stops_future_polling():
 
     assert fake_uart.closed is True
     assert len(calls) == 1
+
+
+def _install_fake_maix_uart_modules(monkeypatch, uart_factory):
+    """安装只覆盖UART4工厂所需接口的假maix模块，并返回调用顺序列表。"""
+    events = []
+    fake_maix = ModuleType("maix")
+    fake_maix.comm = SimpleNamespace(
+        rm_default_comm_listener=lambda: events.append("comm_remove"),
+        add_default_comm_listener=lambda: events.append("comm_restore"),
+    )
+    fake_maix.err = SimpleNamespace(
+        check_raise=lambda result, _message: events.append(("check", result)),
+    )
+    fake_maix.pinmap = SimpleNamespace(
+        set_pin_function=lambda pin, function: events.append(("pin", pin, function)) or 0,
+    )
+
+    def open_uart(device, baudrate):
+        """记录UART设备与波特率，然后调用测试指定工厂。"""
+        events.append(("uart", device, baudrate))
+        return uart_factory(events)
+
+    fake_maix.uart = SimpleNamespace(UART=open_uart)
+    monkeypatch.setitem(sys.modules, "maix", fake_maix)
+    return events
+
+
+def test_maix_uart4_factory_takes_and_returns_default_comm_listener(monkeypatch):
+    """应用占用UART4前必须停默认监听，关闭UART后必须把监听归还系统。"""
+    raw_uart = _FakeUart()
+    events = _install_fake_maix_uart_modules(
+        monkeypatch,
+        lambda _events: raw_uart,
+    )
+
+    uart_lease = create_maix_uart4()
+    uart_lease.write(b"abc")
+    uart_lease.close()
+
+    assert events[0] == "comm_remove"
+    assert events[1:5] == [
+        ("pin", "A21", "UART4_TX"),
+        ("check", 0),
+        ("pin", "A22", "UART4_RX"),
+        ("check", 0),
+    ]
+    assert events[5] == ("uart", "/dev/ttyS4", 115200)
+    assert events[-1] == "comm_restore"
+    assert raw_uart.closed is True
+
+
+def test_maix_uart4_factory_restores_listener_when_open_fails(monkeypatch):
+    """UART构造失败时也必须恢复默认监听，不能让Maix通信口永久失联。"""
+
+    def fail_open(_events):
+        """模拟设备被占用或驱动打开失败。"""
+        raise RuntimeError("uart busy")
+
+    events = _install_fake_maix_uart_modules(monkeypatch, fail_open)
+
+    with pytest.raises(RuntimeError, match="uart busy"):
+        create_maix_uart4()
+
+    assert events[0] == "comm_remove"
+    assert events[-1] == "comm_restore"

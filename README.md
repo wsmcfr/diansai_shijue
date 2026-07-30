@@ -1,16 +1,16 @@
 # MaixCAM2 拼图碎片识别
 
-本项目用于在 MaixCAM2 上识别黑色 A4 纸上的白色拼图碎片。A版v1.9.2保留跨帧`GRAPH → FOUR_FAST → FALLBACK`流水线，并给只在四片WHITE中运行的FOURFAST增加1.5秒独立CPU活动预算；快路径到期会正常转入FALLBACK，不再占满UNKNOWN统一8秒活动预算。1～3片仍保持原`GRAPH → FALLBACK`路径，24ms/64工作单元调度、92%严格门、86%受约束容错门和电脑控制台诊断均保持不变。龙门架通信与运动控制仍由下位机模块接入。
+本项目用于在 MaixCAM2 上识别黑色 A4 纸上的白色拼图碎片。A版v2.0.1保留跨帧`GRAPH → FOUR_FAST → FALLBACK`流水线，并使用UART4协议版本2发送会话心跳、完整A4毫米边界和1～4片拼装结果。1～3片仍保持原`GRAPH → FALLBACK`路径，四片FOURFAST保留1.5秒独立CPU活动预算；当前现场宏为90%严格门、84%受约束容错门和8mm伪短边清理。龙门架通信与运动控制仍由下位机接入。
 
 当前保留原稳定版，并新增两个独立自动黑纸ROI版本：A版使用四边形掩膜，B版使用透视展开。完整安装、按钮和现场调参说明见 [A/B操作手册](docs/maixcam2-auto-roi-ab-guide.md)。
 
 | 版本 | 目录 | 发布ZIP |
 |---|---|---|
 | 稳定版 | `maixcam2_app/` | `maix-diansai_1-v1.0.0.zip` |
-| A 四边形掩膜与规划 | `maixcam2_app_A_quad/` | `diansai_quad-v1.9.2.zip` |
+| A 四边形掩膜与规划、UART4协议 | `maixcam2_app_A_quad/` | `diansai_quad-v2.0.1.zip` |
 | B 透视展开 | `maixcam2_app_B_warp/` | `diansai_warp-v1.1.0.zip` |
 
-> A版 `v1.9.2` 使用设置V5保存纸张方向。竖放映射210×297mm、默认上下裁33.5mm；横放映射297×210mm、默认左右裁33.5mm。正常界面只显示标定A4纸面；选择模式/材料后必须点击`START`，连续3帧后锁定一次轮廓，成功或失败都保持到再次点击`START`。WHITE依次执行整边`GRAPH_AUTO`、四片`FOUR_FAST`和原FALLBACK，三阶段共享24ms/64工作单元的单帧调度；FOURFAST另有1.5秒活动子预算，到期只转FALLBACK。中间重叠预筛按最终全部碎片面积估算，最终仍执行92%严格门，严格无解后才允许86%填充且每片具有目标外边的容错结果。CARD继续使用原始锁定轮廓和纹理择优。
+> A版`v2.0.1`使用设置V5保存纸张方向。竖放映射210×297mm，横放映射297×210mm，黄色视觉区域默认等于完整蓝色A4区域；230×230mm机械行程由F4按实际零点独立限位。正常界面只显示标定A4纸面；选择模式/材料后必须点击`START`，连续3帧后锁定一次轮廓，成功或失败都保持到再次点击`START`。WHITE依次执行整边`GRAPH_AUTO`、四片`FOUR_FAST`和原FALLBACK，CARD继续使用原始锁定轮廓和纹理择优。
 
 ## 当前功能
 
@@ -28,7 +28,7 @@
 | 触摸操作 | 正常界面使用`KNOWN`、`UNKNOWN`、`WHITE/SAVE`、`START`、`CAL`，CAL界面直接调参数 |
 | 参数持久化 | 只有`GOOD 4/4`时允许保存，重启后自动恢复现场参数 |
 | 分离保存门 | 1～4片可`LOCK ROI`；ADV分割参数仍需`GOOD 4/4` |
-| 机械毫米区域 | 屏幕直接调X/Y/W/H/SPLIT/PAPER；竖放默认210×230mm，横放默认230×210mm |
+| 视觉毫米区域 | 屏幕直接调X/Y/W/H/SPLIT/PAPER；竖放默认210×297mm，横放默认297×210mm，F4另做230×230mm机械限位 |
 | 已知拼装 | 下半区保存一次正确100×60mm布局，运行时最多24种全局匹配 |
 | 未知拼装 | 1～4片WHITE/CARD显式选择；WHITE依次运行32边/90组合GRAPH、四片分段接缝Beam和96宽FALLBACK；CARD保留T形分段接缝和扑克牌评分 |
 | 倾斜相机映射 | 完整A4四角按V=210×297mm或H=297×210mm建立Homography，像素轮廓反算后再规划回绘 |
