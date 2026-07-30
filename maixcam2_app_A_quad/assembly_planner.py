@@ -11,12 +11,12 @@ import numpy as np
 
 # ======================== 现场调试常量（用户可直接修改） ========================
 # 第一轮严格矩形验收的最低填充率。提高会减少误接受，降低会容忍更多角点缺口。
-UNKNOWN_STRICT_MIN_FILL_RATIO = 0.90
+UNKNOWN_STRICT_MIN_FILL_RATIO = 0.92
 # 仅WHITE严格轮失败后使用的最低填充率；尺寸、重叠和逐片外边约束不会随之放宽。
-UNKNOWN_RELAXED_MIN_FILL_RATIO = 0.84
+UNKNOWN_RELAXED_MIN_FILL_RATIO = 0.85
 # UNKNOWN WHITE求解副本允许合并的伪短边上限，单位mm；设为0.0可完全关闭清理。
-# 题目真实边不短于20mm，当前8mm为远距离角点误差保留12mm安全余量。
-UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM = 8.0
+# 题目真实边不短于20mm，当前10mm为远距离角点误差保留10mm安全余量。
+UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM = 10.0
 # True时在WHITE四片的整边GRAPH失败后启用分层Beam快路径；False可恢复旧FALLBACK。
 UNKNOWN_FOUR_FAST_ENABLED = True
 # FOUR_FAST每层全局保留的状态数；增大可提高复杂轮廓召回，但会增加候选检查量。
