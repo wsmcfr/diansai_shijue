@@ -253,8 +253,15 @@ def test_runtime_debug_log_reports_snapshot_graph_and_result(capsys):
     assert "[SOLVER] PIECE" in output
     assert "vertices_mm=" in output
     assert "edges_mm=" in output
+    assert "[SOLVER] SHAPE id=U1" in output
+    assert "candidates=" in output
+    assert "best_vertices=" in output
+    assert "min_edge=" in output
+    assert "score=" in output
     assert "[SOLVER] GRAPH" in output
     assert "layouts=" in output
+    assert "[SOLVER] TIER rank=0" in output
+    assert "[SOLVER] ACCEPT shapes=U1:0" in output
     assert "[SOLVER] RESULT" in output
     assert "reason=ok" in output
 
@@ -363,6 +370,27 @@ def test_runtime_disabled_debug_does_not_build_cleanup_preview(monkeypatch, caps
                 "center_mm": tuple(float(value) for value in np.mean(vertices, axis=0)),
             }
         ],
+    )
+
+    assert "[SOLVER]" not in capsys.readouterr().out
+
+
+def test_runtime_disabled_debug_does_not_build_shape_preview(monkeypatch, capsys):
+    """调试关闭时快照不得调用求解片构造器计算SHAPE候选摘要。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    def forbidden_solver_piece(*args, **kwargs):
+        """若关闭日志后仍构造候选预览，则立即使测试失败。"""
+        del args, kwargs
+        raise AssertionError("关闭调试后不应构造SHAPE日志预览")
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", forbidden_solver_piece)
+    runtime = assembly_planner.AssemblyRuntime(stable_frames=1, debug_enabled=False)
+
+    runtime._debug_snapshot(
+        "unknown",
+        "white",
+        [_unknown_rectangle()],
     )
 
     assert "[SOLVER]" not in capsys.readouterr().out

@@ -417,6 +417,35 @@ def _best_rotation_delta_deg(source_vertices_mm, target_vertices_mm):
     return _normalize_angle_deg(angle_deg), float(alignment_error)
 
 
+def _ordered_rigid_rotation_delta_deg(source_vertices_mm, target_vertices_mm):
+    """按完整轮廓相同点序计算无缩放、无镜像的刚体旋转角。
+
+    UNKNOWN搜索对`outline_local`只施加刚体变换，规范化布局也不会改变单片顶点顺序，
+    因此源轮廓与目标轮廓可以直接逐点对应。函数先按算术中心去平移，再用二维Kabsch
+    分解求行列式为正一的旋转；这避免通用闭合轮廓配准在矩形近似对称时误选相差
+    180度的等价角。返回`(规范到[-180,180)的角度, 均方根误差)`。
+    """
+    source = _normalize_vertices(source_vertices_mm)
+    target = _normalize_vertices(target_vertices_mm)
+    if source.shape != target.shape:
+        raise ValueError("有序刚体配准要求源目标完整轮廓点数一致")
+    source_centered = source - np.mean(source, axis=0)
+    target_centered = target - np.mean(target, axis=0)
+    covariance = source_centered.T @ target_centered
+    left_vectors, _singular_values, right_vectors_t = np.linalg.svd(covariance)
+    rotation = right_vectors_t.T @ left_vectors.T
+    if float(np.linalg.det(rotation)) < 0.0:
+        # 只允许纸面内旋转；若SVD给出反射，翻转最后一条主轴恢复正向旋转。
+        right_vectors_t[-1, :] *= -1.0
+        rotation = right_vectors_t.T @ left_vectors.T
+    transformed = source_centered @ rotation.T
+    error = float(
+        np.sqrt(np.mean(np.sum((transformed - target_centered) ** 2, axis=1)))
+    )
+    angle_deg = math.degrees(math.atan2(rotation[1, 0], rotation[0, 0]))
+    return _normalize_angle_deg(angle_deg), error
+
+
 def solve_known_layout(
     pieces,
     templates,
@@ -1946,7 +1975,7 @@ def _build_unknown_success_plan(
     placements = []
     for index, solver_piece in enumerate(solver_pieces):
         target_polygon = canonical_by_index[index] + target_origin
-        rotation_delta, _ = _best_rotation_delta_deg(
+        rotation_delta, _ = _ordered_rigid_rotation_delta_deg(
             solver_piece["outline_source"],
             target_polygon,
         )
@@ -4776,6 +4805,30 @@ class AssemblyRuntime:
                 )
 
             self._debug_log("PIECE", build_piece_details)
+            if str(mode).strip().lower() == "unknown":
+                def build_shape_details(piece=piece, fallback_index=fallback_index):
+                    """惰性构造当前碎片的候选数量、最佳顶点、最短边和质量分。"""
+                    try:
+                        solver_piece = _solver_piece(piece, fallback_index - 1)
+                        hypotheses = solver_piece["hypotheses"]
+                        best = hypotheses[0]
+                        return (
+                            f"id={piece.get('id', f'U{fallback_index}')} "
+                            f"candidates={len(hypotheses)} "
+                            f"best_vertices={len(best['local_vertices'])} "
+                            f"min_edge={float(best['minimum_edge_mm']):.1f}mm "
+                            f"score={float(best['score']):.3f}"
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        # 调试摘要不能因候选为空反过来中断相机主循环；正式求解仍会
+                        # 返回shape_hypothesis_empty或unknown_geometry_invalid。
+                        return (
+                            f"id={piece.get('id', f'U{fallback_index}')} "
+                            f"candidates=0 reason={str(error) or 'invalid'}"
+                        )
+
+                # 候选构造器只位于惰性回调内；debug关闭时不会执行额外几何计算。
+                self._debug_log("SHAPE", build_shape_details)
             if (
                 str(mode).strip().lower() == "unknown"
                 and str(unknown_profile).strip().lower() == UNKNOWN_PROFILE_WHITE
@@ -4800,6 +4853,17 @@ class AssemblyRuntime:
 
     def _debug_graph(self, diagnostics, plan, elapsed_ms):
         """输出一次GRAPH有界枚举统计和容错拒绝原因。"""
+        maximum_rank = int(diagnostics.get("maximum_hypothesis_rank", -1))
+        if maximum_rank >= 0:
+            self._debug_log(
+                "TIER",
+                lambda: (
+                    f"rank={maximum_rank} "
+                    f"edges={int(diagnostics.get('graph_edge_candidates', 0))} "
+                    f"states={int(diagnostics.get('graph_layouts_checked', 0))} "
+                    "source=GRAPH"
+                ),
+            )
         self._debug_log(
             "GRAPH",
             lambda: (
@@ -4821,6 +4885,17 @@ class AssemblyRuntime:
         关键参数：diagnostics来自`_solve_unknown_four_fast_path`，plan可为None；日志只在
         总调试开关开启时由`_debug_log`惰性格式化，不参与后续FALLBACK决策。
         """
+        maximum_rank = int(diagnostics.get("maximum_hypothesis_rank", -1))
+        if maximum_rank >= 0:
+            self._debug_log(
+                "TIER",
+                lambda: (
+                    f"rank={maximum_rank} "
+                    f"edges={int(diagnostics.get('four_work_units', 0))} "
+                    f"states={int(diagnostics.get('four_complete_states', 0))} "
+                    "source=FOUR_FAST"
+                ),
+            )
         self._debug_log(
             "FOUR_FAST",
             lambda: (
@@ -4892,6 +4967,22 @@ class AssemblyRuntime:
             else max(0, int(round((time.monotonic() - self._solve_started_at) * 1000.0)))
         )
         diagnostics = plan.diagnostics if isinstance(plan, AssemblyPlan) else {}
+        selected_hypotheses = diagnostics.get("selected_hypotheses", tuple())
+        if bool(getattr(plan, "success", False)) and selected_hypotheses:
+            def build_accept_details():
+                """按锁定碎片顺序惰性格式化最终采用的候选编号。"""
+                piece_ids = [
+                    str(piece.get("id", f"U{index + 1}"))
+                    for index, piece in enumerate(self.locked_pieces)
+                ]
+                shape_text = ",".join(
+                    f"{piece_ids[index] if index < len(piece_ids) else f'U{index + 1}'}:"
+                    f"{int(hypothesis_index)}"
+                    for index, hypothesis_index in enumerate(selected_hypotheses)
+                )
+                return f"shapes={shape_text} source={str(source).upper()}"
+
+            self._debug_log("ACCEPT", build_accept_details)
         self._debug_log(
             "RESULT",
             lambda: (

@@ -868,6 +868,70 @@ def test_fallback_maps_dominant_hard_gate_failure(
     assert plan.reason == public_reason
 
 
+def test_unknown_placement_rigid_transform_recovers_full_target_outline():
+    """机械中心和旋转角必须把锁定完整轮廓恢复到下半区目标完整轮廓。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    canonical_outline = np.asarray(
+        ((0, 0), (50, -0.4), (100, 0), (100, 60), (50, 60.4), (0, 60)),
+        dtype=np.float64,
+    )
+    canonical_center = np.asarray(
+        assembly_planner._polygon_centroid(canonical_outline),
+        dtype=np.float64,
+    )
+    source_angle_deg = 37.0
+    source_angle = math.radians(source_angle_deg)
+    source_rotation = np.asarray(
+        (
+            (math.cos(source_angle), -math.sin(source_angle)),
+            (math.sin(source_angle), math.cos(source_angle)),
+        ),
+        dtype=np.float64,
+    )
+    source_center = np.asarray((86.0, 83.0), dtype=np.float64)
+    outline_source = (
+        (canonical_outline - canonical_center) @ source_rotation.T + source_center
+    )
+    solver_piece = {
+        "id": "U1",
+        "source_center": tuple(float(value) for value in source_center),
+        "outline_source": outline_source,
+    }
+
+    plan = assembly_planner._build_unknown_success_plan(
+        [solver_piece],
+        ({0: canonical_outline}, 100.0, 60.8, 0.0),
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        score=0.0,
+        search_nodes=1,
+        diagnostics={},
+    )
+
+    assert plan is not None and plan.success is True
+    placement = plan.placements[0]
+    np.testing.assert_allclose(placement.source_center_mm, source_center, atol=1e-6)
+    assert placement.rotation_delta_deg == pytest.approx(-source_angle_deg, abs=0.1)
+    target_center = np.asarray(placement.target_center_mm, dtype=np.float64)
+    target_angle = math.radians(placement.rotation_delta_deg)
+    target_rotation = np.asarray(
+        (
+            (math.cos(target_angle), -math.sin(target_angle)),
+            (math.sin(target_angle), math.cos(target_angle)),
+        ),
+        dtype=np.float64,
+    )
+    reconstructed = (
+        (outline_source - source_center) @ target_rotation.T + target_center
+    )
+    np.testing.assert_allclose(
+        reconstructed,
+        np.asarray(placement.target_polygon_mm, dtype=np.float64),
+        atol=0.15,
+    )
+
+
 def test_white_solver_cleanup_macro_and_device_short_edges():
     """默认12mm宏必须清除实机U2/U3伪短边，且不修改输入数组。"""
     from maixcam2_app_A_quad import assembly_planner
