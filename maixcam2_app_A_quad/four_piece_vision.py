@@ -7,8 +7,10 @@ import numpy as np
 
 try:
     from maixcam2_app_A_quad.paper_locator import (
+        orient_a4_quad_for_coordinates,
         order_a4_quad,
         paper_size_mm,
+        validate_camera_mount_direction,
         validate_paper_orientation,
     )
 except ModuleNotFoundError as error:
@@ -16,8 +18,10 @@ except ModuleNotFoundError as error:
     if error.name != "maixcam2_app_A_quad":
         raise
     from paper_locator import (
+        orient_a4_quad_for_coordinates,
         order_a4_quad,
         paper_size_mm,
+        validate_camera_mount_direction,
         validate_paper_orientation,
     )
 
@@ -486,17 +490,20 @@ def analyze_four_piece_frame(
     paper_orientation,
     split_y_mm=None,
     pixels_per_mm=FOUR_WARP_PIXELS_PER_MM,
+    camera_mount_direction=None,
 ):
     """执行一帧FOUR专用透视、双阈值、受限拆分和毫米几何提取。
 
-    返回FourPieceDetection。该函数只做单帧视觉，不累计稳定状态、不启动求解；只有
-    FourPieceVisionRuntime负责跨帧锁定。四片按纸面X中心从左到右编号U1～U4。
+    关键参数camera_mount_direction决定纸面逻辑原点和上下区方向，为空时使用设备固定
+    配置。返回FourPieceDetection。该函数只做单帧视觉，不累计稳定状态、不启动求解；
+    只有FourPieceVisionRuntime负责跨帧锁定。四片按纸面X中心从左到右编号U1～U4。
     """
     warp = warp_full_paper(
         frame_bgr,
         paper_quad,
         paper_orientation,
         pixels_per_mm=pixels_per_mm,
+        camera_mount_direction=camera_mount_direction,
     )
     masks = build_four_piece_masks(warp.image, pixels_per_mm=warp.pixels_per_mm)
     masks = _mask_source_region(masks, split_y_mm, warp.pixels_per_mm)
@@ -583,19 +590,33 @@ class FourPieceVisionRuntime:
         self._locked_detection = None
         self._context_key = None
 
-    def update(self, frame_bgr, paper_quad, paper_orientation, split_y_mm=None):
+    def update(
+        self,
+        frame_bgr,
+        paper_quad,
+        paper_orientation,
+        split_y_mm=None,
+        camera_mount_direction=None,
+    ):
         """分析一帧并推进稳定门；锁定后始终返回同一个冻结检测对象。
 
         主要流程：标定上下文变化时清空旧参考；单帧必须恰有四片且全部完整才参与
         稳定计数；达到stable_frames后把当前结果标为locked并停止后续分割。
-        返回FourPieceDetection，便于界面显示实时失败原因或冻结轮廓。
+        camera_mount_direction是固定相机安装方向，也纳入稳定上下文；方向变化会清空旧
+        计数。返回FourPieceDetection，便于界面显示实时失败原因或冻结轮廓。
         """
         if self.snapshot_locked:
             return self._locked_detection
         normalized_quad = order_a4_quad(paper_quad)
         orientation = validate_paper_orientation(paper_orientation)
+        normalized_mount = (
+            None
+            if camera_mount_direction is None
+            else validate_camera_mount_direction(camera_mount_direction)
+        )
         context_key = (
             orientation,
+            normalized_mount,
             None if split_y_mm is None else round(float(split_y_mm), 4),
             tuple(np.round(normalized_quad.reshape(-1), 3)),
         )
@@ -609,6 +630,7 @@ class FourPieceVisionRuntime:
             orientation,
             split_y_mm=split_y_mm,
             pixels_per_mm=self.pixels_per_mm,
+            camera_mount_direction=normalized_mount,
         )
         self.last_detection = detection
         actionable = (
@@ -646,16 +668,24 @@ def build_paper_warp(
     paper_quad,
     paper_orientation,
     pixels_per_mm=FOUR_WARP_PIXELS_PER_MM,
+    camera_mount_direction=None,
 ):
     """构造相机像素与完整A4展开像素之间的一对单应矩阵。
 
     主要流程：规范蓝框四角和横竖方向，按毫米尺寸乘固定像素密度建立目标矩形，
-    再分别计算正向和反向Homography。关键参数paper_quad为相机像素四角；返回
+    再分别计算正向和反向Homography。关键参数paper_quad为相机像素四角，
+    camera_mount_direction决定四角对应的毫米原点和轴方向；返回
     ``(正向矩阵, 反向矩阵, 输出宽, 输出高, 纸面尺寸, 规范方向, 比例)``。
     """
     scale = _validate_pixels_per_mm(pixels_per_mm)
     orientation = validate_paper_orientation(paper_orientation)
-    ordered_quad = order_a4_quad(paper_quad)
+    # FOUR专用展开必须与普通毫米映射使用同一纸面定向，否则屏幕红线已经旋转后，
+    # 四片检测仍会按旧方向裁剪上半区，并发送错误的源中心和目标中心。
+    ordered_quad = orient_a4_quad_for_coordinates(
+        paper_quad,
+        orientation,
+        camera_mount_direction=camera_mount_direction,
+    )
     paper_width_mm, paper_height_mm = paper_size_mm(orientation)
     output_width = int(round(paper_width_mm * scale))
     output_height = int(round(paper_height_mm * scale))
@@ -697,11 +727,13 @@ def warp_full_paper(
     paper_quad,
     paper_orientation,
     pixels_per_mm=FOUR_WARP_PIXELS_PER_MM,
+    camera_mount_direction=None,
 ):
     """把固定相机中的完整A4蓝框展开为比例固定的俯视BGR图。
 
     主要流程：校验相机帧，调用build_paper_warp建立矩阵，再用线性插值展开颜色图。
-    线性插值只作用于BGR图；后续二值分割禁止使用会跨越2mm黑缝的大形态学核。
+    线性插值只作用于BGR图；camera_mount_direction为空时读取固定设备配置；后续
+    二值分割禁止使用会跨越2mm黑缝的大形态学核。
     返回PaperWarpResult，包含展开图、正逆矩阵、毫米尺寸和坐标换算方法。
     """
     _validate_frame(frame_bgr)
@@ -717,6 +749,7 @@ def warp_full_paper(
         paper_quad,
         paper_orientation,
         pixels_per_mm=pixels_per_mm,
+        camera_mount_direction=camera_mount_direction,
     )
     warped = cv2.warpPerspective(
         frame_bgr,

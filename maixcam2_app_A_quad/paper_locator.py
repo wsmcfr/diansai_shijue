@@ -25,6 +25,22 @@ PAPER_ORIENTATIONS = (
     PAPER_ORIENTATION_PORTRAIT,
     PAPER_ORIENTATION_LANDSCAPE,
 )
+CAMERA_MOUNT_TOP = "top"
+CAMERA_MOUNT_SIDE_LOWER_RIGHT = "side_lower_right"
+CAMERA_MOUNT_SIDE_LOWER_LEFT = "side_lower_left"
+CAMERA_MOUNT_UPSIDE_DOWN = "upside_down"
+CAMERA_MOUNT_DIRECTIONS = (
+    CAMERA_MOUNT_TOP,
+    CAMERA_MOUNT_SIDE_LOWER_RIGHT,
+    CAMERA_MOUNT_SIDE_LOWER_LEFT,
+    CAMERA_MOUNT_UPSIDE_DOWN,
+)
+CAMERA_MOUNT_QUAD_SHIFTS = {
+    CAMERA_MOUNT_TOP: 0,
+    CAMERA_MOUNT_SIDE_LOWER_RIGHT: 1,
+    CAMERA_MOUNT_SIDE_LOWER_LEFT: -1,
+    CAMERA_MOUNT_UPSIDE_DOWN: 2,
+}
 
 
 def validate_paper_orientation(paper_orientation):
@@ -36,6 +52,22 @@ def validate_paper_orientation(paper_orientation):
     normalized = str(paper_orientation).strip().lower()
     if normalized not in PAPER_ORIENTATIONS:
         raise ValueError("paper_orientation必须是portrait或landscape")
+    return normalized
+
+
+def validate_camera_mount_direction(camera_mount_direction):
+    """校验并返回固定相机安装方向。
+
+    可选值：top为正常顶置；side_lower_right/side_lower_left分别表示侧装后目标下半区
+    出现在原始CAL画面右侧/左侧；upside_down表示顶置画面旋转180度。非法值抛出
+    ValueError，防止机械毫米原点和UART坐标静默反向。
+    """
+    normalized = str(camera_mount_direction).strip().lower()
+    if normalized not in CAMERA_MOUNT_DIRECTIONS:
+        raise ValueError(
+            "camera_mount_direction必须是top、side_lower_right、"
+            "side_lower_left或upside_down"
+        )
     return normalized
 
 
@@ -221,17 +253,76 @@ def infer_paper_orientation(paper_quad):
     return PAPER_ORIENTATION_PORTRAIT
 
 
+def _machine_orientation_from_camera(observed_orientation, camera_mount_direction):
+    """把画面横竖方向转换为固定机械纸面方向。
+
+    关键参数：observed_orientation为蓝框在相机画面中的H/V；安装方向由枚举明确
+    90度正负和180度。侧装的奇数四分之一圈使H与V互换，顶置或倒置保持不变。
+    返回值：供工作区域、Homography和UART共同使用的逻辑PAPER方向。
+    """
+    orientation = validate_paper_orientation(observed_orientation)
+    direction = validate_camera_mount_direction(camera_mount_direction)
+    quarter_turns = abs(int(CAMERA_MOUNT_QUAD_SHIFTS[direction]))
+    if quarter_turns % 2 == 0:
+        return orientation
+    if orientation == PAPER_ORIENTATION_LANDSCAPE:
+        return PAPER_ORIENTATION_PORTRAIT
+    return PAPER_ORIENTATION_LANDSCAPE
+
+
+def orient_a4_quad_for_coordinates(
+    paper_quad,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+    camera_mount_direction=None,
+):
+    """按纸面逻辑方向返回毫米坐标系使用的四角顺序。
+
+    主要流程：先按画面左上、右上、右下、左下规范蓝框，再比较蓝框的画面方向与
+    固定安装方向先确定机械原点和Y轴正方向，再比较自动机械方向与用户保存的PAPER
+    方向。手动方向不一致时额外旋转一位作为兜底。这样两个侧装方向不会共用一个
+    模糊的90度布尔值，Homography也不会只交换210和297两个数值。
+
+    关键参数：paper_quad为相机像素四角；paper_orientation为用户确认的逻辑方向；
+    camera_mount_direction为空时读取config.py固定值，测试或离线工具可显式覆盖。
+    返回值：与物理(0,0)、(W,0)、(W,H)、(0,H)一一对应的4x2 float32四角。
+    循环移位始终保持四边形绕序，因此只旋转坐标系，不会镜像轮廓或反转角度手性。
+    """
+    ordered_quad = order_a4_quad(paper_quad)
+    requested_orientation = validate_paper_orientation(paper_orientation)
+    observed_orientation = infer_paper_orientation(ordered_quad)
+    direction = validate_camera_mount_direction(
+        DEFAULT_CONFIG.get("camera_mount_direction", CAMERA_MOUNT_TOP)
+        if camera_mount_direction is None
+        else camera_mount_direction
+    )
+    machine_orientation = _machine_orientation_from_camera(
+        observed_orientation,
+        direction,
+    )
+    corner_shift = int(CAMERA_MOUNT_QUAD_SHIFTS[direction])
+    if requested_orientation != machine_orientation:
+        # PAPER手动兜底选择另一组物理轴；安装方向仍决定90度旋转的正负。
+        corner_shift += 1 if corner_shift >= 0 else -1
+    return np.roll(ordered_quad, corner_shift, axis=0).astype(np.float32)
+
+
 def _physical_to_image_homography(
     paper_quad,
     paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+    camera_mount_direction=None,
 ):
     """构造完整A4毫米平面到相机四边形的单应性矩阵。
 
     主要流程：规范四角顺序，建立210×297毫米标准平面并求透视矩阵，再检查矩阵
     是否有限和可逆。返回值：``(矩阵, 有序四角)``；退化输入抛出 ValueError。
     """
-    ordered_quad = order_a4_quad(paper_quad)
-    paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
+    orientation = validate_paper_orientation(paper_orientation)
+    ordered_quad = orient_a4_quad_for_coordinates(
+        paper_quad,
+        orientation,
+        camera_mount_direction=camera_mount_direction,
+    )
+    paper_width_mm, paper_height_mm = paper_size_mm(orientation)
     physical_quad = np.float32(
         [
             [0, 0],
@@ -250,11 +341,13 @@ def build_active_quad(
     paper_quad,
     inset_mm=0.0,
     paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+    camera_mount_direction=None,
 ):
-    """由完整A4四角生成210×230mm机械有效四边形。
+    """由完整A4四角生成当前默认工作区的有效四边形。
 
-    主要流程：长边上下各裁33.5mm，再把左、右、上、下四边整体内缩 inset_mm，
-    最后通过完整A4单应性映射回相机坐标。inset_mm 允许0～20mm。
+    主要流程：读取当前纸张方向的默认毫米工作区，再把四边整体内缩inset_mm，最后
+    通过完整A4单应性映射回相机坐标。A版默认工作区等于完整A4，inset_mm允许0～20mm。
+    camera_mount_direction为空时使用设备固定配置；离线顶置图可显式传入top。
     返回值：按左上、右上、右下、左下排序的4×2 float32相机坐标。
     """
     try:
@@ -265,7 +358,11 @@ def build_active_quad(
         raise ValueError("inset_mm 必须位于0到20之间")
 
     orientation = validate_paper_orientation(paper_orientation)
-    matrix, _ = _physical_to_image_homography(paper_quad, orientation)
+    matrix, _ = _physical_to_image_homography(
+        paper_quad,
+        orientation,
+        camera_mount_direction=camera_mount_direction,
+    )
     work_x_mm, work_y_mm, work_width_mm, work_height_mm = default_work_region_mm(
         orientation
     )
@@ -319,6 +416,7 @@ def paper_points_to_image_px(
     points_mm,
     paper_quad,
     paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+    camera_mount_direction=None,
 ):
     """把一个或多个完整A4毫米点批量映射为相机像素坐标。
 
@@ -330,7 +428,11 @@ def paper_points_to_image_px(
         raise ValueError("points_mm必须是N×2毫米坐标")
     if not np.all(np.isfinite(points_array)):
         raise ValueError("points_mm必须包含有限数字")
-    matrix, _ = _physical_to_image_homography(paper_quad, paper_orientation)
+    matrix, _ = _physical_to_image_homography(
+        paper_quad,
+        paper_orientation,
+        camera_mount_direction=camera_mount_direction,
+    )
     mapped = cv2.perspectiveTransform(points_array.reshape(1, -1, 2), matrix)[0]
     if not np.all(np.isfinite(mapped)):
         raise ValueError("毫米点无法映射到相机坐标")
@@ -341,12 +443,14 @@ def paper_point_to_image_px(
     point_mm,
     paper_quad,
     paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+    camera_mount_direction=None,
 ):
     """把单个完整A4毫米点映射为相机像素浮点元组。"""
     mapped = paper_points_to_image_px(
         [point_mm],
         paper_quad,
         paper_orientation,
+        camera_mount_direction=camera_mount_direction,
     )[0]
     return float(mapped[0]), float(mapped[1])
 
@@ -381,13 +485,19 @@ def image_point_to_paper_mm(
     point,
     paper_quad,
     paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+    camera_mount_direction=None,
 ):
     """把原相机像素点反算为完整A4的毫米坐标。
 
-    关键参数：point 为 ``(x, y)`` 相机坐标；paper_quad 为已锁定完整A4四角。
-    返回值：``(x_mm, y_mm)`` 浮点元组，原点位于完整A4左上角。
+    关键参数：point为``(x, y)``相机坐标；paper_quad为已锁定完整A4四角；
+    camera_mount_direction为空时使用固定设备配置，测试可显式覆盖。
+    返回值：``(x_mm, y_mm)``浮点元组，原点位于安装方向定义的A4逻辑起点。
     """
-    _, ordered_quad = _physical_to_image_homography(paper_quad, paper_orientation)
+    _, ordered_quad = _physical_to_image_homography(
+        paper_quad,
+        paper_orientation,
+        camera_mount_direction=camera_mount_direction,
+    )
     paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
     physical_quad = np.float32(
         [
@@ -411,18 +521,24 @@ def image_points_to_paper_mm(
     points,
     paper_quad,
     paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+    camera_mount_direction=None,
 ):
     """把一个或多个相机像素点批量反算为完整A4毫米坐标。
 
     主要流程：用完整A4四角构造一次逆单应矩阵并批量透视变换，避免逐顶点重复求矩阵。
-    关键参数：points必须为N×2有限坐标。返回值：N×2 float32毫米数组。
+    关键参数：points必须为N×2有限坐标；camera_mount_direction决定纸面逻辑原点和
+    两轴方向，为空时使用固定设备配置。返回值：N×2 float32毫米数组。
     """
     points_array = np.asarray(points, dtype=np.float32)
     if points_array.ndim != 2 or points_array.shape[1] != 2:
         raise ValueError("points必须是N×2相机坐标")
     if not np.all(np.isfinite(points_array)):
         raise ValueError("points必须包含有限坐标")
-    _, ordered_quad = _physical_to_image_homography(paper_quad, paper_orientation)
+    _, ordered_quad = _physical_to_image_homography(
+        paper_quad,
+        paper_orientation,
+        camera_mount_direction=camera_mount_direction,
+    )
     paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
     physical_quad = np.float32(
         [
@@ -577,11 +693,16 @@ def locate_black_paper(frame_bgr, config=None):
             threshold=threshold,
             confidence=best_confidence,
         )
+    observed_orientation = infer_paper_orientation(best_quad)
+    paper_orientation = _machine_orientation_from_camera(
+        observed_orientation,
+        merged_config.get("camera_mount_direction", CAMERA_MOUNT_TOP),
+    )
     return PaperLocation(
         True,
         paper_quad=best_quad,
         active_quad=None,
-        paper_orientation=infer_paper_orientation(best_quad),
+        paper_orientation=paper_orientation,
         confidence=best_confidence,
         threshold=threshold,
         reason="ok",

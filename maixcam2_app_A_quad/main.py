@@ -43,7 +43,7 @@ try:
         image_point_to_paper_mm,
         image_points_to_paper_mm,
         locate_black_paper,
-        order_a4_quad,
+        orient_a4_quad_for_coordinates,
         paper_size_mm,
         validate_paper_orientation,
     )
@@ -108,7 +108,7 @@ except ModuleNotFoundError as error:
         image_point_to_paper_mm,
         image_points_to_paper_mm,
         locate_black_paper,
-        order_a4_quad,
+        orient_a4_quad_for_coordinates,
         paper_size_mm,
         validate_paper_orientation,
     )
@@ -1097,9 +1097,9 @@ def build_paper_display_canvas(
 
     orientation = validate_paper_orientation(paper_orientation)
     paper_width_mm, paper_height_mm = paper_size_mm(orientation)
-    # 设置V5允许按边连续的循环移位或反向四角；毫米映射会先order_a4_quad。显示若直接
-    # 信任保存顺序就可能旋转或镜像纸面，因此必须复用同一个规范化入口保持两条链一致。
-    source_quad = order_a4_quad(paper_quad)
+    # 显示展开必须复用毫米映射的纸面定向。侧装相机下PAPER方向与画面外接方向可能
+    # 不同；若这里仍只按左上角排序，红线和目标会在展开画面中再次错转90度。
+    source_quad = orient_a4_quad_for_coordinates(paper_quad, orientation)
 
     display_scale = min(
         canvas_width / float(paper_width_mm),

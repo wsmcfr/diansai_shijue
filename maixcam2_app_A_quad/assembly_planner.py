@@ -1263,19 +1263,35 @@ def _partial_layout_priority(
     placed_polygons,
     tolerance_mm=3.0,
     target_size_hint_mm=None,
+    long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
+    short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
 ):
     """计算部分布局的紧凑搜索优先级，并拒绝不可能装入最大目标框的状态。
 
     主要流程：先用点集直径和凸包面积做方向无关的安全上界剪枝；再计算最小外接
     矩形面积相对碎片总面积的空隙率。KNOWN可额外提供100×60mm尺寸提示，优先
-    搜索外框更接近已知目标的状态；提示只改变顺序，不参与合法性判定。
-    返回None表示不可能装入122×92mm目标，否则返回可排序浮点元组。
+    搜索外框更接近已知目标的状态；提示只改变顺序，不参与合法性判定。长短边范围
+    带普通UNKNOWN默认值，FOUR可传入自己的范围用于安全上界剪枝。
+    返回None表示不可能装入指定最大目标，否则返回可排序浮点元组。
     """
     polygons = [np.asarray(polygon, dtype=np.float64) for polygon in placed_polygons]
     all_points = np.vstack(polygons)
+    try:
+        long_side_range = tuple(float(value) for value in long_side_range_mm)
+        short_side_range = tuple(float(value) for value in short_side_range_mm)
+    except (TypeError, ValueError) as error:
+        raise ValueError("部分布局长短边范围必须包含有限数字") from error
+    for side_range in (long_side_range, short_side_range):
+        if (
+            len(side_range) != 2
+            or not all(math.isfinite(value) for value in side_range)
+            or side_range[0] <= 0.0
+            or side_range[0] > side_range[1]
+        ):
+            raise ValueError("部分布局长短边范围必须是递增的两个正有限数字")
     maximum_diagonal = math.hypot(
-        UNKNOWN_LONG_SIDE_RANGE_MM[1],
-        UNKNOWN_SHORT_SIDE_RANGE_MM[1],
+        long_side_range[1],
+        short_side_range[1],
     ) + max(0.0, float(tolerance_mm))
     point_differences = all_points[:, None, :] - all_points[None, :, :]
     maximum_distance = float(
@@ -1286,7 +1302,7 @@ def _partial_layout_priority(
 
     hull = cv2.convexHull(all_points.astype(np.float32).reshape(-1, 1, 2))
     maximum_area = (
-        UNKNOWN_LONG_SIDE_RANGE_MM[1] * UNKNOWN_SHORT_SIDE_RANGE_MM[1]
+        long_side_range[1] * short_side_range[1]
     )
     if abs(float(cv2.contourArea(hull))) > maximum_area * 1.05:
         return None
@@ -1423,6 +1439,9 @@ def _canonicalize_complete_layout(
     min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
     require_all_outer_edges=False,
     metrics=None,
+    long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
+    short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
+    max_overlap_ratio=UNKNOWN_MAX_OVERLAP_RATIO,
 ):
     """把完整组合旋正到长边X轴，并用栅格验证目标矩形尺寸、重叠和缝隙。
 
@@ -1430,17 +1449,32 @@ def _canonicalize_complete_layout(
     再按调用方指定的填充门与外边策略验收。严格层使用92%且不额外要求外边；WHITE
     容错层使用文件顶部可调门槛，并强制每片至少拥有一条目标外边。
 
-    关键参数：min_fill_ratio必须位于0～1；require_all_outer_edges只允许容错层启用；
-    metrics若为字典会写入本次候选的浮点诊断，不参与机械结果。
+    关键参数：min_fill_ratio和max_overlap_ratio必须位于0～1；长短边范围均为
+    ``(最小值, 最大值)``。require_all_outer_edges只允许容错层启用；metrics若为字典
+    会写入本次候选的浮点诊断，不参与机械结果。验收参数带UNKNOWN旧默认值，FOUR
+    可显式覆盖而不改变普通UNKNOWN调用行为。
     返回值：``(结果, 原因)``；成功时结果为按索引多边形、宽、高和几何分数，
     原因为None；失败原因区分尺寸、填充、重叠或逐片外边拒绝。
     """
     try:
         minimum_fill = float(min_fill_ratio)
+        maximum_overlap = float(max_overlap_ratio)
+        long_side_range = tuple(float(value) for value in long_side_range_mm)
+        short_side_range = tuple(float(value) for value in short_side_range_mm)
     except (TypeError, ValueError) as error:
-        raise ValueError("最低填充率必须是0到1之间的有限数字") from error
+        raise ValueError("矩形验收参数必须包含有限数字") from error
     if not 0.0 <= minimum_fill <= 1.0 or not math.isfinite(minimum_fill):
         raise ValueError("最低填充率必须是0到1之间的有限数字")
+    if not 0.0 <= maximum_overlap <= 1.0 or not math.isfinite(maximum_overlap):
+        raise ValueError("最大重叠率必须是0到1之间的有限数字")
+    for side_range in (long_side_range, short_side_range):
+        if (
+            len(side_range) != 2
+            or not all(math.isfinite(value) for value in side_range)
+            or side_range[0] <= 0.0
+            or side_range[0] > side_range[1]
+        ):
+            raise ValueError("矩形长短边范围必须是递增的两个正有限数字")
     metric_values = metrics if isinstance(metrics, dict) else None
 
     indices = sorted(placed_by_index)
@@ -1478,8 +1512,8 @@ def _canonicalize_complete_layout(
             }
         )
     if not (
-        UNKNOWN_LONG_SIDE_RANGE_MM[0] <= width_mm <= UNKNOWN_LONG_SIDE_RANGE_MM[1]
-        and UNKNOWN_SHORT_SIDE_RANGE_MM[0] <= height_mm <= UNKNOWN_SHORT_SIDE_RANGE_MM[1]
+        long_side_range[0] <= width_mm <= long_side_range[1]
+        and short_side_range[0] <= height_mm <= short_side_range[1]
     ):
         return None, "size_reject"
 
@@ -1505,7 +1539,7 @@ def _canonicalize_complete_layout(
                 "overlap_ratio": float(overlap_ratio),
             }
         )
-    if overlap_ratio > UNKNOWN_MAX_OVERLAP_RATIO:
+    if overlap_ratio > maximum_overlap:
         return None, "overlap_reject"
     if fill_ratio < minimum_fill:
         return None, "fill_reject"
@@ -2082,6 +2116,11 @@ def _solve_unknown_four_fast_path_steps(
     beam_width=UNKNOWN_FOUR_FAST_BEAM_WIDTH,
     max_work_units=UNKNOWN_FOUR_FAST_MAX_WORK_UNITS,
     progress=None,
+    strict_min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
+    relaxed_min_fill_ratio=UNKNOWN_RELAXED_MIN_FILL_RATIO,
+    long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
+    short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
+    max_overlap_ratio=UNKNOWN_MAX_OVERLAP_RATIO,
 ):
     """逐候选执行UNKNOWN WHITE四片分层Beam快解。
 
@@ -2090,10 +2129,11 @@ def _solve_unknown_four_fast_path_steps(
     `_candidate_overlaps_fast`剪枝，完整状态仍调用现有92%严格与86%容错硬验收。
 
     关键参数：beam_width限制每个未完成层保留状态数，max_work_units限制对齐候选检查
-    总数；中间层达到上限时直接返回无解，完整层达到上限时仍验收已经生成的候选，
-    只有这些候选无解才返回None并由调用方继续FALLBACK。每个候选或完整验收后yield；
-    StopIteration.value返回`(plan, diagnostics)`。progress可选共享字典用于在yield前保存
-    已通过硬门的规划，机械目标仍由公共构造函数生成。
+    总数；strict/relaxed、长短边范围和最大重叠率带普通UNKNOWN默认值，独立FOUR可
+    显式传入自己的现场宏。中间层达到上限时直接返回无解，完整层达到上限时仍验收
+    已生成的候选，只有这些候选无解才返回None并由调用方继续FALLBACK。每个候选或
+    完整验收后yield；StopIteration.value返回`(plan, diagnostics)`。progress可选共享
+    字典用于在yield前保存已通过硬门的规划，机械目标仍由公共构造函数生成。
     """
     diagnostics = {
         "four_fast_path": 0,
@@ -2127,6 +2167,11 @@ def _solve_unknown_four_fast_path_steps(
         selected_work_limit = int(max_work_units)
         selected_pixels_per_mm = float(pixels_per_mm)
         length_tolerance = float(edge_length_tolerance_mm)
+        selected_strict_fill = float(strict_min_fill_ratio)
+        selected_relaxed_fill = float(relaxed_min_fill_ratio)
+        selected_max_overlap = float(max_overlap_ratio)
+        selected_long_range = tuple(float(value) for value in long_side_range_mm)
+        selected_short_range = tuple(float(value) for value in short_side_range_mm)
         if (
             selected_beam_width <= 0
             or selected_work_limit <= 0
@@ -2134,8 +2179,21 @@ def _solve_unknown_four_fast_path_steps(
             or not math.isfinite(selected_pixels_per_mm)
             or length_tolerance < 0.0
             or not math.isfinite(length_tolerance)
+            or not 0.0 <= selected_relaxed_fill <= selected_strict_fill <= 1.0
+            or not math.isfinite(selected_strict_fill)
+            or not math.isfinite(selected_relaxed_fill)
+            or not 0.0 <= selected_max_overlap <= 1.0
+            or not math.isfinite(selected_max_overlap)
         ):
             raise ValueError
+        for side_range in (selected_long_range, selected_short_range):
+            if (
+                len(side_range) != 2
+                or not all(math.isfinite(value) for value in side_range)
+                or side_range[0] <= 0.0
+                or side_range[0] > side_range[1]
+            ):
+                raise ValueError
         # FOUR_FAST保留原锁定顶点，以免删除伪短边时损失最终填充面积；快速重叠已经
         # 负责压低原始五边形带来的每候选成本。
         solver_pieces = [
@@ -2291,6 +2349,8 @@ def _solve_unknown_four_fast_path_steps(
                             partial_priority = _partial_layout_priority(
                                 list(updated.values()),
                                 tolerance_mm=length_tolerance,
+                                long_side_range_mm=selected_long_range,
+                                short_side_range_mm=selected_short_range,
                             )
                             if partial_priority is None:
                                 diagnostics["four_partial_reject"] += 1
@@ -2378,8 +2438,11 @@ def _solve_unknown_four_fast_path_steps(
             canonical_result, rejection_reason = _canonicalize_complete_layout(
                 state["placed"],
                 pixels_per_mm=selected_pixels_per_mm,
-                min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
+                min_fill_ratio=selected_strict_fill,
                 metrics=strict_metrics,
+                long_side_range_mm=selected_long_range,
+                short_side_range_mm=selected_short_range,
+                max_overlap_ratio=selected_max_overlap,
             )
             accepted_relaxed = False
             candidate_metrics = strict_metrics
@@ -2395,9 +2458,12 @@ def _solve_unknown_four_fast_path_steps(
                 canonical_result, relaxed_reason = _canonicalize_complete_layout(
                     state["placed"],
                     pixels_per_mm=selected_pixels_per_mm,
-                    min_fill_ratio=UNKNOWN_RELAXED_MIN_FILL_RATIO,
+                    min_fill_ratio=selected_relaxed_fill,
                     require_all_outer_edges=True,
                     metrics=relaxed_metrics,
+                    long_side_range_mm=selected_long_range,
+                    short_side_range_mm=selected_short_range,
+                    max_overlap_ratio=selected_max_overlap,
                 )
                 if canonical_result is None:
                     if relaxed_reason == "outer_edge_reject":
@@ -2488,11 +2554,17 @@ def _solve_unknown_four_fast_path(
     max_work_units=UNKNOWN_FOUR_FAST_MAX_WORK_UNITS,
     incremental=False,
     progress=None,
+    strict_min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
+    relaxed_min_fill_ratio=UNKNOWN_RELAXED_MIN_FILL_RATIO,
+    long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
+    short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
+    max_overlap_ratio=UNKNOWN_MAX_OVERLAP_RATIO,
 ):
     """创建FOUR_FAST增量核心；默认同步消费以保持既有调用兼容。
 
     incremental=True时返回可跨帧恢复的生成器；默认False时返回原有
-    `(plan, diagnostics)`。beam_width和max_work_units仍分别约束召回宽度与总候选数。
+    `(plan, diagnostics)`。beam_width和max_work_units仍分别约束召回宽度与总候选数；
+    其余验收参数均保留UNKNOWN旧默认值，供独立FOUR显式覆盖。
     """
     steps = _solve_unknown_four_fast_path_steps(
         pieces,
@@ -2503,6 +2575,11 @@ def _solve_unknown_four_fast_path(
         beam_width=beam_width,
         max_work_units=max_work_units,
         progress=progress,
+        strict_min_fill_ratio=strict_min_fill_ratio,
+        relaxed_min_fill_ratio=relaxed_min_fill_ratio,
+        long_side_range_mm=long_side_range_mm,
+        short_side_range_mm=short_side_range_mm,
+        max_overlap_ratio=max_overlap_ratio,
     )
     if bool(incremental):
         return steps

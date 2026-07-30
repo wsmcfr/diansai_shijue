@@ -192,6 +192,54 @@ def test_four_solve_job_advances_in_bounded_work_units():
     assert calls < 2000
 
 
+def test_four_solve_job_returns_validated_plan_when_last_unit_crosses_budget():
+    """工作单元越过活动截止线时，已验证计划必须优先于solver_timeout返回。"""
+    from maixcam2_app_A_quad.four_piece_solver import (
+        FourPieceSolveJob,
+        solve_four_piece_layout,
+    )
+
+    validated = solve_four_piece_layout(
+        _four_grid_pieces(),
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+    )
+    assert validated.success is True
+    clock_values = iter((0.0, 0.0, 3.1))
+    job = FourPieceSolveJob(
+        _four_grid_pieces(),
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+        active_budget_seconds=3.0,
+        clock=lambda: next(clock_values),
+    )
+
+    def one_expensive_success_unit():
+        """模拟底层在yield前保存计划，但该工作单元执行后已越过截止线。"""
+        job._fast_progress["best_plan"] = validated
+        yield None
+        return validated
+
+    job._generator = one_expensive_success_unit()
+    result = job.advance(time_budget_ms=10000.0, work_unit_limit=2)
+
+    # 截止返回前必须克隆并重建位姿，不能直接复用底层快图对象中的旧角度。
+    assert result is not validated
+    assert result.success is True
+    assert [item.piece_id for item in result.placements] == [
+        item.piece_id for item in validated.placements
+    ]
+    np.testing.assert_allclose(
+        [item.target_center_mm for item in result.placements],
+        [item.target_center_mm for item in validated.placements],
+        atol=1e-4,
+    )
+    assert result.diagnostics["fill_milli"] == validated.diagnostics["fill_milli"]
+    assert result.diagnostics["overlap_milli"] == validated.diagnostics["overlap_milli"]
+    assert result.diagnostics["returned_best_at_timeout"] == 1
+    assert job.done is True
+
+
 def test_four_solver_rejects_wrong_count_and_out_of_range_rectangle():
     """非四片和80×40mm小矩形都必须失败，且不得携带任何机械目标。"""
     from maixcam2_app_A_quad.four_piece_solver import solve_four_piece_layout
@@ -211,3 +259,71 @@ def test_four_solver_rejects_wrong_count_and_out_of_range_rectangle():
     assert too_small.reason in ("no_rect", "size_reject")
     assert wrong_count.placements == []
     assert too_small.placements == []
+
+
+def test_four_solver_applies_dedicated_two_mm_size_tolerance():
+    """FOUR应接受题目上限外2mm测量误差，并拒绝超过专用容差的尺寸。"""
+    from maixcam2_app_A_quad.four_piece_solver import solve_four_piece_layout
+
+    within_tolerance = solve_four_piece_layout(
+        _four_grid_pieces(width=100.0, height=91.0),
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+    )
+    outside_tolerance = solve_four_piece_layout(
+        _four_grid_pieces(width=100.0, height=93.0),
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+    )
+
+    assert within_tolerance.success is True
+    assert outside_tolerance.success is False
+    assert outside_tolerance.reason in ("no_rect", "size_reject")
+
+
+def test_four_fast_path_isolated_from_unknown_acceptance_globals(monkeypatch):
+    """FOUR快图必须显式使用专用验收宏，不能随普通UNKNOWN全局值改变。"""
+    from maixcam2_app_A_quad import assembly_planner
+    from maixcam2_app_A_quad.four_piece_solver import solve_four_piece_layout
+    from tests_ab.test_a_unknown_planner import _field_four_pieces_from_device_log
+
+    # 把普通UNKNOWN验收改成必然拒绝实机矩形；FOUR仍应按自己的题目范围求解成功。
+    monkeypatch.setattr(assembly_planner, "UNKNOWN_LONG_SIDE_RANGE_MM", (1.0, 2.0))
+    monkeypatch.setattr(assembly_planner, "UNKNOWN_SHORT_SIDE_RANGE_MM", (1.0, 2.0))
+    monkeypatch.setattr(assembly_planner, "UNKNOWN_STRICT_MIN_FILL_RATIO", 0.999)
+    monkeypatch.setattr(assembly_planner, "UNKNOWN_RELAXED_MIN_FILL_RATIO", 0.999)
+    monkeypatch.setattr(assembly_planner, "UNKNOWN_MAX_OVERLAP_RATIO", 0.0)
+
+    plan = solve_four_piece_layout(
+        _field_four_pieces_from_device_log(),
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+    )
+
+    assert plan.success is True, (plan.reason, plan.diagnostics)
+
+
+def test_four_solver_handles_device_snapshot_without_generic_fallback():
+    """实机噪声轮廓必须走四片快图求解，不能依赖旧通用FALLBACK。"""
+    from maixcam2_app_A_quad.four_piece_solver import solve_four_piece_layout
+    from tests_ab.test_a_unknown_planner import _field_four_pieces_from_device_log
+
+    plan = solve_four_piece_layout(
+        _field_four_pieces_from_device_log(),
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+    )
+
+    assert plan.success is True, (plan.reason, plan.search_nodes, plan.diagnostics)
+    assert len(plan.placements) == 4
+    assert plan.diagnostics["solver_source_fast"] == 1
+    assert plan.diagnostics["native_search_nodes"] == 0
+    pieces_by_id = {
+        piece["id"]: piece for piece in _field_four_pieces_from_device_log()
+    }
+    for placement in plan.placements:
+        # 实机回退路径同样必须保证UART中心和角度可精确重建目标，不能只看矩形成功。
+        _assert_placement_reconstructs_target(
+            pieces_by_id[placement.piece_id],
+            placement,
+        )

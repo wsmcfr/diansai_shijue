@@ -111,8 +111,8 @@ def test_a_v3_pixel_coordinates_scale_to_actual_high_resolution(tmp_path):
     assert loaded["fixed_threshold"] == 108.0
 
 
-def test_a_v5_saves_normalized_coordinates_and_loads_at_new_resolution(tmp_path):
-    """V5磁盘坐标必须与分辨率无关，换成640x480加载后应等比还原。"""
+def test_a_v6_saves_normalized_coordinates_and_loads_at_new_resolution(tmp_path):
+    """V6磁盘坐标必须与分辨率无关，换成640x480加载后应等比还原。"""
     from maixcam2_app_A_quad.config import DEFAULT_CONFIG
     from maixcam2_app_A_quad.settings_store import (
         build_default_runtime_settings,
@@ -120,7 +120,7 @@ def test_a_v5_saves_normalized_coordinates_and_loads_at_new_resolution(tmp_path)
         save_runtime_settings,
     )
 
-    path = tmp_path / "vision_settings_v5.json"
+    path = tmp_path / "vision_settings_v6.json"
     settings = build_default_runtime_settings(DEFAULT_CONFIG, frame_size=(1280, 960))
     settings["roi"] = [160, 60, 960, 840]
     settings["paper_quad"] = [
@@ -134,7 +134,7 @@ def test_a_v5_saves_normalized_coordinates_and_loads_at_new_resolution(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     loaded = load_runtime_settings(path, DEFAULT_CONFIG, frame_size=(640, 480))
 
-    assert payload["version"] == 5
+    assert payload["version"] == 6
     assert payload["coordinate_space"] == "normalized"
     assert all(0.0 <= value <= 1.0 for value in payload["roi"])
     assert all(

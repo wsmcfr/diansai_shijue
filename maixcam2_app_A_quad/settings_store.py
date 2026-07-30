@@ -27,12 +27,15 @@ except ModuleNotFoundError as error:
     )
 
 
-# V4开始把ROI和A4四角保存为0～1归一化值；V5新增纸张横竖方向字段。
+# V4开始把ROI和A4四角保存为0～1归一化值；V5新增纸张横竖方向字段；V6明确
+# 固定相机的四种安装方向。当前设备使用的V5蓝框没有侧装正负方向语义，升级时
+# 不能直接沿用到V6；V2～V4继续执行各自已有的历史兼容规则。
 # V2/V3设备文件固定来自旧版640x480相机，加载到高分辨率时必须显式等比迁移。
-SETTINGS_VERSION = 5
+SETTINGS_VERSION = 6
 LEGACY_SETTINGS_VERSION = 2
 PIXEL_SETTINGS_VERSION = 3
 NORMALIZED_SETTINGS_VERSION = 4
+ORIENTATION_SETTINGS_VERSION = 5
 LEGACY_PIXEL_FRAME_SIZE = (640, 480)
 
 # 只有这些字段允许由触摸调参界面修改并写入持久文件。
@@ -408,6 +411,7 @@ def load_runtime_settings(path, config, frame_size=None):
         LEGACY_SETTINGS_VERSION,
         PIXEL_SETTINGS_VERSION,
         NORMALIZED_SETTINGS_VERSION,
+        ORIENTATION_SETTINGS_VERSION,
         SETTINGS_VERSION,
     ):
         raise ValueError("现场参数文件版本无效")
@@ -469,14 +473,23 @@ def load_runtime_settings(path, config, frame_size=None):
         )
     else:
         if payload.get("coordinate_space") != "normalized":
-            raise ValueError("V4/V5现场参数缺少normalized坐标声明")
-        # V4还没有方向字段，严格沿用历史竖放语义；V5必须使用文件中的显式方向。
+            raise ValueError("V4/V5/V6现场参数缺少normalized坐标声明")
+        # V4还没有方向字段，严格沿用历史竖放语义；V5/V6使用文件中的显式方向。
         if version == NORMALIZED_SETTINGS_VERSION:
             loaded_settings["paper_orientation"] = PAPER_ORIENTATION_PORTRAIT
+        if version == ORIENTATION_SETTINGS_VERSION:
+            # V5虽然已经保存H/V，但当时毫米原点固定跟随画面左上角，没有记录相机
+            # 是向左还是向右侧装。继续使用旧蓝框会让红线、目标位置及UART毫米坐标
+            # 一起反向。ROI和分割阈值仍与坐标原点无关，因此保留；纸面相关字段则
+            # 全部恢复为V6默认值，迫使现场重新执行AUTO ROI和LOCK ROI。
+            loaded_settings["paper_quad"] = None
         loaded_settings = _normalized_to_pixel_coordinates(
             loaded_settings,
             actual_frame_size,
         )
+        if version == ORIENTATION_SETTINGS_VERSION:
+            for key in PAPER_SETTING_KEYS:
+                loaded_settings[key] = default_settings[key]
     return validate_runtime_settings(loaded_settings, actual_frame_size)
 
 

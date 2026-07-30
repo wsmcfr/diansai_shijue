@@ -44,4 +44,7 @@ DEFAULT_CONFIG = {
     "paper_min_rectangularity": 0.70,
     "paper_min_confidence": 0.65,
     "paper_close_kernel": 9,
+    # 固定相机安装方向同时决定AUTO H/V转换、毫米原点和上下区。当前结构中源碎片区
+    # 在原始CAL画面左侧、目标区在右侧；若实机相反改为side_lower_left。顶置相机用top。
+    "camera_mount_direction": "side_lower_right",
 }

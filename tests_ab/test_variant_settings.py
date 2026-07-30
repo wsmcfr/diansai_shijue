@@ -38,7 +38,7 @@ def test_settings_round_trip_paper_quad_and_inset(
 
     assert loaded["paper_quad"] == settings["paper_quad"]
     assert loaded["inset_mm"] == 2.0
-    expected_version = 5 if settings_name.startswith("maixcam2_app_A_quad") else 2
+    expected_version = 6 if settings_name.startswith("maixcam2_app_A_quad") else 2
     assert json.loads(settings_path.read_text(encoding="utf-8"))["version"] == expected_version
 
 
@@ -93,8 +93,8 @@ def test_group_merges_only_update_their_owned_fields(settings_name, config_name)
     assert current["paper_quad"] is None
 
 
-def test_a_v5_round_trip_persists_landscape_orientation(tmp_path):
-    """A版LOCK ROI所属设置必须把横放方向写入V5并在重启后恢复。"""
+def test_a_v6_round_trip_persists_landscape_orientation(tmp_path):
+    """A版LOCK ROI所属设置必须把横放方向写入V6并在重启后恢复。"""
     module, config_module = _load_variant_modules(*VARIANTS[0])
     settings = module.build_default_runtime_settings(config_module.DEFAULT_CONFIG)
     settings.update(
@@ -108,7 +108,7 @@ def test_a_v5_round_trip_persists_landscape_orientation(tmp_path):
             "split_y_mm": 105.0,
         }
     )
-    settings_path = tmp_path / "settings_v5.json"
+    settings_path = tmp_path / "settings_v6.json"
 
     module.save_runtime_settings(settings_path, settings, (640, 480))
     loaded = module.load_runtime_settings(
@@ -117,11 +117,49 @@ def test_a_v5_round_trip_persists_landscape_orientation(tmp_path):
         frame_size=(640, 480),
     )
 
-    assert module.SETTINGS_VERSION == 5
+    assert module.SETTINGS_VERSION == 6
     assert loaded["paper_orientation"] == "landscape"
     assert loaded["work_x_mm"] == pytest.approx(33.5)
     assert loaded["work_height_mm"] == pytest.approx(210.0)
-    assert json.loads(settings_path.read_text(encoding="utf-8"))["version"] == 5
+    assert json.loads(settings_path.read_text(encoding="utf-8"))["version"] == 6
+
+
+def test_a_v5_upgrade_clears_old_paper_lock_and_keeps_segmentation(tmp_path):
+    """旧V5蓝框坐标语义不兼容侧装方向，升级时必须强制重新AUTO和LOCK。"""
+    module, config_module = _load_variant_modules(*VARIANTS[0])
+    settings = module.build_default_runtime_settings(config_module.DEFAULT_CONFIG)
+    settings.update(
+        {
+            "paper_orientation": "landscape",
+            "paper_quad": [[70, 100], [570, 90], [550, 380], [90, 390]],
+            "work_x_mm": 33.5,
+            "work_y_mm": 0.0,
+            "work_width_mm": 230.0,
+            "work_height_mm": 210.0,
+            "split_y_mm": 105.0,
+            "fixed_threshold": 137.0,
+            "min_area_ratio": 0.007,
+        }
+    )
+    settings_path = tmp_path / "legacy_v5.json"
+    module.save_runtime_settings(settings_path, settings, (640, 480))
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    payload["version"] = 5
+    settings_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = module.load_runtime_settings(
+        settings_path,
+        config_module.DEFAULT_CONFIG,
+        frame_size=(640, 480),
+    )
+
+    assert loaded["paper_quad"] is None
+    assert loaded["paper_orientation"] == "portrait"
+    assert loaded["work_width_mm"] == pytest.approx(210.0)
+    assert loaded["work_height_mm"] == pytest.approx(297.0)
+    assert loaded["split_y_mm"] == pytest.approx(148.5)
+    assert loaded["fixed_threshold"] == pytest.approx(137.0)
+    assert loaded["min_area_ratio"] == pytest.approx(0.007)
 
 
 def test_a_v4_settings_migrate_to_portrait_orientation(tmp_path):

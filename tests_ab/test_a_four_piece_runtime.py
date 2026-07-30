@@ -42,6 +42,7 @@ def test_analyze_four_piece_frame_returns_mm_centers_and_original_draw_points():
         PAPER_QUAD,
         "portrait",
         split_y_mm=148.5,
+        camera_mount_direction="top",
     )
 
     assert detection.valid_contour_count == 4
@@ -65,6 +66,7 @@ def test_four_piece_detection_splits_only_a_support_bridge_with_four_strict_core
         PAPER_QUAD,
         "portrait",
         split_y_mm=148.5,
+        camera_mount_direction="top",
     )
 
     assert detection.pre_split_count == 3
@@ -83,6 +85,7 @@ def test_real_three_piece_scene_is_not_split_to_satisfy_four_mode():
         PAPER_QUAD,
         "portrait",
         split_y_mm=148.5,
+        camera_mount_direction="top",
     )
 
     assert detection.valid_contour_count == 3
@@ -104,24 +107,28 @@ def test_runtime_locks_exact_third_stable_observation_once():
         PAPER_QUAD,
         "portrait",
         split_y_mm=148.5,
+        camera_mount_direction="top",
     )
     second = runtime.update(
         _four_piece_frame(0.2),
         PAPER_QUAD,
         "portrait",
         split_y_mm=148.5,
+        camera_mount_direction="top",
     )
     locked = runtime.update(
         _four_piece_frame(0.1),
         PAPER_QUAD,
         "portrait",
         split_y_mm=148.5,
+        camera_mount_direction="top",
     )
     after_lock = runtime.update(
         _four_piece_frame(8.0),
         PAPER_QUAD,
         "portrait",
         split_y_mm=148.5,
+        camera_mount_direction="top",
     )
 
     assert first.locked is False
@@ -138,8 +145,20 @@ def test_runtime_unstable_frame_restarts_count_and_reset_returns_idle():
     from maixcam2_app_A_quad.four_piece_vision import FourPieceVisionRuntime
 
     runtime = FourPieceVisionRuntime(stable_frames=3, center_tolerance_mm=1.0)
-    runtime.update(_four_piece_frame(0.0), PAPER_QUAD, "portrait", 148.5)
-    runtime.update(_four_piece_frame(6.0), PAPER_QUAD, "portrait", 148.5)
+    runtime.update(
+        _four_piece_frame(0.0),
+        PAPER_QUAD,
+        "portrait",
+        148.5,
+        camera_mount_direction="top",
+    )
+    runtime.update(
+        _four_piece_frame(6.0),
+        PAPER_QUAD,
+        "portrait",
+        148.5,
+        camera_mount_direction="top",
+    )
 
     assert runtime.stable_count == 1
     runtime.reset()

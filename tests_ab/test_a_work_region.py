@@ -1,4 +1,4 @@
-"""验证A版设置V5、可调毫米机械区域和分界线调参行为。"""
+"""验证A版设置V6、可调毫米机械区域和分界线调参行为。"""
 
 import json
 from types import SimpleNamespace
@@ -35,11 +35,11 @@ def _empty_detection():
     )
 
 
-def test_a_defaults_expose_v5_work_region_and_split():
+def test_a_defaults_expose_v6_work_region_and_split():
     """A版首次启动必须使用完整210×297mm纸面区域和A4中线。"""
     settings = settings_store.build_default_runtime_settings(DEFAULT_CONFIG)
 
-    assert settings_store.SETTINGS_VERSION == 5
+    assert settings_store.SETTINGS_VERSION == 6
     assert settings["paper_orientation"] == "portrait"
     assert settings["work_x_mm"] == 0.0
     assert settings["work_y_mm"] == 0.0
@@ -54,8 +54,8 @@ def test_a_default_work_region_uses_full_a4_in_both_orientations():
     assert paper_locator.default_work_region_mm("landscape") == (0.0, 0.0, 297.0, 210.0)
 
 
-def test_a_v5_settings_round_trip_work_region(tmp_path):
-    """方向和五个机械参数保存并重载后必须保持浮点毫米值和版本5。"""
+def test_a_v6_settings_round_trip_work_region(tmp_path):
+    """方向和五个机械参数保存并重载后必须保持浮点毫米值和版本6。"""
     settings = _locked_settings()
     settings.update(
         {
@@ -72,7 +72,7 @@ def test_a_v5_settings_round_trip_work_region(tmp_path):
     loaded = settings_store.load_runtime_settings(settings_path, DEFAULT_CONFIG)
 
     assert loaded == settings_store.validate_runtime_settings(settings, (640, 480))
-    assert json.loads(settings_path.read_text(encoding="utf-8"))["version"] == 5
+    assert json.loads(settings_path.read_text(encoding="utf-8"))["version"] == 6
 
 
 def test_a_loads_v2_inset_as_equivalent_v3_region(tmp_path):
@@ -287,6 +287,74 @@ def test_a_landscape_plan_draw_uses_orientation_for_split_line():
     )
 
     assert np.array_equal(output[230, 317], np.asarray((0, 0, 255)))
+
+
+def test_a_side_camera_manual_orientation_rotates_paper_axes_and_split_line():
+    """侧装相机下手动切到V方向时，纸面坐标轴和红线必须整体旋转90度。
+
+    该四边形模拟A4在侧装相机中呈横向且带透视倾斜的画面。PAPER V表示纸面
+    毫米范围仍为210x297，因此297mm的Y轴应沿画面长边，148.5mm红线应连接
+    两条长边的中点并在画面中近似竖直，不能继续沿蓝框长边横向绘制。
+    """
+    side_camera_quad = np.float32(
+        ((90.0, 76.0), (220.0, 60.0), (228.0, 151.0), (92.0, 157.0))
+    )
+
+    split_line = paper_locator.build_split_segment(
+        side_camera_quad,
+        (0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+        paper_orientation="portrait",
+    )
+
+    delta = split_line[1] - split_line[0]
+    assert abs(float(delta[1])) > abs(float(delta[0])) * 4.0
+    for image_point, expected_mm in zip(
+        split_line,
+        ((0.0, 148.5), (210.0, 148.5)),
+    ):
+        recovered_mm = paper_locator.image_point_to_paper_mm(
+            image_point,
+            side_camera_quad,
+            paper_orientation="portrait",
+        )
+        np.testing.assert_allclose(recovered_mm, expected_mm, atol=0.05)
+
+
+def test_a_side_mount_direction_selects_origin_and_lower_region_side():
+    """侧装方向枚举必须明确毫米原点，并允许目标下半区位于画面左侧或右侧。"""
+    side_camera_quad = np.float32(
+        ((90.0, 76.0), (220.0, 60.0), (228.0, 151.0), (92.0, 157.0))
+    )
+
+    lower_right_quad = paper_locator.orient_a4_quad_for_coordinates(
+        side_camera_quad,
+        "portrait",
+        camera_mount_direction="side_lower_right",
+    )
+    lower_left_quad = paper_locator.orient_a4_quad_for_coordinates(
+        side_camera_quad,
+        "portrait",
+        camera_mount_direction="side_lower_left",
+    )
+
+    # 目标区在右：机械原点落在画面左下；目标区在左：机械原点落在画面右上。
+    np.testing.assert_allclose(lower_right_quad[0], side_camera_quad[3], atol=0.01)
+    np.testing.assert_allclose(lower_left_quad[0], side_camera_quad[1], atol=0.01)
+    right_target = paper_locator.paper_point_to_image_px(
+        (105.0, 260.0),
+        side_camera_quad,
+        "portrait",
+        camera_mount_direction="side_lower_right",
+    )
+    left_target = paper_locator.paper_point_to_image_px(
+        (105.0, 260.0),
+        side_camera_quad,
+        "portrait",
+        camera_mount_direction="side_lower_left",
+    )
+    assert right_target[0] > float(np.mean(side_camera_quad[:, 0]))
+    assert left_target[0] < float(np.mean(side_camera_quad[:, 0]))
 
 
 def test_a_work_value_action_cycles_selected_parameter():

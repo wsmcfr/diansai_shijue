@@ -170,10 +170,16 @@ def test_quad_analysis_maps_landscape_piece_to_297_by_210_mm_plane():
     from maixcam2_app_A_quad.main import analyze_quad_frame
 
     paper_quad = np.float32([[60, 90], [580, 80], [550, 390], [90, 400]])
-    physical_quad = np.float32([[0, 0], [297, 0], [297, 210], [0, 210]])
-    matrix = cv2.getPerspectiveTransform(physical_quad, paper_quad)
-    piece_mm = np.float32([[[205, 45], [250, 45], [250, 90], [205, 90]]])
-    piece_px = cv2.perspectiveTransform(piece_mm, matrix)[0]
+    # 生产配置是侧装相机，合成轮廓必须复用同一纸面方向；否则测试图等价于顶置相机，
+    # 与analyze_quad_frame读取的固定安装配置不一致。
+    from maixcam2_app_A_quad.paper_locator import paper_points_to_image_px
+
+    piece_mm = np.float32([[205, 45], [250, 45], [250, 90], [205, 90]])
+    piece_px = paper_points_to_image_px(
+        piece_mm,
+        paper_quad,
+        paper_orientation="landscape",
+    )
     frame = make_paper_scene(paper_quad, white_pieces=(piece_px,))
     settings = build_default_runtime_settings(DEFAULT_CONFIG)
     settings.update(
@@ -324,8 +330,16 @@ def test_paper_display_canvas_preserves_a4_aspect_and_hides_outside_scene(
     ]
     np.testing.assert_allclose(center_pixel, paper_color, atol=2)
 
+    # 侧装相机下PAPER方向可能与蓝框在画面中的横竖方向不同。展开入口应把纸面
+    # 逻辑四角而非固定的画面左上角映到目标矩形，才能与毫米坐标和红线保持一致。
+    from maixcam2_app_A_quad.paper_locator import orient_a4_quad_for_coordinates
+
+    coordinate_quad = orient_a4_quad_for_coordinates(
+        paper_quad,
+        paper_orientation,
+    )
     mapped_quad = cv2.perspectiveTransform(
-        paper_quad.reshape(1, -1, 2),
+        coordinate_quad.reshape(1, -1, 2),
         display_transform,
     )[0]
     expected_quad = np.float32(
@@ -745,7 +759,7 @@ def test_run_app_wires_unknown_profile_to_runtime_overlay_and_toggle():
 
 
 def test_run_app_passes_saved_paper_orientation_to_runtime_overlay():
-    """设备主循环必须把V5方向传给正常界面，确保红线和规划目标按同一纸面回绘。"""
+    """设备主循环必须把V6方向传给正常界面，确保红线和规划目标按同一纸面回绘。"""
     from maixcam2_app_A_quad import main
 
     syntax_tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8"))

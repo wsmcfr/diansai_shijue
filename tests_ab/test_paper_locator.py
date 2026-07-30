@@ -88,7 +88,14 @@ def test_active_quad_crops_long_edges_and_applies_inset_mm(module_name):
     module = importlib.import_module(module_name)
     paper_quad = np.float32([[100, 20], [310, 20], [310, 317], [100, 317]])
 
-    active_quad = module.build_active_quad(paper_quad, inset_mm=2.0)
+    if module_name == "maixcam2_app_A_quad.paper_locator":
+        active_quad = module.build_active_quad(
+            paper_quad,
+            inset_mm=2.0,
+            camera_mount_direction="top",
+        )
+    else:
+        active_quad = module.build_active_quad(paper_quad, inset_mm=2.0)
 
     if module_name == "maixcam2_app_A_quad.paper_locator":
         expected = np.float32([[102, 22], [308, 22], [308, 315], [102, 315]])
@@ -107,7 +114,14 @@ def test_image_point_to_paper_mm_reverses_perspective_mapping(module_name):
     physical_point = np.float32([[[87.5, 142.25]]])
     image_point = cv2.perspectiveTransform(physical_point, matrix)[0, 0]
 
-    recovered = module.image_point_to_paper_mm(image_point, paper_quad)
+    if module_name == "maixcam2_app_A_quad.paper_locator":
+        recovered = module.image_point_to_paper_mm(
+            image_point,
+            paper_quad,
+            camera_mount_direction="top",
+        )
+    else:
+        recovered = module.image_point_to_paper_mm(image_point, paper_quad)
 
     assert recovered == pytest.approx((87.5, 142.25), abs=0.02)
 
@@ -140,7 +154,10 @@ def test_a_locator_auto_detects_landscape_from_opposite_edge_averages():
     )
     scene = make_paper_scene(landscape_quad)
 
-    result = module.locate_black_paper(scene)
+    result = module.locate_black_paper(
+        scene,
+        {"camera_mount_direction": "top"},
+    )
 
     assert result.success is True
     assert result.paper_orientation == module.PAPER_ORIENTATION_LANDSCAPE
@@ -154,7 +171,10 @@ def test_a_locator_detects_strongly_skewed_landscape_paper():
     )
     scene = make_paper_scene(landscape_quad)
 
-    result = module.locate_black_paper(scene)
+    result = module.locate_black_paper(
+        scene,
+        {"camera_mount_direction": "top"},
+    )
 
     assert result.success is True
     assert result.paper_orientation == module.PAPER_ORIENTATION_LANDSCAPE
@@ -162,6 +182,32 @@ def test_a_locator_detects_strongly_skewed_landscape_paper():
         (0.0, 0.0, 297.0, 210.0)
     )
     assert module.default_split_y_mm(result.paper_orientation) == pytest.approx(105.0)
+
+
+def test_a_side_camera_auto_roi_converts_image_orientation_to_machine_orientation():
+    """侧装相机AUTO ROI必须把画面横纸转换为机械纸面的V方向。
+
+    蓝框在相机画面中长边近似水平，但固定侧装配置代表相机相对机械纸面旋转了
+    90度；因此AUTO结果应为210x297mm的V方向，后续红线才能自动旋转为竖向。
+    """
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    side_camera_quad = np.float32(
+        [[90, 76], [220, 60], [228, 151], [92, 157]]
+    )
+    scene = make_paper_scene(side_camera_quad)
+
+    result = module.locate_black_paper(scene)
+
+    assert result.success is True
+    assert result.paper_orientation == module.PAPER_ORIENTATION_PORTRAIT
+    split_line = module.build_split_segment(
+        result.paper_quad,
+        module.default_work_region_mm(result.paper_orientation),
+        module.default_split_y_mm(result.paper_orientation),
+        result.paper_orientation,
+    )
+    delta = split_line[1] - split_line[0]
+    assert abs(float(delta[1])) > abs(float(delta[0])) * 4.0
 
 
 def test_a_landscape_homography_round_trip_uses_297_by_210_mm():
@@ -177,6 +223,7 @@ def test_a_landscape_homography_round_trip_uses_297_by_210_mm():
         image_point,
         paper_quad,
         paper_orientation=module.PAPER_ORIENTATION_LANDSCAPE,
+        camera_mount_direction="top",
     )
 
     assert recovered == pytest.approx((231.5, 84.25), abs=0.02)
@@ -191,6 +238,7 @@ def test_a_landscape_default_active_quad_uses_full_paper():
         paper_quad,
         inset_mm=0.0,
         paper_orientation=module.PAPER_ORIENTATION_LANDSCAPE,
+        camera_mount_direction="top",
     )
 
     expected = paper_quad

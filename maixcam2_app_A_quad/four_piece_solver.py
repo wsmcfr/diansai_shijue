@@ -7,13 +7,21 @@ import cv2
 import numpy as np
 
 try:
-    from maixcam2_app_A_quad.assembly_planner import AssemblyPlacement, AssemblyPlan
+    from maixcam2_app_A_quad.assembly_planner import (
+        AssemblyPlacement,
+        AssemblyPlan,
+        _solve_unknown_four_fast_path,
+    )
     from maixcam2_app_A_quad.four_piece_vision import FourPieceVisionRuntime
 except ModuleNotFoundError as error:
     # MaixVision平铺部署时顶层包不存在，四片求解器仍复用同级兼容结果结构。
     if error.name != "maixcam2_app_A_quad":
         raise
-    from assembly_planner import AssemblyPlacement, AssemblyPlan
+    from assembly_planner import (
+        AssemblyPlacement,
+        AssemblyPlan,
+        _solve_unknown_four_fast_path,
+    )
     from four_piece_vision import FourPieceVisionRuntime
 
 
@@ -33,6 +41,8 @@ FOUR_BEAM_WIDTH = 32
 # 完整矩形长边和短边的题目范围，单位毫米。
 FOUR_RECT_LONG_RANGE_MM = (90.0, 120.0)
 FOUR_RECT_SHORT_RANGE_MM = (50.0, 90.0)
+# 视觉轮廓存在毫米级角点误差；该容差只放宽测量验收，不缩放最终机械目标。
+FOUR_RECT_SIZE_TOLERANCE_MM = 2.0
 # 严格轮和宽松轮最低填充率；宽松轮仍保持相同尺寸和重叠硬门。
 FOUR_STRICT_MIN_FILL_RATIO = 0.92
 FOUR_RELAXED_MIN_FILL_RATIO = 0.85
@@ -638,9 +648,14 @@ def _evaluate_complete_state(state):
     canonical, rotation, translation, width_mm, height_mm = canonicalized
     long_side = max(width_mm, height_mm)
     short_side = min(width_mm, height_mm)
+    size_tolerance = float(FOUR_RECT_SIZE_TOLERANCE_MM)
     if not (
-        FOUR_RECT_LONG_RANGE_MM[0] <= long_side <= FOUR_RECT_LONG_RANGE_MM[1]
-        and FOUR_RECT_SHORT_RANGE_MM[0] <= short_side <= FOUR_RECT_SHORT_RANGE_MM[1]
+        FOUR_RECT_LONG_RANGE_MM[0] - size_tolerance
+        <= long_side
+        <= FOUR_RECT_LONG_RANGE_MM[1] + size_tolerance
+        and FOUR_RECT_SHORT_RANGE_MM[0] - size_tolerance
+        <= short_side
+        <= FOUR_RECT_SHORT_RANGE_MM[1] + size_tolerance
     ):
         return None, "size_reject"
 
@@ -818,6 +833,155 @@ def _build_success_plan(pieces, state, evaluated, work_region_mm, split_y_mm, se
     )
 
 
+def _normalize_fast_diagnostics(diagnostics):
+    """把FOUR_FAST诊断转换为FOUR运行器使用的统一整数字段。
+
+    参数diagnostics来自四片快速图核心；返回新的字典，不修改底层对象。原始字段全部
+    保留，同时增加界面需要的填充率、重叠率和四类拒绝计数别名。
+    """
+    normalized = {
+        str(name): int(value)
+        for name, value in (diagnostics or {}).items()
+    }
+    normalized["fill_milli"] = int(normalized.get("fill_permille", 0))
+    normalized["overlap_milli"] = int(normalized.get("overlap_permille", 0))
+    normalized["overlap_reject"] = int(normalized.get("four_overlap_reject", 0))
+    normalized["size_reject"] = int(normalized.get("four_size_reject", 0))
+    normalized["fill_reject"] = int(normalized.get("four_fill_reject", 0))
+    normalized["geometry_reject"] = int(normalized.get("four_partial_reject", 0))
+    return normalized
+
+
+def _fast_failure_reason(diagnostics):
+    """根据四片快速图计数返回稳定的FOUR失败原因字符串。
+
+    尺寸不合格优先返回size_reject；已形成完整候选但没有通过填充或外边验收时返回
+    no_rect；连两片候选都没有时返回no_edge。返回值只用于状态显示，不携带机械目标。
+    """
+    if int(diagnostics.get("size_reject", 0)) > 0:
+        return "size_reject"
+    if (
+        int(diagnostics.get("fill_reject", 0)) > 0
+        or int(diagnostics.get("four_outer_edge_reject", 0)) > 0
+        or int(diagnostics.get("four_complete_states", 0)) > 0
+    ):
+        return "no_rect"
+    if int(diagnostics.get("four_pair_states", 0)) <= 0:
+        return "no_edge"
+    return "no_rect"
+
+
+def _plan_size_is_within_four_tolerance(plan):
+    """复核成功计划的实测矩形尺寸是否位于题目范围加测量容差内。
+
+    plan.target_rect_mm中的宽高仍保持实际毫米值，不会被缩放到题目边界；这里只允许
+    视觉轮廓在长短边上下限各偏差FOUR_RECT_SIZE_TOLERANCE_MM。无目标矩形返回False。
+    """
+    target_rect = getattr(plan, "target_rect_mm", None)
+    if target_rect is None or len(target_rect) != 4:
+        return False
+    measured_sides = sorted((float(target_rect[2]), float(target_rect[3])))
+    if not np.all(np.isfinite(measured_sides)):
+        return False
+    short_side, long_side = measured_sides
+    tolerance = float(FOUR_RECT_SIZE_TOLERANCE_MM)
+    return bool(
+        FOUR_RECT_LONG_RANGE_MM[0] - tolerance
+        <= long_side
+        <= FOUR_RECT_LONG_RANGE_MM[1] + tolerance
+        and FOUR_RECT_SHORT_RANGE_MM[0] - tolerance
+        <= short_side
+        <= FOUR_RECT_SHORT_RANGE_MM[1] + tolerance
+    )
+
+
+def _rebuild_fast_plan_placements(pieces, plan):
+    """由源顶点和快图目标顶点重新计算可直接发送的中心与旋转角。
+
+    旧FOUR_FAST使用最小外接矩形方向计算角度，规则矩形可能出现180度二义性；此外
+    视觉提供的center_mm可能与轮廓面积质心有小偏差。这里对同序顶点执行无缩放、
+    无镜像Kabsch拟合，并用同一个刚体变换计算target_center_mm。返回值仍是传入的
+    独立AssemblyPlan，但placements会替换为几何自洽的新对象。
+    """
+    pieces_by_id = {str(piece.get("id", "")): piece for piece in pieces}
+    rebuilt = []
+    for placement in plan.placements:
+        piece = pieces_by_id.get(str(placement.piece_id))
+        if piece is None:
+            raise ValueError("FOUR_FAST结果包含未知碎片编号")
+        source_vertices = _normalize_points(piece.get("vertices_mm"), "碎片源顶点")
+        target_vertices = _normalize_points(
+            placement.target_polygon_mm,
+            "碎片目标顶点",
+        )
+        if len(source_vertices) != len(target_vertices):
+            raise ValueError("FOUR_FAST源目标顶点数量不一致")
+
+        source_mean = np.mean(source_vertices, axis=0)
+        target_mean = np.mean(target_vertices, axis=0)
+        source_centered = source_vertices - source_mean
+        target_centered = target_vertices - target_mean
+        # 二维Kabsch可以用点积/叉积闭式求解，无需MaixPy设备端额外依赖SVD。
+        dot_sum = float(np.sum(source_centered * target_centered))
+        cross_sum = float(np.sum(
+            source_centered[:, 0] * target_centered[:, 1]
+            - source_centered[:, 1] * target_centered[:, 0]
+        ))
+        rotation_scale = math.hypot(dot_sum, cross_sum)
+        if rotation_scale <= 1e-12:
+            raise ValueError("FOUR_FAST源目标轮廓无法确定旋转角")
+        cosine = dot_sum / rotation_scale
+        sine = cross_sum / rotation_scale
+        # 行向量右乘矩阵等价于列向量的标准二维旋转；行列式恒为1，不允许镜像。
+        row_rotation = np.asarray(
+            ((cosine, sine), (-sine, cosine)),
+            dtype=np.float64,
+        )
+        translation = target_mean - source_mean @ row_rotation
+        rebuilt_target = source_vertices @ row_rotation + translation
+        maximum_error = float(np.max(np.linalg.norm(
+            rebuilt_target - target_vertices,
+            axis=1,
+        )))
+        if maximum_error > 1e-4:
+            raise ValueError("FOUR_FAST目标不是源轮廓的刚体变换")
+
+        source_center = _normalize_point(piece.get("center_mm"), "碎片源中心")
+        target_center = source_center @ row_rotation + translation
+        rotation_delta_deg = math.degrees(
+            math.atan2(float(row_rotation[0, 1]), float(row_rotation[0, 0]))
+        )
+        rebuilt.append(
+            AssemblyPlacement(
+                placement.piece_id,
+                source_center,
+                target_center,
+                rebuilt_target,
+                rotation_delta_deg,
+            )
+        )
+    rebuilt.sort(key=lambda item: item.piece_id)
+    plan.placements = rebuilt
+    return plan
+
+
+def _prefer_fast_graph_first(pieces):
+    """判断四片快照是否应优先使用抗噪声快图。
+
+    干净三角形/四边形由原生FOUR图直接处理；任一简化轮廓超过四个顶点，通常代表
+    反光、裸露铁片或远距离角点形成了额外折点，此时实机验证快图的边长守恒与紧凑
+    度排序更可靠。只读取vertices_mm，不使用稠密raw_contour_mm，避免把正常轮廓点
+    采样数量误当成噪声。
+    """
+    for piece in pieces:
+        try:
+            if len(piece.get("vertices_mm", ())) > 4:
+                return True
+        except (AttributeError, TypeError):
+            return False
+    return False
+
+
 class FourPieceSolveJob:
     """按有限工作单元跨帧推进的FOUR专用接缝图搜索任务。"""
 
@@ -851,7 +1015,8 @@ class FourPieceSolveJob:
         self.active_seconds = 0.0
         self.result = None
         self.done = False
-        self._stage = "relations"
+        self._stage = "validate"
+        self._fast_progress = {}
         self._relation_graph = {}
         if len(self.pieces) != 4:
             self.result = AssemblyPlan.failed("four_needs_exactly_four")
@@ -870,21 +1035,16 @@ class FourPieceSolveJob:
                 _normalize_polygon(piece.get("raw_contour_mm", piece.get("vertices_mm")))
                 _normalize_point(piece["center_mm"], "碎片源中心")
             _normalize_work_target(self.work_region_mm, self.split_y_mm)
+            # 原生FOUR图仍作为低成本第一阶段；只有它无解时才启动实机验证快图。
             for fixed_index, fixed_piece in enumerate(self.pieces):
                 for moving_index, moving_piece in enumerate(self.pieces):
                     if fixed_index == moving_index:
                         continue
-                    self._relation_graph[(fixed_index, moving_index)] = build_pair_relations(
-                        fixed_piece,
-                        moving_piece,
+                    self._relation_graph[(fixed_index, moving_index)] = (
+                        build_pair_relations(fixed_piece, moving_piece)
                     )
         except (KeyError, TypeError, ValueError):
             self.result = AssemblyPlan.failed("four_input_invalid")
-            self.done = True
-            self._generator = None
-            return
-        if not any(self._relation_graph.values()):
-            self.result = AssemblyPlan.failed("no_edge")
             self.done = True
             self._generator = None
             return
@@ -897,7 +1057,40 @@ class FourPieceSolveJob:
         return self._stage
 
     def _search_generator(self):
-        """逐候选yield工作单元，最终通过StopIteration返回AssemblyPlan。"""
+        """按轮廓复杂度选择首个四片图核心，无解时再运行另一核心。"""
+        if _prefer_fast_graph_first(self.pieces):
+            fast_result = yield from self._fast_search_generator()
+            if fast_result.success:
+                fast_result.diagnostics["solver_source_fast"] = 1
+                fast_result.diagnostics["native_search_nodes"] = 0
+                return fast_result
+
+            native_result = yield from self._native_search_generator()
+            native_result.diagnostics["solver_source_native"] = 1
+            native_result.diagnostics["fast_search_nodes"] = int(
+                fast_result.search_nodes
+            )
+            for name, value in fast_result.diagnostics.items():
+                native_result.diagnostics[f"fast_{name}"] = int(value)
+            return native_result
+
+        native_result = yield from self._native_search_generator()
+        if native_result.success:
+            native_result.diagnostics["solver_source_native"] = 1
+            return native_result
+
+        fast_result = yield from self._fast_search_generator()
+        fast_result.diagnostics["solver_source_fast"] = 1
+        # 保存第一阶段失败概况，现场日志可以确认是否进入了实机快图兜底。
+        fast_result.diagnostics["native_search_nodes"] = int(
+            native_result.search_nodes
+        )
+        for name, value in native_result.diagnostics.items():
+            fast_result.diagnostics[f"native_{name}"] = int(value)
+        return fast_result
+
+    def _native_search_generator(self):
+        """运行原生FOUR关系图搜索；逐候选yield，失败时不启动通用FALLBACK。"""
         states = [
             _LayoutState(
                 {0: (np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64))},
@@ -910,15 +1103,20 @@ class FourPieceSolveJob:
             "fill_reject": 0,
             "geometry_reject": 0,
         }
-        for target_count in (2, 3, 4):
+        for _target_count in (2, 3, 4):
             next_states = []
             seen = set()
             for state in states:
                 placed = tuple(sorted(state.transforms))
-                unplaced = tuple(index for index in range(4) if index not in state.transforms)
+                unplaced = tuple(
+                    index for index in range(4) if index not in state.transforms
+                )
                 for fixed_index in placed:
                     for moving_index in unplaced:
-                        relations = self._relation_graph.get((fixed_index, moving_index), ())
+                        relations = self._relation_graph.get(
+                            (fixed_index, moving_index),
+                            (),
+                        )
                         for relation in relations:
                             self.search_nodes += 1
                             candidate = _expand_state(
@@ -961,7 +1159,9 @@ class FourPieceSolveJob:
                 relaxed_candidates.append(entry)
         candidates = strict_candidates if strict_candidates else relaxed_candidates
         if not candidates:
-            primary_reason = "size_reject" if rejection_counts["size_reject"] else "no_rect"
+            primary_reason = (
+                "size_reject" if rejection_counts["size_reject"] else "no_rect"
+            )
             return AssemblyPlan.failed(
                 primary_reason,
                 search_nodes=self.search_nodes,
@@ -982,6 +1182,167 @@ class FourPieceSolveJob:
             self.split_y_mm,
             self.search_nodes,
         )
+
+    def _fast_search_generator(self):
+        """逐工作单元驱动经过实机验证的四片快速图核心。
+
+        旧通用UNKNOWN链路包含GRAPH、FOUR_FAST和FALLBACK三个阶段；这里仅复用其中
+        与四片白色几何完全对应的FOUR_FAST生成器，不会进入GRAPH、通用FALLBACK或
+        KNOWN模板。生成器仍逐候选yield，因此MaixCAM2主循环可以持续刷新触摸和心跳。
+        返回值统一转换为FOUR自己的失败原因和诊断字段。
+        """
+        fast_generator = _solve_unknown_four_fast_path(
+            self.pieces,
+            self.work_region_mm,
+            self.split_y_mm,
+            beam_width=self.beam_width,
+            incremental=True,
+            progress=self._fast_progress,
+            strict_min_fill_ratio=FOUR_STRICT_MIN_FILL_RATIO,
+            relaxed_min_fill_ratio=FOUR_RELAXED_MIN_FILL_RATIO,
+            long_side_range_mm=(
+                FOUR_RECT_LONG_RANGE_MM[0] - FOUR_RECT_SIZE_TOLERANCE_MM,
+                FOUR_RECT_LONG_RANGE_MM[1] + FOUR_RECT_SIZE_TOLERANCE_MM,
+            ),
+            short_side_range_mm=(
+                FOUR_RECT_SHORT_RANGE_MM[0] - FOUR_RECT_SIZE_TOLERANCE_MM,
+                FOUR_RECT_SHORT_RANGE_MM[1] + FOUR_RECT_SIZE_TOLERANCE_MM,
+            ),
+            max_overlap_ratio=FOUR_MAX_OVERLAP_RATIO,
+        )
+        while True:
+            try:
+                next(fast_generator)
+                # 运行中没有暴露内部局部诊断字典，因此用实际yield次数显示搜索进度；
+                # 完成时会用FOUR_FAST的精确工作单元数覆盖该值。
+                self.search_nodes += 1
+                yield None
+            except StopIteration as completed:
+                plan, diagnostics = completed.value
+                normalized_diagnostics = _normalize_fast_diagnostics(diagnostics)
+                self.search_nodes = max(
+                    self.search_nodes,
+                    int(normalized_diagnostics.get("four_work_units", 0)),
+                )
+                if plan is None:
+                    return AssemblyPlan.failed(
+                        _fast_failure_reason(normalized_diagnostics),
+                        search_nodes=self.search_nodes,
+                        diagnostics=normalized_diagnostics,
+                    )
+                if not _plan_size_is_within_four_tolerance(plan):
+                    normalized_diagnostics["size_reject"] = (
+                        int(normalized_diagnostics.get("size_reject", 0)) + 1
+                    )
+                    return AssemblyPlan.failed(
+                        "size_reject",
+                        search_nodes=self.search_nodes,
+                        diagnostics=normalized_diagnostics,
+                    )
+                try:
+                    plan = _rebuild_fast_plan_placements(self.pieces, plan)
+                except (KeyError, TypeError, ValueError):
+                    # 源目标若不能构成同一个刚体变换，绝不能向F4发送不自洽的位姿。
+                    normalized_diagnostics["geometry_reject"] = (
+                        int(normalized_diagnostics.get("geometry_reject", 0)) + 1
+                    )
+                    return AssemblyPlan.failed(
+                        "geometry_reject",
+                        search_nodes=self.search_nodes,
+                        diagnostics=normalized_diagnostics,
+                    )
+                # AssemblyPlan是本轮刚创建的独立快照，可以安全补充FOUR界面所需别名。
+                plan.search_nodes = self.search_nodes
+                plan.diagnostics.update(normalized_diagnostics)
+                return plan
+
+    def _finish_timeout(self):
+        """在FOUR活动预算到期时关闭任务并优先返回已验证快图计划。
+
+        主要流程：先关闭仍停在yield边界的生成器，读取FOUR_FAST写入共享进度的
+        best_plan；缓存存在时克隆计划、复核题目尺寸并重新计算每片刚体位姿，全部
+        通过后标记returned_best_at_timeout并返回。缓存缺失或复核失败时才返回
+        solver_timeout，绝不能把未经复核的目标坐标发送给F4。
+
+        返回值：成功时为独立的AssemblyPlan快照，失败时为不含placements的超时结果。
+        本函数同时设置done和stage，后续advance会稳定返回同一个终态对象。
+        """
+        if self.done:
+            return self.result
+        if self._generator is not None:
+            self._generator.close()
+
+        progress_diagnostics = dict(
+            self._fast_progress.get("rejection_counts", {})
+        )
+        for name, value in self._fast_progress.items():
+            if name in (
+                "best_plan",
+                "rejection_counts",
+                "current_stage",
+                "result_source",
+            ):
+                continue
+            if isinstance(value, (bool, int, float)) and math.isfinite(float(value)):
+                progress_diagnostics[str(name)] = int(value)
+        normalized_diagnostics = _normalize_fast_diagnostics(progress_diagnostics)
+        normalized_diagnostics["active_elapsed_ms"] = int(
+            round(max(0.0, self.active_seconds) * 1000.0)
+        )
+        self.search_nodes = max(
+            int(self.search_nodes),
+            int(self._fast_progress.get("search_nodes", 0)),
+            int(normalized_diagnostics.get("four_work_units", 0)),
+        )
+
+        best_plan = self._fast_progress.get("best_plan")
+        if isinstance(best_plan, AssemblyPlan) and best_plan.success:
+            # 必须先构造独立对象再重建placements，不能修改底层共享进度保存的原计划。
+            candidate = AssemblyPlan(
+                True,
+                placements=list(best_plan.placements),
+                target_rect_mm=best_plan.target_rect_mm,
+                score=best_plan.score,
+                reason=best_plan.reason,
+                search_nodes=self.search_nodes,
+                diagnostics=dict(best_plan.diagnostics),
+            )
+            if _plan_size_is_within_four_tolerance(candidate):
+                try:
+                    candidate = _rebuild_fast_plan_placements(
+                        self.pieces,
+                        candidate,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    normalized_diagnostics["geometry_reject"] = (
+                        int(normalized_diagnostics.get("geometry_reject", 0)) + 1
+                    )
+                else:
+                    candidate.search_nodes = self.search_nodes
+                    # 共享进度补充活动耗时和拒绝计数，但缓存计划中的最终填充率、
+                    # 重叠率和验收层级更权威，不能被空进度归一化产生的0覆盖。
+                    merged_diagnostics = dict(normalized_diagnostics)
+                    merged_diagnostics.update(candidate.diagnostics)
+                    merged_diagnostics["active_elapsed_ms"] = int(
+                        normalized_diagnostics["active_elapsed_ms"]
+                    )
+                    merged_diagnostics["returned_best_at_timeout"] = 1
+                    candidate.diagnostics = merged_diagnostics
+                    self.result = candidate
+            else:
+                normalized_diagnostics["size_reject"] = (
+                    int(normalized_diagnostics.get("size_reject", 0)) + 1
+                )
+
+        if self.result is None:
+            self.result = AssemblyPlan.failed(
+                "solver_timeout",
+                search_nodes=self.search_nodes,
+                diagnostics=normalized_diagnostics,
+            )
+        self.done = True
+        self._stage = "done"
+        return self.result
 
     def advance(self, time_budget_ms=24.0, work_unit_limit=64):
         """推进有限CPU时间和候选数量；未完成返回None，完成返回缓存计划。
@@ -1006,13 +1367,7 @@ class FourPieceSolveJob:
                 break
             if self.active_seconds + elapsed_this_call >= self.active_budget_seconds:
                 self.active_seconds += elapsed_this_call
-                self.result = AssemblyPlan.failed(
-                    "solver_timeout",
-                    search_nodes=self.search_nodes,
-                )
-                self.done = True
-                self._stage = "done"
-                return self.result
+                return self._finish_timeout()
             try:
                 next(self._generator)
                 units += 1
