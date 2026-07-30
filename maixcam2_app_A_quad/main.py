@@ -142,6 +142,8 @@ except ModuleNotFoundError as error:
 # 模式使用稳定字符串，既用于逻辑判断，也用于屏幕状态栏显示。
 MODE_KNOWN = "known"
 MODE_UNKNOWN = "unknown"
+# FOUR只用于设备内部路径隔离；发送UART结果时仍映射为协议既有的UNKNOWN模式。
+MODE_FOUR = "four"
 
 
 def log_auto_roi_diagnostics(location, debug_enabled=None):
@@ -204,15 +206,28 @@ def _validate_capture_runtime(planner_runtime):
 
 
 def _normalize_capture_mode(requested_mode):
-    """把外部模式值规范为known或unknown，并拒绝未定义模式。
+    """把外部模式值规范为known、unknown或four，并拒绝未定义模式。
 
     关键参数requested_mode允许大小写和首尾空白；返回规范小写字符串，非法值抛出
     ValueError，防止按钮高亮、模板路径和求解模式出现不一致。
     """
     mode = str(requested_mode).strip().lower()
-    if mode not in (MODE_KNOWN, MODE_UNKNOWN):
-        raise ValueError("识别模式必须是known或unknown")
+    if mode not in (MODE_KNOWN, MODE_UNKNOWN, MODE_FOUR):
+        raise ValueError("识别模式必须是known、unknown或four")
     return mode
+
+
+def protocol_mode_for_capture(mode):
+    """把内部采集模式转换为现有UART协议支持的模式字符串。
+
+    主要流程：先复用统一模式校验；FOUR在视觉与求解层保持独立，但线上仍属于UNKNOWN，
+    因此返回unknown。KNOWN和普通UNKNOWN原样返回，F4无需增加新的模式分支。
+    关键参数mode允许大小写和首尾空白。返回值为known或unknown。
+    """
+    normalized_mode = _normalize_capture_mode(mode)
+    if normalized_mode == MODE_FOUR:
+        return MODE_UNKNOWN
+    return normalized_mode
 
 
 def _reset_serial_result_context(serial_runtime):
@@ -265,6 +280,8 @@ def start_capture(
     _reset_serial_result_context(serial_runtime)
     if normalized_mode == MODE_KNOWN:
         return True, "KNOWN CAPTURE"
+    if normalized_mode == MODE_FOUR:
+        return True, "FOUR CAPTURE"
     profile = str(unknown_profile).strip().lower()
     if profile not in (UNKNOWN_PROFILE_WHITE, UNKNOWN_PROFILE_CARD):
         raise ValueError("UNKNOWN子模式必须是white或card")

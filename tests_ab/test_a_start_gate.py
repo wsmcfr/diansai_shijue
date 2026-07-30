@@ -29,12 +29,20 @@ class RecordingSerialContext:
 
 
 def test_run_layout_contains_non_overlapping_start_button():
-    """640x480正常页必须按顺序提供五个互不重叠且可点击的按钮。"""
+    """640x480正常页必须提供独立FOUR和START按钮且所有触摸区互不重叠。"""
     from maixcam2_app_A_quad.touch_ui import build_button_layout, hit_test
 
     buttons = build_button_layout(640, 480)
 
-    assert tuple(buttons) == ("known", "unknown", "save", "start", "cal")
+    assert tuple(buttons) == (
+        "known",
+        "unknown",
+        "four",
+        "save",
+        "start",
+        "cal",
+    )
+    assert hit_test(buttons["four"].center, buttons) == "four"
     assert hit_test(buttons["start"].center, buttons) == "start"
     ordered = [buttons[name] for name in buttons]
     for left, right in zip(ordered, ordered[1:]):
@@ -145,6 +153,34 @@ def test_start_capture_also_opens_new_serial_result_context():
 
     assert planner_runtime.reset_count == 2
     assert serial_runtime.reset_count == 2
+
+
+def test_four_mode_starts_dedicated_capture_and_uses_unknown_wire_mode():
+    """FOUR必须拥有独立采集状态，但串口协议继续使用UNKNOWN模式编码。"""
+    from maixcam2_app_A_quad.main import (
+        MODE_FOUR,
+        MODE_UNKNOWN,
+        protocol_mode_for_capture,
+        select_capture_mode,
+        start_capture,
+    )
+
+    runtime = RecordingRuntime()
+    mode, capture_armed, status = select_capture_mode(MODE_FOUR, runtime)
+    started, start_status = start_capture(MODE_FOUR, runtime)
+
+    assert (mode, capture_armed, status) == (MODE_FOUR, False, "PRESS START")
+    assert (started, start_status) == (True, "FOUR CAPTURE")
+    assert protocol_mode_for_capture(MODE_FOUR) == MODE_UNKNOWN
+    assert runtime.reset_count == 2
+
+
+@pytest.mark.parametrize("mode", ("known", "unknown"))
+def test_protocol_mode_mapping_preserves_existing_modes(mode):
+    """新增FOUR内部模式不得改变KNOWN和UNKNOWN原有协议编码。"""
+    from maixcam2_app_A_quad.main import protocol_mode_for_capture
+
+    assert protocol_mode_for_capture(mode) == mode
 
 
 def test_unarmed_known_save_returns_press_start_without_entering_save(monkeypatch):

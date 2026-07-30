@@ -60,13 +60,14 @@ class TouchReleaseTracker:
 
 
 def build_button_layout(width, height):
-    """根据相机显示图像尺寸创建正常识别界面的五个按钮。
+    """根据相机显示图像尺寸创建正常识别界面的六个按钮。
 
-    主要流程：从左排列已知、未知和模板保存按钮，在剩余区域加入START确认按钮，
-    并复用右上角CAL切换按钮。若显示宽度不足以保持按钮间隔则明确报错，避免触摸区
-    静默重叠。
+    主要流程：右侧先固定CAL，再把剩余宽度平均分给KNOWN、UNKNOWN、FOUR、第三功能
+    和START。FOUR拥有独立触摸区；第三功能在KNOWN中是SAVE，在UNKNOWN中是材料切换。
+    若显示宽度不足以保证每个按钮可操作则明确报错，避免触摸区静默重叠。
     关键参数：width、height 为处理后显示图像尺寸。
-    返回值：以 ``known``、``unknown``、``save``、``start``、``cal`` 为键的按钮字典。
+    返回值：以 ``known``、``unknown``、``four``、``save``、``start``、``cal`` 为键
+    且按屏幕从左到右排列的按钮字典。
     """
     if width <= 0 or height <= 0:
         raise ValueError("图像宽高必须大于零")
@@ -74,37 +75,32 @@ def build_button_layout(width, height):
     margin = max(6, int(round(width * 0.015625)))
     gap = max(6, int(round(width * 0.0125)))
     button_height = max(36, min(52, int(round(height * 0.10))))
-    known_width = max(96, int(round(width * 0.18)))
-    unknown_width = max(112, int(round(width * 0.21)))
-    save_width = max(84, int(round(width * 0.15)))
-
-    known = ButtonRect("known", margin, margin, known_width, button_height)
-    unknown = ButtonRect(
-        "unknown",
-        known.x + known.width + gap,
-        margin,
-        unknown_width,
-        button_height,
-    )
-    save = ButtonRect(
-        "save",
-        unknown.x + unknown.width + gap,
-        margin,
-        save_width,
-        button_height,
-    )
     cal = build_cal_toggle_button(width, height)
-    start_width = max(84, min(100, int(round(width * 0.14))))
-    start_x = save.x + save.width + gap
-    available_start_width = cal.x - gap - start_x
-    if available_start_width < start_width:
-        raise ValueError("显示宽度不足，无法放置互不重叠的START与CAL按钮")
-    start = ButtonRect("start", start_x, margin, start_width, button_height)
+    names = ("known", "unknown", "four", "save", "start")
+    available_width = int(round(cal.x)) - gap - margin - (len(names) - 1) * gap
+    slot_width = available_width // len(names)
+    if slot_width < 64:
+        raise ValueError("显示宽度不足，无法放置互不重叠的FOUR、START与CAL按钮")
+
+    buttons = {}
+    current_x = margin
+    for index, name in enumerate(names):
+        # 最后一个槽吸收整数除法余数，确保START右边仍与CAL保持固定间隔。
+        width_for_slot = (
+            int(round(cal.x)) - gap - current_x
+            if index == len(names) - 1
+            else slot_width
+        )
+        buttons[name] = ButtonRect(
+            name,
+            current_x,
+            margin,
+            width_for_slot,
+            button_height,
+        )
+        current_x += width_for_slot + gap
     return {
-        "known": known,
-        "unknown": unknown,
-        "save": save,
-        "start": start,
+        **buttons,
         "cal": cal,
     }
 
