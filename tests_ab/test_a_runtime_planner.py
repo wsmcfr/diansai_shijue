@@ -368,6 +368,30 @@ def test_runtime_disabled_debug_does_not_build_cleanup_preview(monkeypatch, caps
     assert "[SOLVER]" not in capsys.readouterr().out
 
 
+def test_unknown_runtime_never_calls_known_layout_even_when_templates_exist(monkeypatch):
+    """UNKNOWN必须完全忽略KNOWN模板，任何模板匹配或固定布局调用都视为架构错误。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    def forbidden_known_layout(*args, **kwargs):
+        """若UNKNOWN分支意外进入KNOWN规划，立即给出明确失败。"""
+        del args, kwargs
+        raise AssertionError("UNKNOWN不允许调用solve_known_layout")
+
+    monkeypatch.setattr(assembly_planner, "solve_known_layout", forbidden_known_layout)
+    runtime = assembly_planner.AssemblyRuntime(stable_frames=1, debug_enabled=False)
+
+    plan = runtime.update(
+        mode="unknown",
+        unknown_profile="white",
+        pieces=[_unknown_rectangle()],
+        templates=[{"id": "K1", "forbidden": True}],
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+    )
+
+    assert plan.success is True
+
+
 def test_runtime_debug_log_reports_fallback_rejection_counts(monkeypatch, capsys):
     """GRAPH无解转入兜底后，终态日志必须带节点、前沿和具体拒绝次数。"""
     from maixcam2_app_A_quad import assembly_planner

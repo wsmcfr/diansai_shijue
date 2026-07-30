@@ -14,9 +14,18 @@ import numpy as np
 UNKNOWN_STRICT_MIN_FILL_RATIO = 0.92
 # 仅WHITE严格轮失败后使用的最低填充率；尺寸、重叠和逐片外边约束不会随之放宽。
 UNKNOWN_RELAXED_MIN_FILL_RATIO = 0.86
-# UNKNOWN WHITE求解副本允许合并的伪短边上限，单位mm；设为0.0可完全关闭清理。
-# 题目真实边不短于20mm，默认12mm为远距离角点误差保留8mm安全余量。
+# 旧CLEAN诊断使用的短边门槛；生产求解已改为下面的多候选评分，不再破坏性删点。
 UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM = 12.0
+# 每片最多保留的接缝候选数；增大会提高异常轮廓召回，也会扩大后续边图。
+UNKNOWN_SHAPE_MAX_HYPOTHESES = 3
+# 题目规定真实边不短于20mm，该值用于候选短边惩罚和现场诊断。
+UNKNOWN_REAL_EDGE_MIN_MM = 20.0
+# 考虑Homography和远距离角点误差后的候选硬下限；低于该值默认视为伪边。
+UNKNOWN_EDGE_HARD_FLOOR_MM = 14.0
+# 简化候选相对高保真完整轮廓必须保留的最小面积比例。
+UNKNOWN_SHAPE_AREA_RETENTION_MIN = 0.96
+# 简化候选边界相对完整轮廓允许的最大双向偏差，单位mm。
+UNKNOWN_SHAPE_MAX_DEVIATION_MM = 3.0
 # True时在WHITE四片的整边GRAPH失败后启用分层Beam快路径；False可恢复旧FALLBACK。
 UNKNOWN_FOUR_FAST_ENABLED = True
 # FOUR_FAST每层全局保留的状态数；增大可提高复杂轮廓召回，但会增加候选检查量。
@@ -585,56 +594,266 @@ def edge_feature_match_score(first_feature, second_feature):
     return color_error + 0.5 * gradient_error
 
 
-def _solver_piece(piece, index, clean_short_edges=False):
-    """把识别碎片规范为未知回溯所需的局部毫米多边形、边长和边特征。
+def _validate_shape_hypothesis_constants():
+    """校验UNKNOWN多候选现场宏并返回规范化数值。
 
-    主要流程：校验毫米顶点；WHITE显式请求时先清理求解副本中的伪短边，再转成质心
-    为原点的局部坐标并一次计算全部边长。清理后原逐边花纹不再与新边一一对应，
-    因而只为WHITE置空；CARD不启用清理并完整保留纹理。
-
-    关键参数：clean_short_edges只允许UNKNOWN WHITE入口传True。
-    返回值：只供UNKNOWN求解器使用的独立字典，不修改视觉模块传入的碎片。
+    主要流程：检查候选上限、真实边基准、硬下限、面积保持率和边界偏差；硬下限不得
+    高于题目真实边基准。返回值按构造器需要的顺序排列。配置错误抛出ValueError，
+    由外层求解入口转换成结构化几何失败，不能让异常退出相机主循环。
     """
-    vertices = _normalize_vertices(piece["vertices_mm"])
-    if bool(clean_short_edges):
-        vertices, cleanup = _clean_solver_short_edges(
-            vertices,
-            min_edge_mm=UNKNOWN_WHITE_SOLVER_MIN_EDGE_MM,
+    maximum_hypotheses = int(UNKNOWN_SHAPE_MAX_HYPOTHESES)
+    real_edge_minimum = float(UNKNOWN_REAL_EDGE_MIN_MM)
+    hard_edge_floor = float(UNKNOWN_EDGE_HARD_FLOOR_MM)
+    area_retention_minimum = float(UNKNOWN_SHAPE_AREA_RETENTION_MIN)
+    maximum_deviation = float(UNKNOWN_SHAPE_MAX_DEVIATION_MM)
+    numeric_values = (
+        real_edge_minimum,
+        hard_edge_floor,
+        area_retention_minimum,
+        maximum_deviation,
+    )
+    if (
+        maximum_hypotheses <= 0
+        or not all(math.isfinite(value) for value in numeric_values)
+        or real_edge_minimum <= 0.0
+        or hard_edge_floor <= 0.0
+        or hard_edge_floor > real_edge_minimum
+        or not 0.0 < area_retention_minimum <= 1.0
+        or maximum_deviation <= 0.0
+    ):
+        raise ValueError("UNKNOWN轮廓候选宏无效")
+    return (
+        maximum_hypotheses,
+        real_edge_minimum,
+        hard_edge_floor,
+        area_retention_minimum,
+        maximum_deviation,
+    )
+
+
+def _polygon_boundary_max_distance(source_vertices, target_vertices):
+    """计算一组源点到目标闭合多边形边界的最大最短距离。
+
+    每个源点分别计算到目标全部有限线段的最短距离，再取这些最短距离中的最大值。
+    该方向量用于发现候选删角后遗漏的完整轮廓边界；调用方会交换参数再算一次，形成
+    对称偏差。输入必须已经通过`_normalize_vertices()`校验。
+    """
+    source = np.asarray(source_vertices, dtype=np.float64).reshape(-1, 2)
+    target = np.asarray(target_vertices, dtype=np.float64).reshape(-1, 2)
+    maximum = 0.0
+    for point in source:
+        minimum = min(
+            _point_to_segment_distance(
+                point,
+                target[edge_index],
+                target[(edge_index + 1) % len(target)],
+            )
+            for edge_index in range(len(target))
         )
-    else:
-        edge_lengths = np.linalg.norm(
-            np.roll(vertices, -1, axis=0) - vertices,
+        maximum = max(maximum, float(minimum))
+    return maximum
+
+
+def _polygon_hypothesis_key(vertices):
+    """生成与循环起点和顺逆方向无关的毫米候选去重键。
+
+    坐标按0.01mm量化，足以合并相邻epsilon产生的数值重复，同时不会把现场可分辨的
+    不同角点假设合并。返回值只用于单片候选去重，不参与机械坐标计算。
+    """
+    points = np.rint(np.asarray(vertices, dtype=np.float64) * 100.0).astype(np.int64)
+    point_tuples = tuple((int(point[0]), int(point[1])) for point in points)
+    variants = []
+    for ordered in (point_tuples, tuple(reversed(point_tuples))):
+        for offset in range(len(ordered)):
+            variants.append(ordered[offset:] + ordered[:offset])
+    return min(variants)
+
+
+def _polygon_turn_penalty(vertices):
+    """计算尖刺和近共线重复角点的软惩罚。
+
+    真实拼图角点可以是锐角，因此这里只惩罚小于8度的极端尖刺和大于155度的近共线
+    点；结果按顶点累计。该项只参与候选排序，不代替面积、偏差和短边硬门。
+    """
+    points = np.asarray(vertices, dtype=np.float64).reshape(-1, 2)
+    penalty = 0.0
+    for index, current in enumerate(points):
+        previous_vector = points[(index - 1) % len(points)] - current
+        next_vector = points[(index + 1) % len(points)] - current
+        denominator = float(np.linalg.norm(previous_vector) * np.linalg.norm(next_vector))
+        if denominator <= 1e-9:
+            return float("inf")
+        cosine = float(np.dot(previous_vector, next_vector) / denominator)
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+        if angle < 8.0:
+            penalty += (8.0 - angle) / 8.0
+        elif angle > 155.0:
+            penalty += (angle - 155.0) / 25.0
+    return float(penalty)
+
+
+def _hypothesis_feature_group(piece, candidate_index, vertex_count, candidate_count):
+    """为指定候选复制与边数一致的CARD纹理特征。
+
+    新数据优先读取`shape_edge_features`对应组；旧单候选夹具回退`edge_features`。
+    缺失纹理时返回等长None列表，禁止把另一个候选的边特征按错误索引复用。
+    """
+    feature_groups = piece.get("shape_edge_features") or ()
+    if candidate_index < len(feature_groups):
+        features = list(feature_groups[candidate_index] or ())
+        if len(features) != vertex_count:
+            raise ValueError("shape_edge_features必须与对应候选边数一致")
+        return features
+    legacy_features = list(piece.get("edge_features") or ())
+    if candidate_count == 1 and legacy_features:
+        if len(legacy_features) != vertex_count:
+            raise ValueError("edge_features必须与多边形边数一致")
+        return legacy_features
+    return [None for _ in range(vertex_count)]
+
+
+def _build_solver_shape_hypotheses(piece, outline_vertices, outline_center):
+    """评分、去重并构造单片最多三个UNKNOWN接缝候选。
+
+    主要流程：读取视觉层毫米候选；对新格式执行14mm硬下限、96%面积保持和3mm双向
+    偏差门，再按面积误差、偏差、20mm短边惩罚和近共线惩罚排序。旧测试或旧调用若
+    只有`vertices_mm`，将其作为受信任单候选兼容输入，不在缺少完整视觉候选时误删。
+    所有局部顶点都减去同一个完整轮廓质心。返回值为按score排序并重新编号的字典列表。
+    """
+    (
+        maximum_hypotheses,
+        real_edge_minimum,
+        hard_edge_floor,
+        area_retention_minimum,
+        maximum_deviation,
+    ) = _validate_shape_hypothesis_constants()
+    outline = _normalize_vertices(outline_vertices)
+    outline_area = abs(float(cv2.contourArea(outline.astype(np.float32))))
+    if outline_area <= 1e-6:
+        raise ValueError("完整轮廓面积无效")
+
+    raw_candidates = piece.get("shape_hypotheses_mm")
+    legacy_input = not raw_candidates
+    if legacy_input:
+        raw_candidates = [piece["vertices_mm"]]
+    raw_candidates = list(raw_candidates)
+    deduplicated = {}
+    for candidate_index, raw_candidate in enumerate(raw_candidates):
+        candidate = _normalize_vertices(raw_candidate)
+        if not 3 <= len(candidate) <= 5:
+            continue
+        edge_lengths_array = np.linalg.norm(
+            np.roll(candidate, -1, axis=0) - candidate,
             axis=1,
         )
-        cleanup = {
-            "original_vertex_count": int(len(vertices)),
-            "cleaned_vertex_count": int(len(vertices)),
-            "removed_count": 0,
-            "original_min_edge_mm": float(np.min(edge_lengths)),
-            "cleaned_min_edge_mm": float(np.min(edge_lengths)),
+        minimum_edge = float(np.min(edge_lengths_array))
+        if not legacy_input and minimum_edge < hard_edge_floor:
+            continue
+
+        candidate_area = abs(float(cv2.contourArea(candidate.astype(np.float32))))
+        area_retention = min(outline_area, candidate_area) / max(outline_area, candidate_area)
+        forward_deviation = _polygon_boundary_max_distance(outline, candidate)
+        reverse_deviation = _polygon_boundary_max_distance(candidate, outline)
+        boundary_deviation = max(forward_deviation, reverse_deviation)
+        if not legacy_input and (
+            area_retention < area_retention_minimum
+            or boundary_deviation > maximum_deviation
+        ):
+            continue
+
+        short_edge_penalty = float(
+            np.sum(
+                np.maximum(0.0, real_edge_minimum - edge_lengths_array)
+                / real_edge_minimum
+            )
+        )
+        turn_penalty = _polygon_turn_penalty(candidate)
+        score = (
+            (1.0 - area_retention) * 4.0
+            + (boundary_deviation / maximum_deviation) * 0.5
+            + short_edge_penalty * 0.5
+            + turn_penalty * 0.75
+        )
+        features = _hypothesis_feature_group(
+            piece,
+            candidate_index,
+            len(candidate),
+            len(raw_candidates),
+        )
+        hypothesis = {
+            "input_index": int(candidate_index),
+            "source_vertices": candidate.copy(),
+            "local_vertices": candidate - outline_center,
+            "edge_lengths": tuple(float(value) for value in edge_lengths_array),
+            "edge_features": features,
+            "score": float(score),
+            "area_retention": float(area_retention),
+            "max_deviation_mm": float(boundary_deviation),
+            "minimum_edge_mm": float(minimum_edge),
+            "short_edge_count": int(np.count_nonzero(edge_lengths_array < real_edge_minimum)),
         }
-    center = np.asarray(_polygon_centroid(vertices), dtype=np.float64)
-    local_vertices = vertices - center
-    features = list(piece.get("edge_features") or [])
-    if bool(clean_short_edges) and cleanup["removed_count"] > 0:
-        # WHITE只按几何求解；清理后的新边没有可靠的一一对应纹理，明确置空比错配安全。
-        features = [None for _ in range(len(vertices))]
-    elif features and len(features) != len(vertices):
-        raise ValueError("edge_features必须与多边形边数一致")
-    if not features:
-        features = [None for _ in range(len(vertices))]
+        key = _polygon_hypothesis_key(candidate)
+        previous = deduplicated.get(key)
+        if previous is None or hypothesis["score"] < previous["score"]:
+            deduplicated[key] = hypothesis
+
+    hypotheses = sorted(
+        deduplicated.values(),
+        key=lambda item: (
+            item["score"],
+            item["max_deviation_mm"],
+            -item["area_retention"],
+            item["input_index"],
+        ),
+    )[:maximum_hypotheses]
+    if not hypotheses:
+        raise ValueError("shape_hypothesis_empty")
+    for rank, hypothesis in enumerate(hypotheses):
+        hypothesis["rank"] = int(rank)
+    return hypotheses
+
+
+def _solver_piece(piece, index):
+    """把识别碎片规范为统一的UNKNOWN完整轮廓和候选结构。
+
+    主要流程：高保真轮廓和全部候选使用同一个完整轮廓面积质心作为局部原点；候选经
+    公共评分器排序。返回结构中的`outline_local`与`hypotheses`是新搜索器数据源；
+    `source_vertices/local_vertices/edge_lengths/edge_features`暂时映射首选候选，供后续
+    Task 4/5逐步迁移旧GRAPH、FOURFAST和FALLBACK，不修改视觉层传入字典。
+    """
+    fallback_vertices = _normalize_vertices(piece["vertices_mm"])
+    outline = _normalize_vertices(piece.get("outline_mm", fallback_vertices))
+    outline_center = np.asarray(_polygon_centroid(outline), dtype=np.float64)
+    hypotheses = _build_solver_shape_hypotheses(piece, outline, outline_center)
+    primary = hypotheses[0]
+    primary_lengths = tuple(float(value) for value in primary["edge_lengths"])
+    cleanup = {
+        "original_vertex_count": int(len(fallback_vertices)),
+        "cleaned_vertex_count": int(len(primary["source_vertices"])),
+        "removed_count": 0,
+        "original_min_edge_mm": float(
+            np.min(
+                np.linalg.norm(
+                    np.roll(fallback_vertices, -1, axis=0) - fallback_vertices,
+                    axis=1,
+                )
+            )
+        ),
+        "cleaned_min_edge_mm": float(min(primary_lengths)),
+    }
     return {
         "index": int(index),
         "id": str(piece.get("id", f"U{index + 1}")),
-        "source_vertices": vertices,
-        "local_vertices": local_vertices,
-        "source_center": tuple(float(value) for value in piece.get("center_mm", center)),
+        "outline_source": outline.copy(),
+        "outline_local": outline - outline_center,
+        "source_center": tuple(float(value) for value in outline_center),
+        "hypotheses": hypotheses,
+        # 以下首选候选别名将在Task 4/5完成后仅保留给兼容辅助函数。
+        "source_vertices": primary["source_vertices"].copy(),
+        "local_vertices": primary["local_vertices"].copy(),
         "cleanup": cleanup,
-        "edge_features": features,
-        "edge_lengths": tuple(
-            _edge_length(local_vertices, edge_index)
-            for edge_index in range(len(local_vertices))
-        ),
+        "edge_features": list(primary["edge_features"]),
+        "edge_lengths": primary_lengths,
     }
 
 
@@ -1857,7 +2076,7 @@ def _solve_unknown_graph_fast_path_steps(
         if pixels_per_mm <= 0.0 or not math.isfinite(pixels_per_mm):
             raise ValueError
         solver_pieces = [
-            _solver_piece(piece, index, clean_short_edges=True)
+            _solver_piece(piece, index)
             for index, piece in enumerate(pieces)
         ]
         candidates = _build_graph_edge_candidates(
@@ -2118,10 +2337,10 @@ def _solve_unknown_four_fast_path_steps(
             or not math.isfinite(length_tolerance)
         ):
             raise ValueError
-        # FOUR_FAST保留原锁定顶点，以免删除伪短边时损失最终填充面积；快速重叠已经
-        # 负责压低原始五边形带来的每候选成本。
+        # GRAPH、FOURFAST和FALLBACK必须共享同一候选构造器；当前阶段旧搜索字段统一
+        # 指向评分最高候选，Task 4/5会继续扩展候选等级而不改变完整轮廓。
         solver_pieces = [
-            _solver_piece(piece, index, clean_short_edges=False)
+            _solver_piece(piece, index)
             for index, piece in enumerate(pieces)
         ]
         # 中间两片/三片阶段必须预先知道最终四片总面积，否则同一接缝误差会因当前
@@ -2570,15 +2789,9 @@ def _solve_unknown_layout_steps(
             or search_width <= 0
         ):
             raise ValueError
+        # 三条搜索路径使用同一公共构造器，禁止在FALLBACK重新引入另一套原始伪短边。
         solver_pieces = [
-            _solver_piece(
-                piece,
-                index,
-                # GRAPH已经先用清理副本争取快解；兜底必须恢复原始锁定顶点。
-                # 实机近似用例证明某些短边虽是噪声，却仍携带满足填充率所需的边界面积，
-                # 若两条路径都删除会把原本可解的88.8%布局变成fill_reject。
-                clean_short_edges=False,
-            )
+            _solver_piece(piece, index)
             for index, piece in enumerate(pieces)
         ]
         # WHITE旧FALLBACK也会经历两片/三片中间状态，必须与FOUR_FAST共享最终总面积

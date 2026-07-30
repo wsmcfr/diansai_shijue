@@ -322,10 +322,11 @@ def _quad_bounding_roi(active_quad, frame_size):
 
 
 def analyze_quad_frame(frame_bgr, runtime_settings, config=None):
-    """执行A版四边形掩膜单帧识别并补充完整A4毫米中心。
+    """执行A版四边形掩膜识别并补充完整轮廓、候选和A4毫米坐标。
 
     主要流程：从设置派生有效四边形和外接ROI，合并现场分割参数，调用视觉核心；
-    锁定纸张时再把每片相机中心反算为A4毫米坐标。
+    锁定纸张时再把每片相机中心、完整像素轮廓及全部接缝候选反算为A4毫米坐标，
+    并为每个候选采样与边数严格对应的纹理特征。
     返回值：``QuadFrameAnalysis``；输入或单应性异常由调用方捕获并显示。
     """
     if frame_bgr is None or not isinstance(frame_bgr, np.ndarray):
@@ -350,26 +351,49 @@ def analyze_quad_frame(frame_bgr, runtime_settings, config=None):
     if paper_quad is not None:
         paper_orientation = runtime_settings["paper_orientation"]
         for piece in detection.pieces:
-            # A版保留相机坐标供画面叠加，同时批量增加毫米多边形供规划器使用。
+            # A版保留相机坐标供画面叠加，同时批量增加毫米轮廓供UNKNOWN规划器使用。
             piece["center_mm"] = image_point_to_paper_mm(
                 piece["center"],
                 paper_quad,
                 paper_orientation=paper_orientation,
             )
-            vertices_mm = image_points_to_paper_mm(
-                piece["vertices"],
+            outline_px = np.asarray(piece["contour"], dtype=np.float64).reshape(-1, 2)
+            outline_mm = image_points_to_paper_mm(
+                outline_px,
                 paper_quad,
                 paper_orientation=paper_orientation,
             )
+            piece["outline_mm"] = outline_mm.astype(float).tolist()
+
+            hypotheses_px = list(piece.get("shape_hypotheses_px") or ())
+            if not hypotheses_px:
+                # 异常轮廓没有三至五边候选时保留旧主多边形，后续求解器会给出结构化失败。
+                hypotheses_px = [list(piece["vertices"])]
+            hypotheses_mm = [
+                image_points_to_paper_mm(
+                    candidate,
+                    paper_quad,
+                    paper_orientation=paper_orientation,
+                )
+                for candidate in hypotheses_px
+            ]
+            piece["shape_hypotheses_mm"] = [
+                candidate.astype(float).tolist()
+                for candidate in hypotheses_mm
+            ]
+            # 兼容KNOWN和旧调用：主毫米顶点始终对应显示层的首个候选。
+            vertices_mm = hypotheses_mm[0]
             piece["vertices_mm"] = vertices_mm.astype(float).tolist()
             piece["region"] = classify_piece_region(
-                vertices_mm,
+                outline_mm,
                 runtime_settings["split_y_mm"],
             )
-            piece["edge_features"] = sample_piece_edge_features(
-                frame_bgr,
-                piece["vertices"],
-            )
+            feature_groups = [
+                sample_piece_edge_features(frame_bgr, candidate)
+                for candidate in hypotheses_px
+            ]
+            piece["shape_edge_features"] = feature_groups
+            piece["edge_features"] = list(feature_groups[0])
     return QuadFrameAnalysis(detection, active_quad, roi)
 
 

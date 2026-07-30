@@ -242,6 +242,55 @@ def _cyclic_edge_lengths(vertices):
     return np.linalg.norm(np.diff(closed, axis=0), axis=1)
 
 
+def test_solver_piece_uses_outline_and_ranked_shape_hypotheses():
+    """UNKNOWN求解片必须分离高保真验收轮廓与三至五边接缝候选。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    outline = np.asarray(
+        ((20, 20), (70, 20), (120, 20), (120, 80), (70, 80), (20, 80)),
+        dtype=np.float64,
+    )
+    noisy_five = np.asarray(
+        ((20, 20), (120, 20), (120, 80), (69, 77.5), (20, 80)),
+        dtype=np.float64,
+    )
+    clean_four = np.asarray(
+        ((20, 20), (120, 20), (120, 80), (20, 80)),
+        dtype=np.float64,
+    )
+    piece = {
+        "id": "U1",
+        "center_mm": (70.0, 50.0),
+        "vertices_mm": noisy_five.astype(float).tolist(),
+        "outline_mm": outline.astype(float).tolist(),
+        "shape_hypotheses_mm": [
+            noisy_five.astype(float).tolist(),
+            clean_four.astype(float).tolist(),
+        ],
+        "shape_edge_features": [
+            [None] * len(noisy_five),
+            [None] * len(clean_four),
+        ],
+    }
+
+    solver_piece = assembly_planner._solver_piece(piece, 0)
+
+    assert solver_piece["outline_local"].shape == outline.shape
+    assert len(solver_piece["hypotheses"]) == 2
+    assert [item["rank"] for item in solver_piece["hypotheses"]] == [0, 1]
+    assert len(solver_piece["hypotheses"][0]["local_vertices"]) == 4
+    assert all(
+        "local_vertices" in item and "edge_lengths" in item
+        for item in solver_piece["hypotheses"]
+    )
+    # 完整轮廓和所有候选必须使用同一个完整轮廓质心作为局部原点。
+    np.testing.assert_allclose(
+        np.mean(solver_piece["outline_local"], axis=0),
+        (0.0, 0.0),
+        atol=1e-6,
+    )
+
+
 def test_white_solver_cleanup_macro_and_device_short_edges():
     """默认12mm宏必须清除实机U2/U3伪短边，且不修改输入数组。"""
     from maixcam2_app_A_quad import assembly_planner
@@ -288,8 +337,8 @@ def test_white_solver_cleanup_preserves_real_pentagon_and_zero_disables():
     assert disabled_cleanup["removed_count"] == 0
 
 
-def test_solver_piece_cleanup_is_white_only_and_preserves_card_features():
-    """清理参数只改变WHITE内部几何；CARD必须保留原顶点和逐边花纹。"""
+def test_solver_piece_legacy_input_preserves_features_without_mutation():
+    """旧单候选夹具仍可运行，统一构造器不得修改输入顶点或错配边特征。"""
     from maixcam2_app_A_quad import assembly_planner
 
     vertices = _device_short_edge_pieces()[0]
@@ -303,74 +352,66 @@ def test_solver_piece_cleanup_is_white_only_and_preserves_card_features():
     }
     before = tuple(tuple(point) for point in piece["vertices_mm"])
 
-    white_piece = assembly_planner._solver_piece(
-        piece,
-        0,
-        clean_short_edges=True,
-    )
-    card_piece = assembly_planner._solver_piece(
-        piece,
-        0,
-        clean_short_edges=False,
-    )
+    solver_piece = assembly_planner._solver_piece(piece, 0)
 
-    assert len(white_piece["source_vertices"]) < len(vertices)
-    assert white_piece["cleanup"]["removed_count"] > 0
-    assert white_piece["edge_features"] == [None] * len(white_piece["source_vertices"])
-    np.testing.assert_allclose(card_piece["source_vertices"], vertices)
-    assert card_piece["edge_features"] == piece["edge_features"]
+    np.testing.assert_allclose(solver_piece["source_vertices"], vertices)
+    assert solver_piece["edge_features"] == piece["edge_features"]
+    assert len(solver_piece["hypotheses"]) == 1
     assert tuple(tuple(point) for point in piece["vertices_mm"]) == before
 
 
-def test_graph_cleans_white_but_both_fallback_profiles_preserve_original(monkeypatch):
-    """GRAPH使用清理副本；WHITE/CARD兜底都保留原顶点，防止清理误伤可解布局。"""
+def test_graph_and_both_fallback_profiles_share_solver_piece_builder(monkeypatch):
+    """GRAPH、WHITE兜底和CARD兜底必须调用同一个无清理模式分支的几何构造器。"""
     from maixcam2_app_A_quad import assembly_planner
 
     calls = []
     original_solver_piece = assembly_planner._solver_piece
 
-    def recording_solver_piece(piece, index, clean_short_edges=False):
-        """记录每条求解入口是否显式启用短边清理。"""
-        calls.append(bool(clean_short_edges))
-        return original_solver_piece(
-            piece,
-            index,
-            clean_short_edges=clean_short_edges,
-        )
+    def recording_solver_piece(piece, index):
+        """记录三条求解路径是否都只传公共的碎片与索引参数。"""
+        calls.append(int(index))
+        return original_solver_piece(piece, index)
 
     monkeypatch.setattr(assembly_planner, "_solver_piece", recording_solver_piece)
-    piece = _piece(
-        ((0, 0), (100, 0), (100, 60), (0, 60)),
-        "U1",
-        target_center=(80, 80),
-    )
+    pieces = [
+        _piece(
+            ((0, 0), (50, 0), (50, 60), (0, 60)),
+            "U1",
+            target_center=(55, 80),
+        ),
+        _piece(
+            ((50, 0), (100, 0), (100, 60), (50, 60)),
+            "U2",
+            target_center=(130, 80),
+        ),
+    ]
 
     assembly_planner._solve_unknown_graph_fast_path(
-        [piece],
+        pieces,
         work_region_mm=(0.0, 33.5, 210.0, 230.0),
         split_y_mm=148.5,
     )
-    assert calls == [True]
+    assert calls == [0, 1]
 
     calls.clear()
     white_steps = assembly_planner._solve_unknown_layout_steps(
-        [piece],
+        pieces,
         work_region_mm=(0.0, 33.5, 210.0, 230.0),
         split_y_mm=148.5,
         stop_at_first_solution=True,
     )
     list(white_steps)
-    assert calls == [False]
+    assert calls == [0, 1]
 
     calls.clear()
     card_steps = assembly_planner._solve_unknown_layout_steps(
-        [piece],
+        pieces,
         work_region_mm=(0.0, 33.5, 210.0, 230.0),
         split_y_mm=148.5,
         stop_at_first_solution=False,
     )
     list(card_steps)
-    assert calls == [False]
+    assert calls == [0, 1]
 
 
 @pytest.mark.parametrize("piece_count", [1, 2, 3, 4])

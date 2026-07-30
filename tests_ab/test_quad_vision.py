@@ -16,6 +16,60 @@ def _active_bounding_roi(active_quad):
     return tuple(int(value) for value in cv2.boundingRect(active_quad.astype(np.int32)))
 
 
+def _noisy_rectangle_contour():
+    """构造带一个短凹口的真实矩形轮廓，用于复现“首个五边形不是最佳候选”。
+
+    较小epsilon会保留凹口并得到五边形，稍大epsilon会恢复四边形。该轮廓直接使用
+    有序边界点，不依赖随机噪声，确保RED/GREEN结果在不同OpenCV环境中可重复。
+    """
+    return np.asarray(
+        (
+            (20, 20),
+            (120, 20),
+            (120, 80),
+            (72, 80),
+            (69, 76),
+            (66, 80),
+            (20, 80),
+        ),
+        dtype=np.int32,
+    ).reshape(-1, 1, 2)
+
+
+def test_polygon_hypotheses_keep_later_clean_quadrilateral():
+    """候选生成不能在首个五边形处停止，必须同时保留后续干净四边形。"""
+    from maixcam2_app_A_quad import puzzle_vision
+
+    assert hasattr(puzzle_vision, "approximate_polygon_candidates"), (
+        "视觉层尚未提供多多边形候选接口"
+    )
+    candidates = puzzle_vision.approximate_polygon_candidates(
+        _noisy_rectangle_contour(),
+        DEFAULT_CONFIG,
+    )
+    vertex_counts = [len(candidate) for candidate in candidates]
+
+    assert vertex_counts[0] == 5
+    assert 4 in vertex_counts
+    assert len(vertex_counts) == len(set(tuple(item.reshape(-1)) for item in candidates))
+
+
+def test_piece_geometry_exposes_independent_pixel_hypotheses():
+    """单片结果必须保留独立像素候选，后续排序不能原地修改显示主轮廓。"""
+    from maixcam2_app_A_quad.puzzle_vision import compute_piece_geometry
+
+    piece = compute_piece_geometry(
+        _noisy_rectangle_contour(),
+        roi=(0, 0, 160, 120),
+        config=DEFAULT_CONFIG,
+    )
+
+    hypotheses = piece["shape_hypotheses_px"]
+    assert [len(candidate) for candidate in hypotheses] == [5, 4]
+    assert piece["vertices"] == [tuple(point) for point in hypotheses[0]]
+    assert hypotheses is not piece["vertices"]
+
+
 def test_quad_mask_excludes_bright_floor_and_keeps_four_pieces():
     """验证外接矩形角落的亮地面不会成为轮廓或白色占比。"""
     frame, _paper_quad, active_quad = make_quad_scene_with_four_pieces()

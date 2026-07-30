@@ -209,33 +209,95 @@ def build_foreground_mask(frame_bgr, roi, config=None, active_quad=None):
     return mask, float(threshold)
 
 
-def approximate_polygon(contour, config):
-    """将像素轮廓拟合为题目允许的三至五边主要多边形。
+def _polygon_approximation_parameters(config):
+    """读取并校验多边形拟合参数。
 
-    主要流程：从较小到较大的周长比例逐步增加拟合误差，优先返回首个三至五顶点结果。
-    关键参数：contour 为 OpenCV 轮廓，config 提供误差范围、步长和顶点限制。
-    返回值：形状为 ``(顶点数, 1, 2)`` 的 OpenCV 多边形轮廓。
+    主要流程：把配置中的epsilon范围、步长和顶点范围转换为明确数值，并验证步长、
+    上下界和顶点数关系。关键参数config与检测主配置共用。返回值为按调用顺序排列的
+    五元组；非法设置抛出ValueError，避免视觉循环进入无法终止的epsilon遍历。
     """
-    perimeter = cv2.arcLength(contour, True)
-    if perimeter <= 0:
-        return contour.copy()
-
     epsilon = float(config["approx_epsilon_min"])
     epsilon_max = float(config["approx_epsilon_max"])
     epsilon_step = float(config["approx_epsilon_step"])
     min_vertices = int(config["min_vertices"])
     max_vertices = int(config["max_vertices"])
-    if epsilon_step <= 0 or epsilon_max < epsilon:
+    if (
+        epsilon < 0.0
+        or epsilon_step <= 0.0
+        or epsilon_max < epsilon
+        or min_vertices < 3
+        or max_vertices < min_vertices
+    ):
         raise ValueError("多边形拟合误差范围或步长无效")
+    return epsilon, epsilon_max, epsilon_step, min_vertices, max_vertices
+
+
+def _polygon_candidate_key(candidate):
+    """生成与循环起点和顺逆方向无关的整数多边形去重键。
+
+    OpenCV在相邻epsilon上经常返回同一组顶点。这里枚举正向、反向的所有循环移位并
+    选择字典序最小者，确保同一候选只保留第一次出现的低epsilon版本。
+    """
+    points = np.asarray(candidate, dtype=np.int64).reshape(-1, 2)
+    point_tuples = tuple((int(point[0]), int(point[1])) for point in points)
+    variants = []
+    for ordered in (point_tuples, tuple(reversed(point_tuples))):
+        for offset in range(len(ordered)):
+            variants.append(ordered[offset:] + ordered[:offset])
+    return min(variants)
+
+
+def approximate_polygon_candidates(contour, config):
+    """收集像素轮廓在全部epsilon下得到的三至五边候选。
+
+    主要流程：完整遍历配置的拟合误差范围，保留顶点数符合题目约束的简单候选，并按
+    循环起点无关的键去重。关键参数contour为OpenCV闭合轮廓，config提供epsilon与
+    顶点范围。返回值为独立OpenCV轮廓列表，按epsilon从小到大排列；没有候选时为空。
+    """
+    perimeter = float(cv2.arcLength(contour, True))
+    if perimeter <= 0.0:
+        return []
+
+    epsilon, epsilon_max, epsilon_step, min_vertices, max_vertices = (
+        _polygon_approximation_parameters(config)
+    )
+    candidates = []
+    seen = set()
+    while epsilon <= epsilon_max + 1e-12:
+        candidate = cv2.approxPolyDP(contour, epsilon * perimeter, True)
+        if min_vertices <= len(candidate) <= max_vertices:
+            key = _polygon_candidate_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate.copy())
+        epsilon += epsilon_step
+    return candidates
+
+
+def approximate_polygon(contour, config):
+    """返回兼容显示和KNOWN描述子的首个三至五边像素多边形。
+
+    UNKNOWN会另外读取`approximate_polygon_candidates()`的全部候选；本函数继续返回
+    最小epsilon下的首个合法候选，避免改变既有显示、编号和KNOWN模板行为。没有合法
+    候选时，返回顶点数最接近配置范围的异常显示轮廓。
+    """
+    perimeter = float(cv2.arcLength(contour, True))
+    if perimeter <= 0.0:
+        return contour.copy()
+
+    candidates = approximate_polygon_candidates(contour, config)
+    if candidates:
+        return candidates[0].copy()
+
+    epsilon, epsilon_max, epsilon_step, min_vertices, max_vertices = (
+        _polygon_approximation_parameters(config)
+    )
 
     best_candidate = contour.copy()
     best_distance = float("inf")
     while epsilon <= epsilon_max + 1e-12:
         candidate = cv2.approxPolyDP(contour, epsilon * perimeter, True)
         vertex_count = len(candidate)
-
-        if min_vertices <= vertex_count <= max_vertices:
-            return candidate
 
         # 没有候选落入目标范围时，保留顶点数最接近三至五的结果用于异常显示。
         if vertex_count < min_vertices:
@@ -258,9 +320,22 @@ def compute_piece_geometry(contour, roi, config, active_quad=None):
     关键参数：contour 使用原图坐标；active_quad 提供时按斜边真实距离判断完整性。
     返回值：可供未知编号、模板匹配和显示层直接使用的碎片字典。
     """
-    polygon = approximate_polygon(contour, config)
+    polygon_candidates = approximate_polygon_candidates(contour, config)
+    polygon = (
+        polygon_candidates[0].copy()
+        if polygon_candidates
+        else approximate_polygon(contour, config)
+    )
     vertices_array = polygon.reshape(-1, 2).astype(np.float64)
     vertices = [(int(point[0]), int(point[1])) for point in vertices_array]
+    # 候选使用独立Python列表保存，后续毫米评分和排序不能原地改变显示主轮廓。
+    shape_hypotheses_px = [
+        [
+            (int(point[0]), int(point[1]))
+            for point in candidate.reshape(-1, 2)
+        ]
+        for candidate in polygon_candidates
+    ]
 
     moments = cv2.moments(contour)
     if abs(moments["m00"]) > 1e-9:
@@ -333,6 +408,7 @@ def compute_piece_geometry(contour, roi, config, active_quad=None):
     return {
         "contour": contour,
         "vertices": vertices,
+        "shape_hypotheses_px": shape_hypotheses_px,
         "center": center,
         "angle_deg": angle_deg,
         "area": float(cv2.contourArea(contour)),

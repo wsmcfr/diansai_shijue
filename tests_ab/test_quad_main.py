@@ -148,7 +148,7 @@ def test_auto_roi_debug_switch_disables_output(capsys):
 
 
 def test_quad_analysis_detects_four_pieces_and_adds_paper_mm_centers():
-    """验证A版单帧数据流保留相机中心并额外输出完整A4毫米中心。"""
+    """验证A版单帧数据流同时输出完整轮廓、候选和A4毫米中心。"""
     from maixcam2_app_A_quad.main import analyze_quad_frame
 
     frame, paper_quad, _active_quad = make_quad_scene_with_four_pieces(inset_mm=0.0)
@@ -162,6 +162,23 @@ def test_quad_analysis_detects_four_pieces_and_adds_paper_mm_centers():
     assert all("center_mm" in piece for piece in analysis.detection.pieces)
     assert all(0.0 < piece["center_mm"][0] < 210.0 for piece in analysis.detection.pieces)
     assert all(33.5 < piece["center_mm"][1] < 263.5 for piece in analysis.detection.pieces)
+    for piece in analysis.detection.pieces:
+        outline_mm = np.asarray(piece["outline_mm"], dtype=np.float64)
+        hypotheses_px = piece["shape_hypotheses_px"]
+        hypotheses_mm = piece["shape_hypotheses_mm"]
+        feature_groups = piece["shape_edge_features"]
+
+        assert outline_mm.shape == (len(piece["contour"]), 2)
+        assert len(hypotheses_mm) == len(hypotheses_px) == len(feature_groups)
+        assert len(hypotheses_mm) >= 1
+        assert all(
+            len(candidate_mm) == len(candidate_px) == len(features)
+            for candidate_mm, candidate_px, features in zip(
+                hypotheses_mm,
+                hypotheses_px,
+                feature_groups,
+            )
+        )
 
 
 def test_quad_analysis_maps_landscape_piece_to_297_by_210_mm_plane():
