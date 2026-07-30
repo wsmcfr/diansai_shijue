@@ -1,0 +1,12 @@
+# MaixPy发布ZIP保存LF源码；所有开发机检出时也统一使用LF，保证逐字节发布校验稳定。
+* text=auto eol=lf
+
+# 发布包、题目资料和仿真资源必须保持原始二进制字节。
+*.zip binary
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webm binary
+*.STL binary
