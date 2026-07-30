@@ -289,20 +289,28 @@ def test_runtime_overlay_scales_high_resolution_frame_to_display_size():
 
 
 @pytest.mark.parametrize(
-    ("paper_orientation", "expected_content_roi"),
+    ("paper_quad", "paper_orientation", "expected_content_roi"),
     (
-        ("portrait", (150, 0, 339, 480)),
-        ("landscape", (0, 13, 640, 453)),
+        (
+            np.float32([[180, 30], [460, 50], [500, 450], [140, 430]]),
+            "portrait",
+            (150, 0, 339, 480),
+        ),
+        (
+            np.float32([[120, 60], [520, 40], [550, 420], [90, 430]]),
+            "landscape",
+            (0, 13, 640, 453),
+        ),
     ),
 )
 def test_paper_display_canvas_preserves_a4_aspect_and_hides_outside_scene(
+    paper_quad,
     paper_orientation,
     expected_content_roi,
 ):
-    """正常纸面视图只能显示四角内部，并按横竖A4真实比例居中填充黑边。"""
+    """正常纸面视图只能显示四角内部，并按蓝框实际横竖外观居中填充黑边。"""
     from maixcam2_app_A_quad.main import build_paper_display_canvas
 
-    paper_quad = np.float32([[120, 60], [520, 40], [550, 420], [90, 430]])
     frame = np.full((480, 640, 3), 240, dtype=np.uint8)
     paper_color = (25, 45, 65)
     cv2.fillConvexPoly(frame, np.rint(paper_quad).astype(np.int32), paper_color)
@@ -330,16 +338,12 @@ def test_paper_display_canvas_preserves_a4_aspect_and_hides_outside_scene(
     ]
     np.testing.assert_allclose(center_pixel, paper_color, atol=2)
 
-    # 侧装相机下PAPER方向可能与蓝框在画面中的横竖方向不同。展开入口应把纸面
-    # 逻辑四角而非固定的画面左上角映到目标矩形，才能与毫米坐标和红线保持一致。
-    from maixcam2_app_A_quad.paper_locator import orient_a4_quad_for_coordinates
+    # 显示层应保持CAL中的相机四角外观；机械逻辑四角只用于毫米坐标和UART。
+    from maixcam2_app_A_quad.paper_locator import order_a4_quad
 
-    coordinate_quad = orient_a4_quad_for_coordinates(
-        paper_quad,
-        paper_orientation,
-    )
+    display_quad = order_a4_quad(paper_quad)
     mapped_quad = cv2.perspectiveTransform(
-        coordinate_quad.reshape(1, -1, 2),
+        display_quad.reshape(1, -1, 2),
         display_transform,
     )[0]
     expected_quad = np.float32(
@@ -353,8 +357,62 @@ def test_paper_display_canvas_preserves_a4_aspect_and_hides_outside_scene(
     np.testing.assert_allclose(mapped_quad, expected_quad, atol=0.1)
 
 
+def test_side_camera_normal_view_keeps_cal_landscape_appearance():
+    """侧装相机的正常页必须保持CAL中的横纸外观，不能按机械PAPER V竖向展开。
+
+    蓝框在相机画面中明显横向，但机械坐标仍为210×297mm的portrait。显示层应把
+    画面左上、右上、右下、左下映到横向内容区；机械红线经同一显示矩阵后仍应保持
+    画面中的竖向分隔，证明这里只旋转显示而没有修改毫米上下区。
+    """
+    from maixcam2_app_A_quad.main import (
+        build_paper_display_canvas,
+        transform_points_for_display,
+    )
+    from maixcam2_app_A_quad.paper_locator import (
+        build_split_segment,
+        order_a4_quad,
+    )
+
+    paper_quad = np.float32([[90, 76], [520, 60], [535, 350], [85, 365]])
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.fillConvexPoly(frame, paper_quad.astype(np.int32), (25, 45, 65))
+
+    _, display_transform, content_roi = build_paper_display_canvas(
+        frame,
+        paper_quad,
+        paper_orientation="portrait",
+        canvas_size=(640, 480),
+    )
+
+    assert content_roi == (0, 13, 640, 453)
+    content_x, content_y, content_width, content_height = content_roi
+    mapped_quad = transform_points_for_display(
+        order_a4_quad(paper_quad),
+        display_transform,
+    )
+    expected_quad = np.float32(
+        (
+            (content_x, content_y),
+            (content_x + content_width - 1, content_y),
+            (content_x + content_width - 1, content_y + content_height - 1),
+            (content_x, content_y + content_height - 1),
+        )
+    )
+    np.testing.assert_allclose(mapped_quad, expected_quad, atol=0.1)
+
+    camera_split = build_split_segment(
+        paper_quad,
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+        paper_orientation="portrait",
+    )
+    display_split = transform_points_for_display(camera_split, display_transform)
+    split_delta = display_split[1] - display_split[0]
+    assert abs(float(split_delta[1])) > abs(float(split_delta[0])) * 4.0
+
+
 def test_paper_display_canvas_normalizes_cyclic_and_reversed_quad_order():
-    """显示Homography必须与毫米链同样规范四角，保存顺序变化不能旋转或镜像画面。"""
+    """显示Homography必须规范相机四角，保存顺序变化不能旋转或镜像画面。"""
     from maixcam2_app_A_quad.main import build_paper_display_canvas
 
     paper_quad = np.float32([[120, 60], [520, 40], [550, 420], [90, 430]])
@@ -425,9 +483,9 @@ def test_runtime_overlay_uses_paper_only_canvas_after_roi_is_locked():
         paper_orientation="portrait",
     )
 
-    # 竖放A4左右黑边中部没有按钮或状态栏，必须看不到原相机的亮色纸外背景。
-    assert np.all(output[220, 20] == 0)
-    assert np.all(output[220, 620] == 0)
+    # 蓝框实际为横向，正常页应铺满屏幕宽度；边缘仍必须来自黑纸而非亮色纸外背景。
+    np.testing.assert_allclose(output[220, 20], (20, 30, 40), atol=2)
+    np.testing.assert_allclose(output[220, 620], (20, 30, 40), atol=2)
     assert np.any(output[220, 320] != 0)
 
 
@@ -677,6 +735,42 @@ def test_four_overlay_labels_mask_button_and_renders_selected_paper_mask(monkeyp
     assert "CORE" in rendered_labels
     assert np.all(output[120, 320] >= 240)
     assert np.all(output[220, 20] == 0)
+
+
+def test_side_camera_four_debug_mask_rotates_to_landscape_display():
+    """侧装时FOUR机械竖向掩膜必须旋转后覆盖横向正常页，不能直接横向拉伸。
+
+    side_lower_right的逻辑左上角对应原始相机蓝框左下角，因此逻辑掩膜左上白块
+    应显示在横向内容区左下；若未旋转，它会错误出现在左上。
+    """
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.touch_ui import build_button_layout
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    paper_quad = np.float32(((90, 76), (520, 60), (535, 350), (85, 365)))
+    debug_mask = np.zeros((891, 630), dtype=np.uint8)
+    debug_mask[80:250, 80:250] = 255
+
+    output = main.draw_overlay(
+        frame,
+        [],
+        (0, 0, 640, 480),
+        build_button_layout(640, 480),
+        main.MODE_FOUR,
+        0.0,
+        "FOUR COUNT 0/4",
+        paper_quad=paper_quad,
+        active_quad=paper_quad,
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+        display_size=(640, 480),
+        paper_orientation="portrait",
+        four_debug_view="strict",
+        four_debug_mask=debug_mask,
+    )
+
+    assert float(np.mean(output[330:410, 70:150])) > 220.0
+    assert float(np.mean(output[90:170, 70:150])) < 40.0
 
 
 def test_four_status_reports_count_stability_solving_and_cached_failure():

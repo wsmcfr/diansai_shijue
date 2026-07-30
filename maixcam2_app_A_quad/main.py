@@ -42,8 +42,10 @@ try:
         build_work_quad,
         image_point_to_paper_mm,
         image_points_to_paper_mm,
+        infer_paper_orientation,
         locate_black_paper,
         orient_a4_quad_for_coordinates,
+        order_a4_quad,
         paper_size_mm,
         validate_paper_orientation,
     )
@@ -107,8 +109,10 @@ except ModuleNotFoundError as error:
         build_work_quad,
         image_point_to_paper_mm,
         image_points_to_paper_mm,
+        infer_paper_orientation,
         locate_black_paper,
         orient_a4_quad_for_coordinates,
+        order_a4_quad,
         paper_size_mm,
         validate_paper_orientation,
     )
@@ -1079,11 +1083,12 @@ def build_paper_display_canvas(
 ):
     """把已标定A4四角展开到等比例屏幕内容区，并清除全部纸外相机画面。
 
-    主要流程：校验原相机帧和左上起顺时针四角，根据横放或竖放的真实毫米长宽计算
-    最大等比例内容矩形，再求原图到显示画布的Homography。`warpPerspective`会计算整张
+    主要流程：校验原相机帧，根据蓝框在相机画面中的实际横竖外观计算最大等比例
+    内容矩形，再把画面左上起顺时针四角映射到显示画布。`warpPerspective`会计算整张
     画布，因此最后只复制目标内容矩形，矩形外保持纯黑，防止纸外龙门架或地面泄露。
 
-    关键参数：`canvas_size`为屏幕宽高，`paper_orientation`决定297mm长边方向。
+    关键参数：`canvas_size`为屏幕宽高；`paper_orientation`仍校验机械纸面设置，但不再
+    决定显示旋转。侧装相机下正常页由蓝框外观保持与CAL一致，机械毫米坐标单独处理。
     返回值：`(canvas, display_transform, content_roi)`；矩阵用于把相机轮廓与纸面叠加
     统一映射到同一显示坐标，`content_roi`为`(x, y, width, height)`。
     """
@@ -1095,11 +1100,13 @@ def build_paper_display_canvas(
     if canvas_width <= 0 or canvas_height <= 0:
         raise ValueError("canvas_size宽高必须大于零")
 
-    orientation = validate_paper_orientation(paper_orientation)
-    paper_width_mm, paper_height_mm = paper_size_mm(orientation)
-    # 显示展开必须复用毫米映射的纸面定向。侧装相机下PAPER方向与画面外接方向可能
-    # 不同；若这里仍只按左上角排序，红线和目标会在展开画面中再次错转90度。
-    source_quad = orient_a4_quad_for_coordinates(paper_quad, orientation)
+    validate_paper_orientation(paper_orientation)
+    source_quad = order_a4_quad(paper_quad)
+    display_orientation = infer_paper_orientation(source_quad)
+    paper_width_mm, paper_height_mm = paper_size_mm(display_orientation)
+    # 显示方向与机械方向故意分离：侧装相机的PAPER V负责毫米轴和UART，正常页则
+    # 保持CAL中看到的横纸外观。全部轮廓和规划叠加随后经过同一display_transform，
+    # 因此只改变屏幕排版，不改变碎片的源/目标毫米坐标和旋转角。
 
     display_scale = min(
         canvas_width / float(paper_width_mm),
@@ -1158,6 +1165,38 @@ def transform_points_for_display(points, display_transform):
     if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
         raise ValueError("display_transform必须是有限3×3矩阵")
     return cv2.perspectiveTransform(point_array.reshape(1, -1, 2), matrix)[0]
+
+
+def orient_paper_mask_for_display(mask, paper_quad, paper_orientation="portrait"):
+    """把机械纸面掩膜旋转到正常页采用的相机蓝框外观。
+
+    主要流程：分别取得相机左上起四角和机械毫米逻辑四角，查找二者相差的循环位移，
+    再用相同的四分之一圈数旋转掩膜。这样top、正负90度侧装、倒置180度以及PAPER
+    手动兜底都使用同一关系，不需要为某一种安装方式写死方向。
+
+    关键参数：mask必须是二维uint8纸面掩膜；paper_quad为原相机蓝框；
+    paper_orientation为生成该掩膜时的机械纸张方向。返回连续内存中的新数组，输入不变。
+    无法确认四角循环关系时抛出ValueError，避免显示一个与相机画面错位的调试掩膜。
+    """
+    if not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.dtype != np.uint8:
+        raise ValueError("paper mask必须是二维uint8数组")
+    camera_quad = order_a4_quad(paper_quad)
+    coordinate_quad = orient_a4_quad_for_coordinates(
+        paper_quad,
+        paper_orientation,
+    )
+    quarter_turns = None
+    for candidate_turns in range(4):
+        if np.allclose(
+            np.roll(camera_quad, candidate_turns, axis=0),
+            coordinate_quad,
+            atol=0.05,
+        ):
+            quarter_turns = candidate_turns
+            break
+    if quarter_turns is None:
+        raise ValueError("机械纸面四角无法转换为相机显示方向")
+    return np.ascontiguousarray(np.rot90(mask, k=quarter_turns))
 
 
 def draw_overlay(
@@ -1236,8 +1275,13 @@ def draw_overlay(
             ):
                 raise ValueError("four_debug_mask必须是二维uint8掩膜")
             content_x, content_y, content_width, content_height = content_roi
-            resized_mask = cv2.resize(
+            display_mask = orient_paper_mask_for_display(
                 four_debug_mask,
+                paper_quad,
+                paper_orientation,
+            )
+            resized_mask = cv2.resize(
+                display_mask,
                 (content_width, content_height),
                 interpolation=cv2.INTER_NEAREST,
             )
