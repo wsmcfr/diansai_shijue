@@ -87,3 +87,127 @@ def test_build_relations_includes_segmented_long_to_short_alignment():
 
     assert any(item.segmented for item in relations)
     assert any(item.overlap_length_mm == pytest.approx(40.0, abs=0.5) for item in relations)
+
+
+def _pieces_from_layout(layout):
+    """把目标布局的四片分别施加不同源位姿，形成与模板无关的UNKNOWN输入。"""
+    angles = (37.0, -61.0, 83.0, -24.0)
+    centers = ((35.0, 72.0), (82.0, 78.0), (132.0, 70.0), (178.0, 80.0))
+    return [
+        _piece(vertices, f"U{index + 1}", angles[index], centers[index])
+        for index, vertices in enumerate(layout)
+    ]
+
+
+def _four_grid_pieces(width=100.0, height=60.0):
+    """构造能无缝组成指定矩形的四宫格碎片。"""
+    half_width = width * 0.5
+    half_height = height * 0.5
+    return _pieces_from_layout(
+        (
+            ((0, 0), (half_width, 0), (half_width, half_height), (0, half_height)),
+            ((half_width, 0), (width, 0), (width, half_height), (half_width, half_height)),
+            ((0, half_height), (half_width, half_height), (half_width, height), (0, height)),
+            ((half_width, half_height), (width, half_height), (width, height), (half_width, height)),
+        )
+    )
+
+
+def _t_junction_pieces():
+    """构造一条100mm长边同时连接40/30/30mm三条短边的T形布局。"""
+    return _pieces_from_layout(
+        (
+            ((0, 0), (100, 0), (100, 30), (0, 30)),
+            ((0, 30), (40, 30), (40, 60), (0, 60)),
+            ((40, 30), (70, 30), (70, 60), (40, 60)),
+            ((70, 30), (100, 30), (100, 60), (70, 60)),
+        )
+    )
+
+
+def _assert_placement_reconstructs_target(piece, placement):
+    """按发送的源中心、目标中心和角度重建多边形，验证机械位姿内部一致。"""
+    source_vertices = np.asarray(piece["vertices_mm"], dtype=np.float64)
+    source_center = np.asarray(placement.source_center_mm, dtype=np.float64)
+    target_center = np.asarray(placement.target_center_mm, dtype=np.float64)
+    angle = math.radians(float(placement.rotation_delta_deg))
+    rotation = np.asarray(
+        ((math.cos(angle), -math.sin(angle)), (math.sin(angle), math.cos(angle))),
+        dtype=np.float64,
+    )
+    reconstructed = (source_vertices - source_center) @ rotation.T + target_center
+    assert reconstructed == pytest.approx(
+        np.asarray(placement.target_polygon_mm, dtype=np.float64),
+        abs=1e-5,
+    )
+
+
+@pytest.mark.parametrize("pieces", (_four_grid_pieces(), _t_junction_pieces()))
+def test_four_solver_returns_all_source_and_target_poses(pieces):
+    """专用求解器必须对四宫格和T形布局一次返回四个可执行位姿。"""
+    from maixcam2_app_A_quad.four_piece_solver import solve_four_piece_layout
+
+    plan = solve_four_piece_layout(
+        pieces,
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+    )
+
+    assert plan.success is True, (plan.reason, plan.diagnostics)
+    assert len(plan.placements) == 4
+    assert {item.piece_id for item in plan.placements} == {"U1", "U2", "U3", "U4"}
+    assert plan.target_rect_mm[1] >= 148.5
+    long_side = max(plan.target_rect_mm[2:])
+    short_side = min(plan.target_rect_mm[2:])
+    assert long_side == pytest.approx(100.0, abs=1.5)
+    assert short_side == pytest.approx(60.0, abs=1.5)
+    pieces_by_id = {piece["id"]: piece for piece in pieces}
+    for placement in plan.placements:
+        _assert_placement_reconstructs_target(
+            pieces_by_id[placement.piece_id],
+            placement,
+        )
+
+
+def test_four_solve_job_advances_in_bounded_work_units():
+    """单帧只允许一个工作单元时不得同步跑完整搜索，后续帧继续同一任务。"""
+    from maixcam2_app_A_quad.four_piece_solver import FourPieceSolveJob
+
+    job = FourPieceSolveJob(
+        _four_grid_pieces(),
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+        active_budget_seconds=3.0,
+    )
+
+    assert job.advance(time_budget_ms=1000.0, work_unit_limit=1) is None
+    calls = 1
+    while not job.done and calls < 2000:
+        job.advance(time_budget_ms=1000.0, work_unit_limit=1)
+        calls += 1
+
+    assert job.done is True
+    assert job.result.success is True
+    assert calls > 1
+    assert calls < 2000
+
+
+def test_four_solver_rejects_wrong_count_and_out_of_range_rectangle():
+    """非四片和80×40mm小矩形都必须失败，且不得携带任何机械目标。"""
+    from maixcam2_app_A_quad.four_piece_solver import solve_four_piece_layout
+
+    wrong_count = solve_four_piece_layout(
+        _four_grid_pieces()[:3],
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+    )
+    too_small = solve_four_piece_layout(
+        _four_grid_pieces(width=80.0, height=40.0),
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+    )
+
+    assert wrong_count.reason == "four_needs_exactly_four"
+    assert too_small.reason in ("no_rect", "size_reject")
+    assert wrong_count.placements == []
+    assert too_small.placements == []

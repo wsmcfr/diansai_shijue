@@ -1,9 +1,18 @@
 """UNKNOWN FOUR模式的轮廓假设、接缝关系和四片专用图搜索。"""
 
 import math
+import time
 
 import cv2
 import numpy as np
+
+try:
+    from maixcam2_app_A_quad.assembly_planner import AssemblyPlacement, AssemblyPlan
+except ModuleNotFoundError as error:
+    # MaixVision平铺部署时顶层包不存在，四片求解器仍复用同级兼容结果结构。
+    if error.name != "maixcam2_app_A_quad":
+        raise
+    from assembly_planner import AssemblyPlacement, AssemblyPlan
 
 
 # ======================== FOUR求解调试常量（不影响1～3片） ========================
@@ -17,6 +26,21 @@ FOUR_PAIR_RELATION_LIMIT = 6
 FOUR_SEGMENTED_LENGTH_RATIO = 0.75
 # 过短的分段覆盖不具备可靠机械接缝意义，直接拒绝。
 FOUR_MIN_PARTIAL_RATIO = 0.35
+# 四片分层搜索每层最多保留的全局状态数；只影响FOUR，不改变旧UNKNOWN beam。
+FOUR_BEAM_WIDTH = 32
+# 完整矩形长边和短边的题目范围，单位毫米。
+FOUR_RECT_LONG_RANGE_MM = (90.0, 120.0)
+FOUR_RECT_SHORT_RANGE_MM = (50.0, 90.0)
+# 严格轮和宽松轮最低填充率；宽松轮仍保持相同尺寸和重叠硬门。
+FOUR_STRICT_MIN_FILL_RATIO = 0.92
+FOUR_RELAXED_MIN_FILL_RATIO = 0.85
+# 最终总重叠硬门和中间单片加入时的稍宽松剪枝门。
+FOUR_MAX_OVERLAP_RATIO = 0.03
+FOUR_INTERMEDIATE_MAX_OVERLAP_RATIO = 0.06
+# 专用任务累计CPU活动预算；拍照、显示和帧间等待不计入。
+FOUR_ACTIVE_BUDGET_SECONDS = 3.0
+# 中间几何重叠使用较低像素密度，仅消除共享边栅格误差，不参与最终填充计算。
+FOUR_OVERLAP_PIXELS_PER_MM = 2.0
 # ===============================================================================
 
 
@@ -378,3 +402,649 @@ def build_pair_relations(fixed_piece, moving_piece):
                 selected.append(required)
         selected.sort(key=lambda item: item.score)
     return tuple(selected)
+
+
+class _LayoutState:
+    """保存分层搜索中已放碎片的刚体变换、形状假设和累计评分。"""
+
+    def __init__(self, transforms, hypotheses, score=0.0, overlap_area_mm2=0.0):
+        """复制状态字典，避免不同beam分支共享可变矩阵。"""
+        self.transforms = {
+            int(index): (
+                np.asarray(rotation, dtype=np.float64).copy(),
+                np.asarray(translation, dtype=np.float64).copy(),
+            )
+            for index, (rotation, translation) in transforms.items()
+        }
+        self.hypotheses = dict(hypotheses)
+        self.score = float(score)
+        self.overlap_area_mm2 = float(overlap_area_mm2)
+
+
+def _transform_points(points, rotation, translation):
+    """使用行向量约定对N×2点执行二维刚体旋转和平移。"""
+    normalized = _normalize_points(points, "刚体变换点")
+    rotation = np.asarray(rotation, dtype=np.float64)
+    translation = _normalize_point(translation, "刚体平移")
+    if rotation.shape != (2, 2) or not np.all(np.isfinite(rotation)):
+        raise ValueError("刚体旋转必须是有限2×2矩阵")
+    return normalized @ rotation.T + translation
+
+
+def _state_polygons(state):
+    """按状态中的形状假设和变换返回已放碎片毫米多边形字典。"""
+    polygons = {}
+    for index, (rotation, translation) in state.transforms.items():
+        hypothesis = state.hypotheses.get(index)
+        if hypothesis is None:
+            continue
+        polygons[index] = _transform_points(
+            hypothesis.vertices,
+            rotation,
+            translation,
+        )
+    return polygons
+
+
+def _pair_overlap_area_mm2(first_polygon, second_polygon, pixels_per_mm=None):
+    """栅格估算两个任意简单多边形的内部重叠面积，并排除共享边像素。
+
+    主要流程：建立只覆盖两片局部边界的小画布，分别填充并轻蚀一像素后求交。轻蚀
+    只用于重叠判断，不改变目标轮廓或填充率，可避免正确共享接缝被算成一像素重叠。
+    """
+    scale = (
+        FOUR_OVERLAP_PIXELS_PER_MM
+        if pixels_per_mm is None
+        else float(pixels_per_mm)
+    )
+    if scale <= 0.0 or not math.isfinite(scale):
+        raise ValueError("重叠栅格比例必须是正有限数")
+    first = _normalize_polygon(first_polygon)
+    second = _normalize_polygon(second_polygon)
+    all_points = np.vstack((first, second))
+    minimum = np.floor(np.min(all_points, axis=0) * scale) - 3.0
+    maximum = np.ceil(np.max(all_points, axis=0) * scale) + 3.0
+    width, height = np.maximum(1, (maximum - minimum + 1.0).astype(np.int32))
+    if width * height > 4_000_000:
+        raise ValueError("重叠检查画布异常过大")
+    masks = []
+    erosion_kernel = np.ones((3, 3), dtype=np.uint8)
+    for polygon in (first, second):
+        mask = np.zeros((int(height), int(width)), dtype=np.uint8)
+        pixels = np.rint(polygon * scale - minimum).astype(np.int32)
+        cv2.fillPoly(mask, [pixels.reshape(-1, 1, 2)], 255)
+        masks.append(cv2.erode(mask, erosion_kernel, iterations=1))
+    overlap_pixels = cv2.countNonZero(cv2.bitwise_and(masks[0], masks[1]))
+    return float(overlap_pixels) / (scale * scale)
+
+
+def _compose_moving_transform(fixed_transform, relation):
+    """把moving→fixed接缝变换组合到fixed→assembly状态变换之后。"""
+    fixed_rotation, fixed_translation = fixed_transform
+    moving_rotation = fixed_rotation @ relation.rotation
+    moving_translation = relation.translation @ fixed_rotation.T + fixed_translation
+    return moving_rotation, moving_translation
+
+
+def _state_key(state):
+    """量化已放碎片位姿和形状键，删除不同扩展顺序产生的等价状态。"""
+    entries = []
+    for index in sorted(state.transforms):
+        rotation, translation = state.transforms[index]
+        angle = math.degrees(math.atan2(float(rotation[1, 0]), float(rotation[0, 0])))
+        hypothesis = state.hypotheses.get(index)
+        entries.append(
+            (
+                index,
+                round(angle, 1),
+                round(float(translation[0]), 1),
+                round(float(translation[1]), 1),
+                None if hypothesis is None else _hypothesis_key(hypothesis.vertices),
+            )
+        )
+    return tuple(entries)
+
+
+def _partial_bounds_are_possible(polygons):
+    """用题目最大尺寸对中间组合做保守剪枝，明显过大的状态立即拒绝。"""
+    if not polygons:
+        return False
+    points = np.vstack(tuple(polygons.values())).astype(np.float32)
+    rectangle = cv2.minAreaRect(points.reshape(-1, 1, 2))
+    sides = sorted((float(rectangle[1][0]), float(rectangle[1][1])))
+    if sides[0] <= 1e-6 or sides[1] <= 1e-6:
+        return False
+    return (
+        sides[1] <= FOUR_RECT_LONG_RANGE_MM[1] + 5.0
+        and sides[0] <= FOUR_RECT_SHORT_RANGE_MM[1] + 5.0
+    )
+
+
+def _expand_state(state, moving_index, fixed_index, relation):
+    """尝试按一条接缝把未放碎片加入状态；重叠或尺寸越界返回None。"""
+    fixed_hypothesis = state.hypotheses.get(fixed_index)
+    relation_fixed_key = _hypothesis_key(relation.fixed_hypothesis.vertices)
+    if (
+        fixed_hypothesis is not None
+        and _hypothesis_key(fixed_hypothesis.vertices) != relation_fixed_key
+    ):
+        return None
+    transforms = dict(state.transforms)
+    hypotheses = dict(state.hypotheses)
+    hypotheses[fixed_index] = relation.fixed_hypothesis
+    hypotheses[moving_index] = relation.moving_hypothesis
+    transforms[moving_index] = _compose_moving_transform(
+        transforms[fixed_index],
+        relation,
+    )
+    candidate = _LayoutState(
+        transforms,
+        hypotheses,
+        score=state.score + relation.score,
+        overlap_area_mm2=state.overlap_area_mm2,
+    )
+    polygons = _state_polygons(candidate)
+    moving_polygon = polygons[moving_index]
+    added_overlap = 0.0
+    for other_index, other_polygon in polygons.items():
+        if other_index == moving_index:
+            continue
+        added_overlap += _pair_overlap_area_mm2(moving_polygon, other_polygon)
+    moving_area = abs(float(cv2.contourArea(moving_polygon.astype(np.float32))))
+    if added_overlap / max(1.0, moving_area) > FOUR_INTERMEDIATE_MAX_OVERLAP_RATIO:
+        return None
+    candidate.overlap_area_mm2 += added_overlap
+    candidate.score += added_overlap / max(1.0, moving_area)
+    if not _partial_bounds_are_possible(polygons):
+        return None
+    return candidate
+
+
+def _rotation_matrix(angle_rad):
+    """按弧度构造行列式为1的二维旋转矩阵。"""
+    cosine = math.cos(float(angle_rad))
+    sine = math.sin(float(angle_rad))
+    return np.asarray(((cosine, -sine), (sine, cosine)), dtype=np.float64)
+
+
+def _canonicalize_state(state):
+    """把完整布局旋正到左上原点，返回多边形、全局变换和矩形宽高。
+
+    旋正方向取最小外接矩形最长边，允许整体相差180度；这种差异不会改变机械可执行
+    性。返回``(多边形字典, 旋转, 平移, 宽, 高)``，退化时返回None。
+    """
+    polygons = _state_polygons(state)
+    if len(polygons) != 4:
+        return None
+    all_points = np.vstack(tuple(polygons.values())).astype(np.float32)
+    rectangle = cv2.minAreaRect(all_points.reshape(-1, 1, 2))
+    box = cv2.boxPoints(rectangle).astype(np.float64)
+    edge_vectors = np.roll(box, -1, axis=0) - box
+    edge_lengths = np.linalg.norm(edge_vectors, axis=1)
+    longest_index = int(np.argmax(edge_lengths))
+    longest_vector = edge_vectors[longest_index]
+    if float(np.linalg.norm(longest_vector)) <= 1e-6:
+        return None
+    angle = math.atan2(float(longest_vector[1]), float(longest_vector[0]))
+    canonical_rotation = _rotation_matrix(-angle)
+    rotated = {
+        index: polygon @ canonical_rotation.T
+        for index, polygon in polygons.items()
+    }
+    minimum = np.min(np.vstack(tuple(rotated.values())), axis=0)
+    canonical_translation = -minimum
+    canonical = {
+        index: polygon + canonical_translation
+        for index, polygon in rotated.items()
+    }
+    maximum = np.max(np.vstack(tuple(canonical.values())), axis=0)
+    width_mm, height_mm = float(maximum[0]), float(maximum[1])
+    if width_mm < height_mm:
+        # 数值或OpenCV边序导致长边落在Y轴时再旋转90度，统一长边沿目标X方向。
+        quarter_turn = _rotation_matrix(-math.pi * 0.5)
+        rerotated = {
+            index: polygon @ quarter_turn.T
+            for index, polygon in canonical.items()
+        }
+        second_minimum = np.min(np.vstack(tuple(rerotated.values())), axis=0)
+        canonical = {
+            index: polygon - second_minimum
+            for index, polygon in rerotated.items()
+        }
+        canonical_rotation = quarter_turn @ canonical_rotation
+        canonical_translation = (
+            canonical_translation @ quarter_turn.T - second_minimum
+        )
+        maximum = np.max(np.vstack(tuple(canonical.values())), axis=0)
+        width_mm, height_mm = float(maximum[0]), float(maximum[1])
+    return (
+        canonical,
+        canonical_rotation,
+        canonical_translation,
+        width_mm,
+        height_mm,
+    )
+
+
+def _evaluate_complete_state(state):
+    """执行四片矩形尺寸、填充率和重叠率硬验收并返回结构化指标。"""
+    canonicalized = _canonicalize_state(state)
+    if canonicalized is None:
+        return None, "geometry_reject"
+    canonical, rotation, translation, width_mm, height_mm = canonicalized
+    long_side = max(width_mm, height_mm)
+    short_side = min(width_mm, height_mm)
+    if not (
+        FOUR_RECT_LONG_RANGE_MM[0] <= long_side <= FOUR_RECT_LONG_RANGE_MM[1]
+        and FOUR_RECT_SHORT_RANGE_MM[0] <= short_side <= FOUR_RECT_SHORT_RANGE_MM[1]
+    ):
+        return None, "size_reject"
+
+    polygon_areas = [
+        abs(float(cv2.contourArea(polygon.astype(np.float32))))
+        for polygon in canonical.values()
+    ]
+    total_area = sum(polygon_areas)
+    overlap_area = 0.0
+    polygon_items = list(canonical.items())
+    for first_position, (_first_index, first_polygon) in enumerate(polygon_items):
+        for _second_index, second_polygon in polygon_items[first_position + 1 :]:
+            overlap_area += _pair_overlap_area_mm2(first_polygon, second_polygon)
+    overlap_ratio = overlap_area / max(1.0, total_area)
+    if overlap_ratio > FOUR_MAX_OVERLAP_RATIO:
+        return None, "overlap_reject"
+    rectangle_area = max(1.0, width_mm * height_mm)
+    fill_ratio = max(0.0, min(1.0, (total_area - overlap_area) / rectangle_area))
+    if fill_ratio < FOUR_RELAXED_MIN_FILL_RATIO:
+        return None, "fill_reject"
+    tier = "strict" if fill_ratio >= FOUR_STRICT_MIN_FILL_RATIO else "relaxed"
+    return {
+        "canonical": canonical,
+        "rotation": rotation,
+        "translation": translation,
+        "width_mm": width_mm,
+        "height_mm": height_mm,
+        "fill_ratio": fill_ratio,
+        "overlap_ratio": overlap_ratio,
+        "tier": tier,
+    }, "ok"
+
+
+def _normalize_work_target(work_region_mm, split_y_mm):
+    """校验工作区域与下半区并返回可放置目标矩形的毫米边界。"""
+    try:
+        work_values = tuple(float(value) for value in work_region_mm)
+        split_y = float(split_y_mm)
+    except (TypeError, ValueError) as error:
+        raise ValueError("工作区域和split_y_mm必须包含有限数字") from error
+    if len(work_values) != 4 or not np.all(np.isfinite(work_values)):
+        raise ValueError("work_region_mm必须包含X/Y/W/H四个有限数字")
+    if not math.isfinite(split_y):
+        raise ValueError("split_y_mm必须是有限数字")
+    work_x, work_y, work_width, work_height = work_values
+    if work_width <= 0.0 or work_height <= 0.0:
+        raise ValueError("工作区域宽高必须大于零")
+    lower_top = max(work_y, split_y)
+    lower_bottom = work_y + work_height
+    if lower_top >= lower_bottom:
+        raise ValueError("分界线下方没有可用目标区域")
+    return work_x, lower_top, work_width, lower_bottom - lower_top
+
+
+def _place_canonical_in_lower_region(canonical_result, work_region_mm, split_y_mm):
+    """把旋正矩形居中放入下半区，必要时尝试整体旋转90度。
+
+    返回目标多边形、assembly到目标的全局旋转/平移以及目标矩形；两种方向都放不下
+    时返回None，调用方不得生成机械placements。
+    """
+    work_x, lower_top, available_width, available_height = _normalize_work_target(
+        work_region_mm,
+        split_y_mm,
+    )
+    canonical = canonical_result["canonical"]
+    base_rotation = canonical_result["rotation"]
+    base_translation = canonical_result["translation"]
+    width_mm = canonical_result["width_mm"]
+    height_mm = canonical_result["height_mm"]
+    orientation_candidates = [
+        (
+            canonical,
+            base_rotation,
+            base_translation,
+            width_mm,
+            height_mm,
+        )
+    ]
+    quarter_turn = _rotation_matrix(math.pi * 0.5)
+    rotated = {
+        index: polygon @ quarter_turn.T
+        for index, polygon in canonical.items()
+    }
+    rotated_minimum = np.min(np.vstack(tuple(rotated.values())), axis=0)
+    rotated = {
+        index: polygon - rotated_minimum
+        for index, polygon in rotated.items()
+    }
+    orientation_candidates.append(
+        (
+            rotated,
+            quarter_turn @ base_rotation,
+            base_translation @ quarter_turn.T - rotated_minimum,
+            height_mm,
+            width_mm,
+        )
+    )
+
+    for polygons, rotation, translation, target_width, target_height in orientation_candidates:
+        if target_width > available_width + 1e-6 or target_height > available_height + 1e-6:
+            continue
+        offset = np.asarray(
+            (
+                work_x + (available_width - target_width) * 0.5,
+                lower_top + (available_height - target_height) * 0.5,
+            ),
+            dtype=np.float64,
+        )
+        target_polygons = {
+            index: polygon + offset
+            for index, polygon in polygons.items()
+        }
+        return {
+            "polygons": target_polygons,
+            "rotation": rotation,
+            "translation": translation + offset,
+            "target_rect_mm": (
+                float(offset[0]),
+                float(offset[1]),
+                float(target_width),
+                float(target_height),
+            ),
+        }
+    return None
+
+
+def _build_success_plan(pieces, state, evaluated, work_region_mm, split_y_mm, search_nodes):
+    """把通过硬验收的布局转换成兼容UART和绘制层的AssemblyPlan。"""
+    target = _place_canonical_in_lower_region(
+        evaluated,
+        work_region_mm,
+        split_y_mm,
+    )
+    if target is None:
+        return AssemblyPlan.failed("target_range", search_nodes=search_nodes)
+    placements = []
+    global_rotation = target["rotation"]
+    global_translation = target["translation"]
+    for index, piece in enumerate(pieces):
+        piece_rotation, piece_translation = state.transforms[index]
+        total_rotation = global_rotation @ piece_rotation
+        total_translation = piece_translation @ global_rotation.T + global_translation
+        source_center = _normalize_point(piece["center_mm"], "碎片源中心")
+        target_center = source_center @ total_rotation.T + total_translation
+        angle_deg = math.degrees(
+            math.atan2(float(total_rotation[1, 0]), float(total_rotation[0, 0]))
+        )
+        placements.append(
+            AssemblyPlacement(
+                piece["id"],
+                source_center,
+                target_center,
+                target["polygons"][index],
+                angle_deg,
+            )
+        )
+    diagnostics = {
+        "fill_milli": int(round(evaluated["fill_ratio"] * 1000.0)),
+        "overlap_milli": int(round(evaluated["overlap_ratio"] * 1000.0)),
+        "relaxed": 1 if evaluated["tier"] == "relaxed" else 0,
+    }
+    score = (
+        state.score
+        + (1.0 - evaluated["fill_ratio"]) * 10.0
+        + evaluated["overlap_ratio"] * 10.0
+    )
+    return AssemblyPlan(
+        True,
+        placements=placements,
+        target_rect_mm=target["target_rect_mm"],
+        score=score,
+        reason="ok",
+        search_nodes=search_nodes,
+        diagnostics=diagnostics,
+    )
+
+
+class FourPieceSolveJob:
+    """按有限工作单元跨帧推进的FOUR专用接缝图搜索任务。"""
+
+    def __init__(
+        self,
+        pieces,
+        work_region_mm,
+        split_y_mm,
+        beam_width=FOUR_BEAM_WIDTH,
+        active_budget_seconds=FOUR_ACTIVE_BUDGET_SECONDS,
+        clock=None,
+    ):
+        """准备四片快照、候选关系图和增量生成器。
+
+        关键参数pieces必须恰有四个完整上半区碎片；active_budget_seconds只累计advance
+        内实际CPU时间。无效数量立即形成失败结果；合法输入直到advance才展开组合。
+        """
+        self.pieces = tuple(pieces)
+        self.work_region_mm = tuple(work_region_mm)
+        self.split_y_mm = float(split_y_mm)
+        self.beam_width = int(beam_width)
+        self.active_budget_seconds = float(active_budget_seconds)
+        self._clock = time.monotonic if clock is None else clock
+        if self.beam_width < 1:
+            raise ValueError("beam_width必须至少为1")
+        if self.active_budget_seconds <= 0.0 or not math.isfinite(
+            self.active_budget_seconds
+        ):
+            raise ValueError("active_budget_seconds必须是正有限数")
+        self.search_nodes = 0
+        self.active_seconds = 0.0
+        self.result = None
+        self.done = False
+        self._stage = "relations"
+        self._relation_graph = {}
+        if len(self.pieces) != 4:
+            self.result = AssemblyPlan.failed("four_needs_exactly_four")
+            self.done = True
+            self._generator = None
+            return
+        try:
+            for piece in self.pieces:
+                if (
+                    not isinstance(piece, dict)
+                    or not piece.get("id")
+                    or piece.get("complete") is not True
+                    or piece.get("region") != "upper"
+                ):
+                    raise ValueError("FOUR只接受四个完整上半区碎片")
+                _normalize_polygon(piece.get("raw_contour_mm", piece.get("vertices_mm")))
+                _normalize_point(piece["center_mm"], "碎片源中心")
+            _normalize_work_target(self.work_region_mm, self.split_y_mm)
+            for fixed_index, fixed_piece in enumerate(self.pieces):
+                for moving_index, moving_piece in enumerate(self.pieces):
+                    if fixed_index == moving_index:
+                        continue
+                    self._relation_graph[(fixed_index, moving_index)] = build_pair_relations(
+                        fixed_piece,
+                        moving_piece,
+                    )
+        except (KeyError, TypeError, ValueError):
+            self.result = AssemblyPlan.failed("four_input_invalid")
+            self.done = True
+            self._generator = None
+            return
+        if not any(self._relation_graph.values()):
+            self.result = AssemblyPlan.failed("no_edge")
+            self.done = True
+            self._generator = None
+            return
+        self._stage = "search"
+        self._generator = self._search_generator()
+
+    @property
+    def stage(self):
+        """返回当前关系准备、搜索或完成阶段，供设备状态栏显示。"""
+        return self._stage
+
+    def _search_generator(self):
+        """逐候选yield工作单元，最终通过StopIteration返回AssemblyPlan。"""
+        states = [
+            _LayoutState(
+                {0: (np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64))},
+                {},
+            )
+        ]
+        rejection_counts = {
+            "overlap_reject": 0,
+            "size_reject": 0,
+            "fill_reject": 0,
+            "geometry_reject": 0,
+        }
+        for target_count in (2, 3, 4):
+            next_states = []
+            seen = set()
+            for state in states:
+                placed = tuple(sorted(state.transforms))
+                unplaced = tuple(index for index in range(4) if index not in state.transforms)
+                for fixed_index in placed:
+                    for moving_index in unplaced:
+                        relations = self._relation_graph.get((fixed_index, moving_index), ())
+                        for relation in relations:
+                            self.search_nodes += 1
+                            candidate = _expand_state(
+                                state,
+                                moving_index,
+                                fixed_index,
+                                relation,
+                            )
+                            yield None
+                            if candidate is None:
+                                rejection_counts["overlap_reject"] += 1
+                                continue
+                            key = _state_key(candidate)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            next_states.append(candidate)
+            if not next_states:
+                return AssemblyPlan.failed(
+                    "no_rect",
+                    search_nodes=self.search_nodes,
+                    diagnostics=rejection_counts,
+                )
+            next_states.sort(key=lambda item: item.score)
+            states = next_states[: self.beam_width]
+
+        strict_candidates = []
+        relaxed_candidates = []
+        for state in states:
+            self.search_nodes += 1
+            evaluated, reason = _evaluate_complete_state(state)
+            yield None
+            if evaluated is None:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                continue
+            entry = (state.score, state, evaluated)
+            if evaluated["tier"] == "strict":
+                strict_candidates.append(entry)
+            else:
+                relaxed_candidates.append(entry)
+        candidates = strict_candidates if strict_candidates else relaxed_candidates
+        if not candidates:
+            primary_reason = "size_reject" if rejection_counts["size_reject"] else "no_rect"
+            return AssemblyPlan.failed(
+                primary_reason,
+                search_nodes=self.search_nodes,
+                diagnostics=rejection_counts,
+            )
+        candidates.sort(
+            key=lambda item: (
+                item[0] + (1.0 - item[2]["fill_ratio"]) * 10.0,
+                item[2]["overlap_ratio"],
+            )
+        )
+        _score, best_state, best_evaluated = candidates[0]
+        return _build_success_plan(
+            self.pieces,
+            best_state,
+            best_evaluated,
+            self.work_region_mm,
+            self.split_y_mm,
+            self.search_nodes,
+        )
+
+    def advance(self, time_budget_ms=24.0, work_unit_limit=64):
+        """推进有限CPU时间和候选数量；未完成返回None，完成返回缓存计划。
+
+        单帧预算与累计活动预算双重生效。每次生成、检查或拒绝一个组合关系计一个工作
+        单元；达到任一当前帧门立即让出，保证触摸、显示和UART心跳继续刷新。
+        """
+        if self.done:
+            return self.result
+        try:
+            time_budget_ms = float(time_budget_ms)
+            work_unit_limit = int(work_unit_limit)
+        except (TypeError, ValueError) as error:
+            raise ValueError("求解时间片参数无效") from error
+        if time_budget_ms <= 0.0 or work_unit_limit < 1:
+            raise ValueError("求解时间片必须为正且至少包含一个工作单元")
+        started_at = self._clock()
+        units = 0
+        while units < work_unit_limit:
+            elapsed_this_call = self._clock() - started_at
+            if elapsed_this_call * 1000.0 >= time_budget_ms:
+                break
+            if self.active_seconds + elapsed_this_call >= self.active_budget_seconds:
+                self.active_seconds += elapsed_this_call
+                self.result = AssemblyPlan.failed(
+                    "solver_timeout",
+                    search_nodes=self.search_nodes,
+                )
+                self.done = True
+                self._stage = "done"
+                return self.result
+            try:
+                next(self._generator)
+                units += 1
+            except StopIteration as completed:
+                self.active_seconds += self._clock() - started_at
+                self.result = completed.value
+                self.done = True
+                self._stage = "done"
+                return self.result
+        self.active_seconds += self._clock() - started_at
+        return None
+
+    def run_to_completion(self):
+        """连续消费增量任务直到结束，供离线测试和兼容同步入口使用。"""
+        while not self.done:
+            self.advance(time_budget_ms=1000.0, work_unit_limit=100000)
+        return self.result
+
+
+def solve_four_piece_layout(
+    pieces,
+    work_region_mm,
+    split_y_mm,
+    beam_width=FOUR_BEAM_WIDTH,
+    active_budget_seconds=FOUR_ACTIVE_BUDGET_SECONDS,
+):
+    """同步运行独立FOUR求解器并返回兼容AssemblyPlan。
+
+    设备主循环应直接使用FourPieceSolveJob.advance保持非阻塞；本函数用于单元测试、
+    PC回放和少量同步工具。它不调用KNOWN模板或旧UNKNOWN GRAPH/FALLBACK。
+    """
+    job = FourPieceSolveJob(
+        pieces,
+        work_region_mm,
+        split_y_mm,
+        beam_width=beam_width,
+        active_budget_seconds=active_budget_seconds,
+    )
+    return job.run_to_completion()
