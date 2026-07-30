@@ -3,6 +3,7 @@
 import ast
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -705,3 +706,132 @@ def test_run_app_known_save_uses_direct_registration_without_job_start():
 
     assert len(gated_calls) == 1
     assert old_job_starts == []
+
+
+def test_successful_plan_queues_all_placements_once_through_serial_runtime():
+    """成功规划必须把1～4片全部位姿原样交给通信运行器的单次结果接口。"""
+    from maixcam2_app_A_quad.main import queue_successful_plan_result
+
+    placements = [
+        SimpleNamespace(
+            piece_id=f"U{index}",
+            source_center_mm=(20.0 * index, 30.0),
+            target_center_mm=(40.0 * index, 210.0),
+            rotation_delta_deg=15.0 * index,
+        )
+        for index in range(1, 4)
+    ]
+    plan = SimpleNamespace(success=True, placements=placements)
+
+    class RecordingSerialRuntime:
+        """记录结果帧接口收到的模式、纸张方向和完整碎片列表。"""
+
+        def __init__(self):
+            """初始化为空调用记录。"""
+            self.calls = []
+
+        def queue_puzzle_result_once(self, mode, orientation, actual_placements):
+            """保存调用参数并模拟本采集上下文首次排队成功。"""
+            self.calls.append((mode, orientation, actual_placements))
+            return True
+
+    serial_runtime = RecordingSerialRuntime()
+
+    queued = queue_successful_plan_result(
+        serial_runtime,
+        plan,
+        "unknown",
+        "portrait",
+    )
+
+    assert queued is True
+    assert serial_runtime.calls == [("unknown", "portrait", placements)]
+
+
+@pytest.mark.parametrize(
+    "plan",
+    (
+        None,
+        SimpleNamespace(success=False, placements=[]),
+        SimpleNamespace(success=True, placements=[]),
+    ),
+)
+def test_failed_or_incomplete_plan_is_never_sent(plan):
+    """无规划、失败规划和空成功规划都不能形成F4机械动作。"""
+    from maixcam2_app_A_quad.main import queue_successful_plan_result
+
+    class RejectUnexpectedQueue:
+        """任何结果排队调用都表示门禁失效。"""
+
+        def queue_puzzle_result_once(self, *_args):
+            """拒绝不应发生的通信调用。"""
+            raise AssertionError("失败或空规划不得发送")
+
+    assert queue_successful_plan_result(
+        RejectUnexpectedQueue(),
+        plan,
+        "unknown",
+        "portrait",
+    ) is False
+
+
+def test_uart_status_replaces_previous_suffix_without_repetition():
+    """每帧状态只保留一个最新UART后缀，避免不断拼接导致文字溢出。"""
+    from maixcam2_app_A_quad.main import append_uart_status
+
+    assert append_uart_status("PLAN OK", "UART:OFFLINE") == "PLAN OK UART:OFFLINE"
+    assert append_uart_status("PLAN OK UART:OFFLINE", "UART:OK") == "PLAN OK UART:OK"
+    assert append_uart_status("UART:ERROR", "UART:OK") == "UART:OK"
+
+
+def test_main_imports_serial_protocol_in_package_and_flat_modes():
+    """源码包和MaixVision平铺运行两条导入路径都必须包含UART4协议模块。"""
+    from maixcam2_app_A_quad import main
+
+    source = Path(main.__file__).read_text(encoding="utf-8")
+
+    assert "from maixcam2_app_A_quad.serial_protocol import" in source
+    assert "from serial_protocol import" in source
+
+
+def test_run_app_wires_nonblocking_serial_poll_reset_submit_and_close():
+    """设备入口必须逐帧推进串口，并接入CAL复位、成功规划发送和正常退出释放。"""
+    from maixcam2_app_A_quad import main
+
+    syntax_tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8"))
+    run_function = next(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_app"
+    )
+    calls = [node for node in ast.walk(run_function) if isinstance(node, ast.Call)]
+
+    assert any(
+        isinstance(node.func, ast.Name) and node.func.id == "VisionSerialRuntime"
+        for node in calls
+    )
+    assert any(
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "serial_runtime"
+        and node.func.attr == "poll"
+        for node in calls
+    )
+    assert any(
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "serial_runtime"
+        and node.func.attr == "reset_result_context"
+        for node in calls
+    )
+    assert any(
+        isinstance(node.func, ast.Name) and node.func.id == "queue_successful_plan_result"
+        for node in calls
+    )
+    assert any(
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "serial_runtime"
+        and node.func.attr == "close"
+        for node in calls
+    )

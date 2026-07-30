@@ -308,3 +308,95 @@ def test_runtime_updates_expensive_measurement_only_on_measure_page():
 
     assert measurement is not None
     assert session.measurement_tracker.stable_frames == 1
+
+
+def test_send_a4_calibration_action_queues_orientation_without_saving(monkeypatch):
+    """SEND A4只发送当前完整纸面方向，不得顺带保存任何调参字段。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.calibration_ui import CalibrationSession
+    from maixcam2_app_A_quad.config import DEFAULT_CONFIG
+    from maixcam2_app_A_quad.main import InterfaceState, handle_calibration_action
+    from maixcam2_app_A_quad.settings_store import build_default_runtime_settings
+
+    class RecordingSerialRuntime:
+        """记录A4排队参数并提供调参界面使用的最近事件文字。"""
+
+        def __init__(self):
+            """初始化为空调用记录。"""
+            self.paper_orientations = []
+            self.last_event_text = "UART READY"
+
+        def queue_paper_frame(self, paper_orientation):
+            """模拟成功排队A4帧，并返回可辨认的序号。"""
+            self.paper_orientations.append(paper_orientation)
+            self.last_event_text = "A4 QUEUED"
+            return 23
+
+    def fail_if_saved(*_args, **_kwargs):
+        """SEND A4若错误进入持久化路径，立即使测试失败。"""
+        raise AssertionError("SEND A4不得保存设置")
+
+    monkeypatch.setattr(main, "save_runtime_settings", fail_if_saved)
+    runtime_settings = build_default_runtime_settings(DEFAULT_CONFIG, (1280, 960))
+    runtime_settings.update(
+        {
+            "paper_orientation": "landscape",
+            "paper_quad": [[80, 80], [1180, 80], [1180, 880], [80, 880]],
+            "work_x_mm": 0.0,
+            "work_y_mm": 0.0,
+            "work_width_mm": 297.0,
+            "work_height_mm": 210.0,
+            "split_y_mm": 105.0,
+        }
+    )
+    interface = InterfaceState()
+    interface.calibration_session = CalibrationSession(runtime_settings, (1280, 960))
+    serial_runtime = RecordingSerialRuntime()
+
+    unchanged, status = handle_calibration_action(
+        "control_6",
+        interface,
+        runtime_settings,
+        _measurement_result(),
+        "unused.json",
+        (1280, 960),
+        serial_runtime=serial_runtime,
+    )
+
+    assert unchanged is runtime_settings
+    assert serial_runtime.paper_orientations == ["landscape"]
+    assert status == "A4 QUEUED"
+
+
+def test_send_a4_without_paper_quad_returns_roi_not_set():
+    """即使通过直接动作调用，未标定蓝框时也不能向F4排队A4帧。"""
+    from maixcam2_app_A_quad.calibration_ui import CalibrationSession
+    from maixcam2_app_A_quad.config import DEFAULT_CONFIG
+    from maixcam2_app_A_quad.main import InterfaceState, handle_calibration_action
+    from maixcam2_app_A_quad.settings_store import build_default_runtime_settings
+
+    class RejectUnexpectedQueue:
+        """未标定场景中任何发送调用都属于测试失败。"""
+
+        last_event_text = "UART READY"
+
+        def queue_paper_frame(self, _paper_orientation):
+            """拒绝不应发生的排队操作。"""
+            raise AssertionError("未设置paper_quad不得发送")
+
+    runtime_settings = build_default_runtime_settings(DEFAULT_CONFIG, (1280, 960))
+    interface = InterfaceState()
+    interface.calibration_session = CalibrationSession(runtime_settings, (1280, 960))
+
+    unchanged, status = handle_calibration_action(
+        "control_6",
+        interface,
+        runtime_settings,
+        _measurement_result(),
+        "unused.json",
+        (1280, 960),
+        serial_runtime=RejectUnexpectedQueue(),
+    )
+
+    assert unchanged is runtime_settings
+    assert status == "ROI NOT SET"

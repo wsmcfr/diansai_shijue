@@ -16,6 +16,18 @@ class RecordingRuntime:
         self.reset_count += 1
 
 
+class RecordingSerialContext:
+    """记录通信结果上下文是否随模式和START动作同步清除。"""
+
+    def __init__(self):
+        """初始化通信上下文重置次数。"""
+        self.reset_count = 0
+
+    def reset_result_context(self):
+        """模拟取消旧结果帧并允许新START发送一次。"""
+        self.reset_count += 1
+
+
 def test_run_layout_contains_non_overlapping_start_button():
     """640x480正常页必须按顺序提供五个互不重叠且可点击的按钮。"""
     from maixcam2_app_A_quad.touch_ui import build_button_layout, hit_test
@@ -80,6 +92,19 @@ def test_selecting_mode_disarms_capture_and_resets_runtime():
     assert runtime.reset_count == 1
 
 
+def test_selecting_mode_also_resets_serial_result_context():
+    """模式选择必须取消旧PUZZLE_RESULT，避免F4执行上一轮机械目标。"""
+    from maixcam2_app_A_quad.main import MODE_KNOWN, select_capture_mode
+
+    planner_runtime = RecordingRuntime()
+    serial_runtime = RecordingSerialContext()
+
+    select_capture_mode(MODE_KNOWN, planner_runtime, serial_runtime=serial_runtime)
+
+    assert planner_runtime.reset_count == 1
+    assert serial_runtime.reset_count == 1
+
+
 def test_start_capture_arms_and_restarts_current_selection():
     """每次点击START都必须清空旧状态并按当前UNKNOWN材料重新采集。"""
     from maixcam2_app_A_quad.main import (
@@ -106,6 +131,20 @@ def test_start_capture_arms_and_restarts_current_selection():
     assert first_status == "UNKNOWN CARD CAPTURE"
     assert second_status == first_status
     assert runtime.reset_count == 2
+
+
+def test_start_capture_also_opens_new_serial_result_context():
+    """每次START重拍必须让本轮成功规划能够重新排队一次结果帧。"""
+    from maixcam2_app_A_quad.main import MODE_UNKNOWN, start_capture
+
+    planner_runtime = RecordingRuntime()
+    serial_runtime = RecordingSerialContext()
+
+    start_capture(MODE_UNKNOWN, planner_runtime, serial_runtime=serial_runtime)
+    start_capture(MODE_UNKNOWN, planner_runtime, serial_runtime=serial_runtime)
+
+    assert planner_runtime.reset_count == 2
+    assert serial_runtime.reset_count == 2
 
 
 def test_unarmed_known_save_returns_press_start_without_entering_save(monkeypatch):

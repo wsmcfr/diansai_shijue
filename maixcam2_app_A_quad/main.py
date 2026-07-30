@@ -59,6 +59,10 @@ try:
         merge_segmentation_settings,
         save_runtime_settings,
     )
+    from maixcam2_app_A_quad.serial_protocol import (
+        VisionSerialRuntime,
+        create_maix_uart4,
+    )
     from maixcam2_app_A_quad.template_store import (
         load_templates,
         match_known_pieces,
@@ -118,6 +122,7 @@ except ModuleNotFoundError as error:
         merge_segmentation_settings,
         save_runtime_settings,
     )
+    from serial_protocol import VisionSerialRuntime, create_maix_uart4
     from template_store import (
         load_templates,
         match_known_pieces,
@@ -208,16 +213,33 @@ def _normalize_capture_mode(requested_mode):
     return mode
 
 
-def select_capture_mode(requested_mode, planner_runtime):
+def _reset_serial_result_context(serial_runtime):
+    """按需清除通信运行器中的旧拼图结果上下文。
+
+    关键参数serial_runtime允许为None，以保持纯视觉PC调用兼容；非None时必须提供
+    reset_result_context方法。该函数不清除手动A4帧和心跳，只取消上一轮机械目标。
+    返回值：无；接口不完整时抛出ValueError，避免静默沿用旧目标。
+    """
+    if serial_runtime is None:
+        return
+    reset_context = getattr(serial_runtime, "reset_result_context", None)
+    if not callable(reset_context):
+        raise ValueError("serial_runtime必须提供reset_result_context方法")
+    reset_context()
+
+
+def select_capture_mode(requested_mode, planner_runtime, serial_runtime=None):
     """选择KNOWN或UNKNOWN，并把正常页恢复为完全待机。
 
     主要流程：校验模式与运行器，释放旧稳定计数、锁定快照、求解任务和规划缓存；只
-    保存模式选择，不启动视觉分析。返回值为``(规范模式, False, "PRESS START")``，
-    其中False可直接写回主循环capture_armed。
+    保存模式选择，不启动视觉分析；同时取消旧PUZZLE_RESULT，防止F4继续执行上一轮
+    目标。serial_runtime为空时保持旧测试和纯视觉调用兼容。返回值为
+    ``(规范模式, False, "PRESS START")``，其中False可直接写回主循环capture_armed。
     """
     mode = _normalize_capture_mode(requested_mode)
     _validate_capture_runtime(planner_runtime)
     planner_runtime.reset()
+    _reset_serial_result_context(serial_runtime)
     return mode, False, "PRESS START"
 
 
@@ -225,23 +247,69 @@ def start_capture(
     mode,
     planner_runtime,
     unknown_profile=UNKNOWN_PROFILE_WHITE,
+    serial_runtime=None,
 ):
     """确认当前选择并开始一次全新的稳定快照采集。
 
     主要流程：校验模式、UNKNOWN材料和运行器，始终清除上一轮状态，使重复点击START
-    成为明确的重拍入口。返回值为``(True, 状态文字)``；True可直接写回
-    capture_armed，状态文字用于提示本轮实际采用的模式和材料。
+    成为明确的重拍入口；通信上下文同步复位，使本轮成功规划可以且只可以重新发送
+    一次。返回值为``(True, 状态文字)``；True可直接写回capture_armed，状态文字
+    用于提示本轮实际采用的模式和材料。
     """
     normalized_mode = _normalize_capture_mode(mode)
     _validate_capture_runtime(planner_runtime)
 
     planner_runtime.reset()
+    _reset_serial_result_context(serial_runtime)
     if normalized_mode == MODE_KNOWN:
         return True, "KNOWN CAPTURE"
     profile = str(unknown_profile).strip().lower()
     if profile not in (UNKNOWN_PROFILE_WHITE, UNKNOWN_PROFILE_CARD):
         raise ValueError("UNKNOWN子模式必须是white或card")
     return True, f"UNKNOWN {profile.upper()} CAPTURE"
+
+
+def queue_successful_plan_result(
+    serial_runtime,
+    assembly_plan,
+    mode,
+    paper_orientation,
+):
+    """把一次完整成功规划交给通信运行器的单次结果队列。
+
+    主要流程：先拒绝None、失败结果和空placements，再把同一列表整体交给协议层；
+    协议层负责1～4片校验、定点编码和同一START上下文去重。关键参数中的mode和
+    paper_orientation必须与本次求解使用的运行设置一致。返回True表示首次排队，
+    False表示没有可发送规划或协议层判定本上下文已经发送过。
+    """
+    if assembly_plan is None or not bool(getattr(assembly_plan, "success", False)):
+        return False
+    placements = getattr(assembly_plan, "placements", None)
+    if not placements:
+        return False
+    queue_result = getattr(serial_runtime, "queue_puzzle_result_once", None)
+    if not callable(queue_result):
+        raise ValueError("serial_runtime必须提供queue_puzzle_result_once方法")
+    return bool(queue_result(mode, paper_orientation, placements))
+
+
+def append_uart_status(status_text, link_text):
+    """把最新UART链路状态作为唯一后缀加入屏幕状态文字。
+
+    主要流程：按空格拆分旧状态，删除任何UART:开头的历史后缀，再追加协议运行器
+    给出的UART:OK/OFFLINE/ERROR。返回新的ASCII字符串，不修改输入；这种替换方式
+    避免每帧重复拼接导致状态栏越来越长。
+    """
+    normalized_link = str(link_text).strip()
+    if normalized_link not in ("UART:OK", "UART:OFFLINE", "UART:ERROR"):
+        raise ValueError("UART链路状态无效")
+    status_tokens = [
+        token
+        for token in str(status_text).strip().split()
+        if not token.startswith("UART:")
+    ]
+    status_tokens.append(normalized_link)
+    return " ".join(status_tokens)
 
 
 def select_display_pieces(live_pieces, planner_runtime):
@@ -717,12 +785,14 @@ def handle_calibration_action(
     settings_path,
     frame_size,
     frame_bgr=None,
+    serial_runtime=None,
 ):
-    """处理五页调参动作并执行两组互不覆盖的持久化。
+    """处理五页调参动作、A4发送和两组互不覆盖的持久化。
 
-    主要流程：顶部动作切换页面；底部固定槽先由会话映射为AUTO ROI、INSET、LOCK
-    或ADV参数动作。LOCK只合并纸张字段，ADV SAVE只合并分割字段。
-    frame_bgr 仅在AUTO ROI单次点击时使用。返回值为 ``(运行参数, 状态文字)``。
+    主要流程：顶部动作切换页面；底部固定槽先由会话映射为AUTO ROI、工作区、LOCK、
+    SEND A4或ADV参数动作。LOCK只合并纸张字段，ADV SAVE只合并分割字段，SEND A4
+    只排队协议帧且不写设置。frame_bgr仅在AUTO ROI单次点击时使用。
+    返回值为 ``(运行参数, 状态文字)``。
     """
     if not interface_state.is_calibrating:
         raise ValueError("只有调参界面可以处理调参动作")
@@ -766,6 +836,22 @@ def handle_calibration_action(
         )
         session.status_text = "ROI LOCKED"
         return saved_settings, session.status_text
+    if logical_action == "send_a4":
+        if session.settings.get("paper_quad") is None:
+            session.status_text = "ROI NOT SET"
+            return runtime_settings, session.status_text
+        if serial_runtime is None:
+            session.status_text = "UART ERROR"
+            return runtime_settings, session.status_text
+        queue_paper_frame = getattr(serial_runtime, "queue_paper_frame", None)
+        if not callable(queue_paper_frame):
+            raise ValueError("serial_runtime必须提供queue_paper_frame方法")
+        queue_paper_frame(session.settings["paper_orientation"])
+        session.status_text = str(serial_runtime.last_event_text)
+        return runtime_settings, session.status_text
+    if logical_action == "disabled":
+        # ADV第六槽是为保持六槽布局而保留的空白区，触摸后不改变任何状态。
+        return runtime_settings, session.status_text
     if logical_action == "next_param":
         return runtime_settings, f"PARAM {session.cycle_item()}"
     if logical_action == "value_dec":
@@ -1212,6 +1298,9 @@ def run_app():
     interface_state = InterfaceState()
     # 固定机位仍要求连续3帧；中心容差放宽到3mm以容纳远距离轮廓量化抖动。
     planner_runtime = AssemblyRuntime(stable_frames=3, position_tolerance_mm=3.0)
+    # 构造函数不打开硬件；第一次poll才配置A21/A22并尝试打开UART4，因此串口故障
+    # 不会阻止相机和显示初始化。
+    serial_runtime = VisionSerialRuntime(create_maix_uart4)
 
     mode = MODE_UNKNOWN
     # 现场白色覆膜可能因反光产生伪纹理，因此启动默认明确选择几何首解即停的WHITE。
@@ -1246,6 +1335,11 @@ def run_app():
     while not app.need_exit():
         camera_image = cam.read()
         frame_bgr = image.image2cv(camera_image, ensure_bgr=False, copy=False)
+
+        # 每帧只推进一次非阻塞UART状态机。心跳状态0=待机、1=CAL、2=已START，
+        # F4可据此区分视觉在线但尚未开始识别的正常情况。
+        serial_app_state = 1 if interface_state.is_calibrating else (2 if capture_armed else 0)
+        serial_runtime.poll(app_state=serial_app_state)
 
         # CAL使用未保存工作副本，RUN只使用已经保存并生效的参数。
         if interface_state.is_calibrating:
@@ -1336,6 +1430,7 @@ def run_app():
             if action == "cal":
                 # CAL会改变纸张或分割参数，进入和退出都必须丢弃旧机械目标。
                 planner_runtime.reset()
+                serial_runtime.reset_result_context()
                 capture_armed = False
                 entered_calibration = interface_state.toggle_calibration(
                     runtime_settings,
@@ -1353,6 +1448,7 @@ def run_app():
                         PERSISTENT_SETTINGS_PATH,
                         frame_size,
                         frame_bgr=frame_bgr,
+                        serial_runtime=serial_runtime,
                     )
                 except Exception as error:
                     # 调参动作失败保持旧运行参数和当前会话，便于用户修正后重试。
@@ -1362,6 +1458,7 @@ def run_app():
                 mode, capture_armed, status_message = select_capture_mode(
                     action,
                     planner_runtime,
+                    serial_runtime=serial_runtime,
                 )
                 preserve_planning_status = True
                 capture_reset_requested = True
@@ -1372,6 +1469,7 @@ def run_app():
                 mode, capture_armed, status_message = select_capture_mode(
                     MODE_UNKNOWN,
                     planner_runtime,
+                    serial_runtime=serial_runtime,
                 )
                 preserve_planning_status = True
                 capture_reset_requested = True
@@ -1381,6 +1479,7 @@ def run_app():
                     mode,
                     planner_runtime,
                     unknown_profile=unknown_profile,
+                    serial_runtime=serial_runtime,
                 )
                 preserve_planning_status = True
                 capture_reset_requested = True
@@ -1407,6 +1506,7 @@ def run_app():
             display_status = status_message
             if resolution_fallback and "RES LOW" not in display_status:
                 display_status = f"{display_status} RES LOW".strip()
+            display_status = append_uart_status(display_status, serial_runtime.link_text)
             display_frame = draw_calibration_frame(
                 frame_bgr,
                 detection,
@@ -1462,6 +1562,12 @@ def run_app():
                     first_solution_node=planner_runtime.first_solution_node,
                     snapshot_locked=planner_runtime.snapshot_locked,
                 )
+                queue_successful_plan_result(
+                    serial_runtime,
+                    assembly_plan,
+                    mode,
+                    runtime_settings["paper_orientation"],
+                )
 
             # 稳定门达到前画实时轮廓；达到后始终画运行器深复制的同一快照，使屏幕
             # 红点与求解输入完全一致。手动重拍点击帧不显示旧点，也不把旧检测结果计入
@@ -1477,6 +1583,7 @@ def run_app():
             display_status = status_message
             if resolution_fallback and "RES LOW" not in display_status:
                 display_status = f"{display_status} RES LOW".strip()
+            display_status = append_uart_status(display_status, serial_runtime.link_text)
             display_frame = draw_overlay(
                 frame_bgr,
                 display_pieces,
@@ -1500,6 +1607,9 @@ def run_app():
         if capture_reset_requested:
             detection = None
         time.sleep_ms(1)
+    # app.need_exit正常结束后释放UART文件描述符；运行器close可重复调用且内部吞掉
+    # 驱动关闭异常，不能影响Maix应用退出。
+    serial_runtime.close()
 
 
 if __name__ == "__main__":
