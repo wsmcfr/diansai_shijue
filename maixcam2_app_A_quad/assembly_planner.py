@@ -864,6 +864,122 @@ def _edge_length(vertices, edge_index):
     return float(np.linalg.norm(end - start))
 
 
+def _edge_alignment_pose(
+    source_polygon,
+    source_edge,
+    target_polygon,
+    target_edge,
+    anchor="midpoint",
+):
+    """计算源边反向贴合目标边的二维刚体位姿。
+
+    主要流程：根据两条有向边的夹角生成行列式为正一的旋转矩阵，再按`anchor`
+    选择中点、源起点或源终点作为平移锚点。整个过程不引入缩放和镜像；等长边在
+    三种锚点下得到相同结果，长短边分段接缝则可用两端锚点生成左右两个候选。
+
+    关键参数：`source_edge`和`target_edge`是闭合多边形边号；`anchor`可为
+    `midpoint`、`source_start`或`source_end`。返回值为`(2x2旋转矩阵, 2维平移)`。
+    """
+    source = np.asarray(source_polygon, dtype=np.float64)
+    target = np.asarray(target_polygon, dtype=np.float64)
+    source_edge = int(source_edge)
+    target_edge = int(target_edge)
+    source_start = source[source_edge]
+    source_end = source[(source_edge + 1) % len(source)]
+    target_start = target[target_edge]
+    target_end = target[(target_edge + 1) % len(target)]
+    source_vector = source_end - source_start
+    target_reverse_vector = target_start - target_end
+    if (
+        float(np.linalg.norm(source_vector)) <= 1e-9
+        or float(np.linalg.norm(target_reverse_vector)) <= 1e-9
+    ):
+        raise ValueError("接缝边长度必须大于零")
+
+    source_angle = math.atan2(source_vector[1], source_vector[0])
+    target_angle = math.atan2(target_reverse_vector[1], target_reverse_vector[0])
+    angle = target_angle - source_angle
+    rotation = np.asarray(
+        ((math.cos(angle), -math.sin(angle)), (math.sin(angle), math.cos(angle))),
+        dtype=np.float64,
+    )
+    rotated_start = source_start @ rotation.T
+    rotated_end = source_end @ rotation.T
+    if anchor == "midpoint":
+        source_anchor = (rotated_start + rotated_end) * 0.5
+        target_anchor = (target_start + target_end) * 0.5
+    elif anchor == "source_start":
+        source_anchor = rotated_start
+        target_anchor = target_end
+    elif anchor == "source_end":
+        source_anchor = rotated_end
+        target_anchor = target_start
+    else:
+        raise ValueError("未知接缝锚点模式")
+    translation = target_anchor - source_anchor
+    return rotation, translation
+
+
+def _transform_solver_outline(solver_piece, hypothesis_index, pose):
+    """用同一刚体位姿转换一片碎片的接缝候选和完整轮廓。
+
+    主要流程：按候选编号读取`local_vertices`，并与`outline_local`分别通过同一个
+    旋转矩阵和平移向量。返回的两套多边形共享坐标系：接缝多边形只用于提出后续
+    连接，完整轮廓专门用于重叠和最终矩形硬验收。
+
+    关键参数：`solver_piece`来自`_solver_piece`；`hypothesis_index`是候选列表下标；
+    `pose`为`(旋转矩阵, 平移向量)`。返回含候选编号、位姿和两套多边形的字典。
+    """
+    hypotheses = solver_piece["hypotheses"]
+    selected_index = int(hypothesis_index)
+    if not 0 <= selected_index < len(hypotheses):
+        raise ValueError("候选编号超出范围")
+    hypothesis = hypotheses[selected_index]
+    return {
+        "hypothesis": selected_index,
+        "pose": pose,
+        "seam_polygon": _transform_polygon_with_pose(
+            hypothesis["local_vertices"],
+            pose,
+        ),
+        "outline_polygon": _transform_polygon_with_pose(
+            solver_piece["outline_local"],
+            pose,
+        ),
+    }
+
+
+def _solver_state_pose_key(pose_by_index, hypothesis_by_index, precision=100.0):
+    """生成包含候选身份和量化刚体位姿的稳定搜索状态键。
+
+    每片记录候选编号、旋转矩阵和平移向量，避免外框相近的不同接缝候选在完整轮廓
+    硬验收前被错误合并。`precision`是每个浮点单位的量化倍数，默认保留0.01精度；
+    返回按碎片索引排序的不可变元组，可直接用于集合和字典去重。
+    """
+    scale = float(precision)
+    if scale <= 0.0 or not math.isfinite(scale):
+        raise ValueError("位姿量化精度必须是有限正数")
+    result = []
+    for piece_index in sorted(pose_by_index):
+        if piece_index not in hypothesis_by_index:
+            raise ValueError("位姿状态缺少候选编号")
+        rotation, translation = pose_by_index[piece_index]
+        pose_values = np.concatenate(
+            (
+                np.asarray(rotation, dtype=np.float64).reshape(-1),
+                np.asarray(translation, dtype=np.float64).reshape(-1),
+            )
+        )
+        result.append(
+            (
+                int(piece_index),
+                int(hypothesis_by_index[piece_index]),
+                tuple(int(value) for value in np.rint(pose_values * scale)),
+            )
+        )
+    return tuple(result)
+
+
 def _align_source_edge_to_target(source_vertices, source_edge, target_vertices, target_edge):
     """生成使源边与目标边反向重合的无缩放、无镜像刚体变换多边形。"""
     source_start = source_vertices[source_edge]
@@ -945,12 +1061,22 @@ def _segmented_seam_is_possible(
         if piece_index in (source_index, target_index):
             continue
         # _solver_piece已经缓存边长；兼容旧测试构造的内部字典时才现场补算。
-        edge_lengths = solver_piece.get("edge_lengths")
-        if edge_lengths is None:
+        # 其余碎片可以尚未确定形状候选，因此这里汇总全部候选的边长，仅回答
+        # “是否存在补齐长边的可能”。真正搜索状态会固定候选编号，最终不会混用。
+        hypotheses = solver_piece.get("hypotheses")
+        if hypotheses:
             edge_lengths = tuple(
-                _edge_length(solver_piece["local_vertices"], edge_index)
-                for edge_index in range(len(solver_piece["local_vertices"]))
+                float(edge_length)
+                for hypothesis in hypotheses
+                for edge_length in hypothesis["edge_lengths"]
             )
+        else:
+            edge_lengths = solver_piece.get("edge_lengths")
+            if edge_lengths is None:
+                edge_lengths = tuple(
+                    _edge_length(solver_piece["local_vertices"], edge_index)
+                    for edge_index in range(len(solver_piece["local_vertices"]))
+                )
         next_sums = list(partial_sums)
         for current_sum, segment_count in partial_sums:
             for edge_length in edge_lengths:
@@ -969,11 +1095,11 @@ def _segmented_seam_is_possible(
 
 
 def _build_edge_compatibility_graph(solver_pieces, base_tolerance_mm):
-    """一次构建所有有向整边与T形分段边兼容关系。
+    """一次构建全部形状候选的有向整边与T形分段边兼容关系。
 
-    主要流程：复用每片预计算边长，枚举不同碎片的有向边对；等长边直接登记为
-    ``full``，长度不同的边只有通过长度守恒检查才登记为``segmented``。每条关系还
-    缓存纹理分数、匹配长度和误差，后续搜索只查询这张有限图，不再重复判断边长。
+    主要流程：枚举不同碎片的候选对和有向边对；等长边直接登记为``full``，长度
+    不同的边只有通过长度守恒检查才登记为``segmented``。每条关系记录源/目标候选
+    编号、最高等级、候选总分、纹理分数和边长误差，后续搜索可按等级逐步开放。
 
     关键参数：solver_pieces来自_solver_piece；base_tolerance_mm是远距离毫米边长容差。
     返回值：``{(源片索引, 目标片索引): (关系字典, ...)}``，无兼容边的片对也保留
@@ -985,58 +1111,87 @@ def _build_edge_compatibility_graph(solver_pieces, base_tolerance_mm):
 
     graph = {}
     for source_index, source_piece in enumerate(solver_pieces):
-        source_lengths = tuple(float(value) for value in source_piece["edge_lengths"])
         for target_index, target_piece in enumerate(solver_pieces):
             if source_index == target_index:
                 continue
-            target_lengths = tuple(float(value) for value in target_piece["edge_lengths"])
             relations = []
-            for source_edge, source_length in enumerate(source_lengths):
-                for target_edge, target_length in enumerate(target_lengths):
-                    pair_tolerance = max(
-                        tolerance_mm,
-                        0.04 * max(source_length, target_length),
+            for source_hypothesis_index, source_hypothesis in enumerate(
+                source_piece["hypotheses"]
+            ):
+                source_lengths = tuple(
+                    float(value) for value in source_hypothesis["edge_lengths"]
+                )
+                source_rank = int(
+                    source_hypothesis.get("rank", source_hypothesis_index)
+                )
+                for target_hypothesis_index, target_hypothesis in enumerate(
+                    target_piece["hypotheses"]
+                ):
+                    target_lengths = tuple(
+                        float(value) for value in target_hypothesis["edge_lengths"]
                     )
-                    length_error = abs(source_length - target_length)
-                    lengths_are_equal = length_error <= pair_tolerance
-                    if not lengths_are_equal and not _segmented_seam_is_possible(
-                        solver_pieces,
-                        source_index,
-                        source_length,
-                        target_index,
-                        target_length,
-                        tolerance_mm,
-                    ):
-                        continue
-
-                    relation_kind = "full" if lengths_are_equal else "segmented"
-                    # 整边反向重合时两组特征区间一一对应，可以安全预计算纹理分数。
-                    # 分段边存在“锚定长边左端或右端”两种候选，若没有实际子段区间，
-                    # 用整条长边重采样会产生伪分数；此时只使用几何关系参与限宽排序。
-                    texture_score = 0.0
-                    if lengths_are_equal:
-                        texture_score = edge_feature_match_score(
-                            source_piece["edge_features"][source_edge],
-                            target_piece["edge_features"][target_edge],
-                        )
-                    relations.append(
-                        {
-                            "source_edge": int(source_edge),
-                            "target_edge": int(target_edge),
-                            "kind": relation_kind,
-                            "texture_score": float(texture_score),
-                            "matched_length_mm": float(min(source_length, target_length)),
-                            "length_error_mm": float(length_error),
-                        }
+                    target_rank = int(
+                        target_hypothesis.get("rank", target_hypothesis_index)
                     )
+                    maximum_rank = max(source_rank, target_rank)
+                    hypothesis_score = float(
+                        source_hypothesis.get("score", 0.0)
+                    ) + float(target_hypothesis.get("score", 0.0))
+                    for source_edge, source_length in enumerate(source_lengths):
+                        for target_edge, target_length in enumerate(target_lengths):
+                            pair_tolerance = max(
+                                tolerance_mm,
+                                0.04 * max(source_length, target_length),
+                            )
+                            length_error = abs(source_length - target_length)
+                            lengths_are_equal = length_error <= pair_tolerance
+                            if not lengths_are_equal and not _segmented_seam_is_possible(
+                                solver_pieces,
+                                source_index,
+                                source_length,
+                                target_index,
+                                target_length,
+                                tolerance_mm,
+                            ):
+                                continue
 
-            # 整边、低纹理误差、长接缝优先。该顺序只影响速度，最终仍走矩形硬验收。
+                            relation_kind = "full" if lengths_are_equal else "segmented"
+                            # 只有整边反向重合时特征区间一一对应；分段边没有实际子段
+                            # 区间，继续只使用几何关系，防止虚假的整边纹理分数。
+                            texture_score = 0.0
+                            if lengths_are_equal:
+                                texture_score = edge_feature_match_score(
+                                    source_hypothesis["edge_features"][source_edge],
+                                    target_hypothesis["edge_features"][target_edge],
+                                )
+                            relations.append(
+                                {
+                                    "source_hypothesis": int(source_hypothesis_index),
+                                    "target_hypothesis": int(target_hypothesis_index),
+                                    "source_edge": int(source_edge),
+                                    "target_edge": int(target_edge),
+                                    "maximum_rank": int(maximum_rank),
+                                    "hypothesis_score": float(hypothesis_score),
+                                    "kind": relation_kind,
+                                    "texture_score": float(texture_score),
+                                    "matched_length_mm": float(
+                                        min(source_length, target_length)
+                                    ),
+                                    "length_error_mm": float(length_error),
+                                }
+                            )
+
+            # 候选等级和质量优先，随后沿用整边、纹理、长接缝和误差排序。
             relations.sort(
                 key=lambda relation: (
+                    relation["maximum_rank"],
+                    relation["hypothesis_score"],
                     0 if relation["kind"] == "full" else 1,
                     relation["texture_score"],
                     -relation["matched_length_mm"],
                     relation["length_error_mm"],
+                    relation["source_hypothesis"],
+                    relation["target_hypothesis"],
                     relation["source_edge"],
                     relation["target_edge"],
                 )
@@ -1781,11 +1936,12 @@ def _build_graph_edge_candidates(
     match_ratio=UNKNOWN_GRAPH_MATCH_RATIO,
     candidate_limit=UNKNOWN_GRAPH_MAX_EDGE_CANDIDATES,
 ):
-    """构造不同碎片之间最多32条无向整边连接假设。
+    """构造不同碎片、不同形状候选之间最多32条无向整边连接假设。
 
-    每条候选保存两个碎片索引、各自边索引和相对长度误差。16%门槛用于容忍远距离
-    轮廓角点误差，但短于题目最短接缝的边不会进入图；候选按误差、长接缝优先排序
-    后截断。返回元组，后续组合不得再次扩大候选集合。
+    每条关系同时保存两片的候选编号、边号、最高候选等级和候选质量总分。16%门槛
+    用于容忍远距离角点误差，但短于题目最短接缝的边不会进入图。候选先按等级和
+    候选质量排序，再比较边长误差和接缝长度，保证首选形状不被次级候选挤出有限图。
+    返回元组；后续连接集合必须固定同一碎片的候选编号，不能跨候选借边。
     """
     ratio_limit = float(match_ratio)
     maximum_candidates = int(candidate_limit)
@@ -1796,36 +1952,66 @@ def _build_graph_edge_candidates(
     for first_index, first_piece in enumerate(solver_pieces):
         for second_index in range(first_index + 1, len(solver_pieces)):
             second_piece = solver_pieces[second_index]
-            for first_edge, first_length in enumerate(first_piece["edge_lengths"]):
-                first_length = float(first_length)
-                if first_length < UNKNOWN_MIN_SEAM_LENGTH_MM:
-                    continue
-                for second_edge, second_length in enumerate(second_piece["edge_lengths"]):
-                    second_length = float(second_length)
-                    if second_length < UNKNOWN_MIN_SEAM_LENGTH_MM:
-                        continue
-                    long_length = max(first_length, second_length)
-                    if long_length <= 1e-9:
-                        continue
-                    relative_error = abs(first_length - second_length) / long_length
-                    if relative_error > ratio_limit:
-                        continue
-                    candidates.append(
-                        {
-                            "relative_error": float(relative_error),
-                            "first_index": int(first_index),
-                            "first_edge": int(first_edge),
-                            "second_index": int(second_index),
-                            "second_edge": int(second_edge),
-                            "matched_length_mm": float(min(first_length, second_length)),
-                        }
+            for first_hypothesis_index, first_hypothesis in enumerate(
+                first_piece["hypotheses"]
+            ):
+                first_rank = int(first_hypothesis.get("rank", first_hypothesis_index))
+                for second_hypothesis_index, second_hypothesis in enumerate(
+                    second_piece["hypotheses"]
+                ):
+                    second_rank = int(
+                        second_hypothesis.get("rank", second_hypothesis_index)
                     )
+                    maximum_rank = max(first_rank, second_rank)
+                    hypothesis_score = float(first_hypothesis.get("score", 0.0)) + float(
+                        second_hypothesis.get("score", 0.0)
+                    )
+                    for first_edge, first_length in enumerate(
+                        first_hypothesis["edge_lengths"]
+                    ):
+                        first_length = float(first_length)
+                        if first_length < UNKNOWN_MIN_SEAM_LENGTH_MM:
+                            continue
+                        for second_edge, second_length in enumerate(
+                            second_hypothesis["edge_lengths"]
+                        ):
+                            second_length = float(second_length)
+                            if second_length < UNKNOWN_MIN_SEAM_LENGTH_MM:
+                                continue
+                            long_length = max(first_length, second_length)
+                            if long_length <= 1e-9:
+                                continue
+                            relative_error = abs(first_length - second_length) / long_length
+                            if relative_error > ratio_limit:
+                                continue
+                            candidates.append(
+                                {
+                                    "relative_error": float(relative_error),
+                                    "first_index": int(first_index),
+                                    "first_edge": int(first_edge),
+                                    "second_index": int(second_index),
+                                    "second_edge": int(second_edge),
+                                    # 无向GRAPH沿用first/second索引，但候选字段统一采用
+                                    # source/target命名，分别与first/second一一对应。
+                                    "source_hypothesis": int(first_hypothesis_index),
+                                    "target_hypothesis": int(second_hypothesis_index),
+                                    "maximum_rank": int(maximum_rank),
+                                    "hypothesis_score": float(hypothesis_score),
+                                    "matched_length_mm": float(
+                                        min(first_length, second_length)
+                                    ),
+                                }
+                            )
     candidates.sort(
         key=lambda candidate: (
+            candidate["maximum_rank"],
+            candidate["hypothesis_score"],
             candidate["relative_error"],
             -candidate["matched_length_mm"],
             candidate["first_index"],
             candidate["second_index"],
+            candidate["source_hypothesis"],
+            candidate["target_hypothesis"],
             candidate["first_edge"],
             candidate["second_edge"],
         )
@@ -1862,8 +2048,9 @@ def _collect_graph_matching_sets(
     """枚举最多90组边唯一、度数受限且覆盖全部碎片的连接关系。
 
     两片只需一条连接边；三至四片先找N-1条生成树，只有找不到时才尝试N条闭环。
-    同一碎片物理边在一组中只能使用一次，每片连接度不超过3。返回值按累计边长
-    相对误差排序，使WHITE优先检查最可信组合。
+    同一碎片物理边在一组中只能使用一次，每片连接度不超过3；同一碎片一旦由某条
+    关系选择了形状候选，后续关系必须使用同一候选。返回值先按最高候选等级和候选
+    分数排序，再比较累计边长误差，使WHITE优先检查排名0的可信组合。
     """
     count = int(piece_count)
     limit = int(matching_set_limit)
@@ -1877,8 +2064,15 @@ def _collect_graph_matching_sets(
 
     matching_sets = []
 
-    def search(start_index, target_count, selected, used_edges, degrees):
-        """深度优先选择固定条数关系，到达上限后立即停止继续组合。"""
+    def search(
+        start_index,
+        target_count,
+        selected,
+        used_edges,
+        degrees,
+        selected_hypotheses,
+    ):
+        """深度优先选择固定条数关系，并固定每片已经选定的候选编号。"""
         if len(matching_sets) >= limit:
             return
         if len(selected) == target_count:
@@ -1893,8 +2087,18 @@ def _collect_graph_matching_sets(
             relation = candidates[candidate_index]
             first_index = relation["first_index"]
             second_index = relation["second_index"]
-            first_edge = (first_index, relation["first_edge"])
-            second_edge = (second_index, relation["second_edge"])
+            first_hypothesis = int(relation.get("source_hypothesis", 0))
+            second_hypothesis = int(relation.get("target_hypothesis", 0))
+            if (
+                first_index in selected_hypotheses
+                and selected_hypotheses[first_index] != first_hypothesis
+            ) or (
+                second_index in selected_hypotheses
+                and selected_hypotheses[second_index] != second_hypothesis
+            ):
+                continue
+            first_edge = (first_index, first_hypothesis, relation["first_edge"])
+            second_edge = (second_index, second_hypothesis, relation["second_edge"])
             if first_edge in used_edges or second_edge in used_edges:
                 continue
             if degrees[first_index] >= 3 or degrees[second_index] >= 3:
@@ -1905,14 +2109,27 @@ def _collect_graph_matching_sets(
             degrees[first_index] += 1
             degrees[second_index] += 1
             selected.append(relation)
+            previous_first = selected_hypotheses.get(first_index)
+            previous_second = selected_hypotheses.get(second_index)
+            selected_hypotheses[first_index] = first_hypothesis
+            selected_hypotheses[second_index] = second_hypothesis
             search(
                 candidate_index + 1,
                 target_count,
                 selected,
                 used_edges,
                 degrees,
+                selected_hypotheses,
             )
             selected.pop()
+            if previous_first is None:
+                selected_hypotheses.pop(first_index, None)
+            else:
+                selected_hypotheses[first_index] = previous_first
+            if previous_second is None:
+                selected_hypotheses.pop(second_index, None)
+            else:
+                selected_hypotheses[second_index] = previous_second
             degrees[first_index] -= 1
             degrees[second_index] -= 1
             used_edges.remove(first_edge)
@@ -1922,12 +2139,14 @@ def _collect_graph_matching_sets(
 
     target_counts = (1,) if count == 2 else (count - 1, count)
     for target_count in target_counts:
-        search(0, target_count, [], set(), [0] * count)
+        search(0, target_count, [], set(), [0] * count, {})
         if matching_sets:
             break
     matching_sets.sort(
-        key=lambda relations: sum(
-            relation["relative_error"] for relation in relations
+        key=lambda relations: (
+            max((int(relation.get("maximum_rank", 0)) for relation in relations), default=0),
+            sum(float(relation.get("hypothesis_score", 0.0)) for relation in relations),
+            sum(relation["relative_error"] for relation in relations),
         )
     )
     return tuple(matching_sets[:limit])
@@ -1971,16 +2190,43 @@ def _align_edge_midpoint_pose(source_polygon, source_edge, target_start, target_
 
 
 def _propagate_graph_layout(solver_pieces, relations):
-    """从第0片出发通过连接图一次传播全部碎片位姿。
+    """按关系指定的形状候选传播全部碎片刚体位姿。
 
-    返回值为`(按索引多边形字典, 闭合误差)`；图断开或数值无效时返回`(None, inf)`。
-    树关系只访问每片一次，闭环关系再次到达已放置片时用平均顶点距离累计一致性误差。
+    主要流程：先从关系中建立每片唯一的候选编号；若同片出现候选冲突立即拒绝。
+    随后固定第0片位姿，通过反向接缝逐片传播旋转和平移。每片最终同时生成接缝
+    多边形和完整轮廓多边形；闭环再次到达已放置片时，只比较同一候选的接缝位置。
+
+    返回值：成功时为`(状态字典, 闭合误差)`，状态含`hypothesis_by_index`、
+    `pose_by_index`、`seam_by_index`和`outline_by_index`；关系冲突、图断开或数值异常
+    时返回`(None, inf)`。
     """
     piece_count = len(solver_pieces)
     adjacency = [[] for _ in range(piece_count)]
+    hypothesis_by_index = {}
     for relation in relations:
-        adjacency[relation["first_index"]].append(relation)
-        adjacency[relation["second_index"]].append(relation)
+        first_index = int(relation["first_index"])
+        second_index = int(relation["second_index"])
+        first_hypothesis = int(relation.get("source_hypothesis", 0))
+        second_hypothesis = int(relation.get("target_hypothesis", 0))
+        if (
+            first_index in hypothesis_by_index
+            and hypothesis_by_index[first_index] != first_hypothesis
+        ) or (
+            second_index in hypothesis_by_index
+            and hypothesis_by_index[second_index] != second_hypothesis
+        ):
+            return None, float("inf")
+        hypothesis_by_index[first_index] = first_hypothesis
+        hypothesis_by_index[second_index] = second_hypothesis
+        adjacency[first_index].append(relation)
+        adjacency[second_index].append(relation)
+
+    # 单片布局没有连接关系；多片连通关系则应覆盖全部碎片。未覆盖项在后续断开检查
+    # 中拒绝，这里只为合法单片和第0片提供排名0默认值。
+    if piece_count == 1:
+        hypothesis_by_index[0] = 0
+    elif 0 not in hypothesis_by_index:
+        return None, float("inf")
 
     poses = [None] * piece_count
     poses[0] = (np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64))
@@ -1988,8 +2234,12 @@ def _propagate_graph_layout(solver_pieces, relations):
     closure_error = 0.0
     while pending:
         current_index = pending.pop()
+        current_hypothesis_index = hypothesis_by_index[current_index]
+        current_hypothesis = solver_pieces[current_index]["hypotheses"][
+            current_hypothesis_index
+        ]
         current_polygon = _transform_polygon_with_pose(
-            solver_pieces[current_index]["local_vertices"],
+            current_hypothesis["local_vertices"],
             poses[current_index],
         )
         for relation in adjacency[current_index]:
@@ -1997,28 +2247,38 @@ def _propagate_graph_layout(solver_pieces, relations):
                 current_edge = relation["first_edge"]
                 neighbor_index = relation["second_index"]
                 neighbor_edge = relation["second_edge"]
+                neighbor_hypothesis_index = int(
+                    relation.get("target_hypothesis", 0)
+                )
             else:
                 current_edge = relation["second_edge"]
                 neighbor_index = relation["first_index"]
                 neighbor_edge = relation["first_edge"]
-            target_start = current_polygon[current_edge]
-            target_end = current_polygon[(current_edge + 1) % len(current_polygon)]
-            proposed_pose = _align_edge_midpoint_pose(
-                solver_pieces[neighbor_index]["local_vertices"],
+                neighbor_hypothesis_index = int(
+                    relation.get("source_hypothesis", 0)
+                )
+            if hypothesis_by_index.get(neighbor_index) != neighbor_hypothesis_index:
+                return None, float("inf")
+            neighbor_hypothesis = solver_pieces[neighbor_index]["hypotheses"][
+                neighbor_hypothesis_index
+            ]
+            proposed_pose = _edge_alignment_pose(
+                neighbor_hypothesis["local_vertices"],
                 neighbor_edge,
-                target_start,
-                target_end,
+                current_polygon,
+                current_edge,
+                anchor="midpoint",
             )
             if poses[neighbor_index] is None:
                 poses[neighbor_index] = proposed_pose
                 pending.append(neighbor_index)
                 continue
             existing_polygon = _transform_polygon_with_pose(
-                solver_pieces[neighbor_index]["local_vertices"],
+                neighbor_hypothesis["local_vertices"],
                 poses[neighbor_index],
             )
             proposed_polygon = _transform_polygon_with_pose(
-                solver_pieces[neighbor_index]["local_vertices"],
+                neighbor_hypothesis["local_vertices"],
                 proposed_pose,
             )
             closure_error += float(
@@ -2027,16 +2287,38 @@ def _propagate_graph_layout(solver_pieces, relations):
 
     if any(pose is None for pose in poses):
         return None, float("inf")
-    placed_by_index = {
-        index: _transform_polygon_with_pose(
-            solver_pieces[index]["local_vertices"],
+    transformed_by_index = {
+        index: _transform_solver_outline(
+            solver_pieces[index],
+            hypothesis_by_index[index],
             pose,
         )
         for index, pose in enumerate(poses)
     }
-    if not all(np.all(np.isfinite(polygon)) for polygon in placed_by_index.values()):
+    if not all(
+        np.all(np.isfinite(transformed["seam_polygon"]))
+        and np.all(np.isfinite(transformed["outline_polygon"]))
+        for transformed in transformed_by_index.values()
+    ):
         return None, float("inf")
-    return placed_by_index, float(closure_error)
+    return (
+        {
+            "hypothesis_by_index": dict(hypothesis_by_index),
+            "pose_by_index": {
+                index: poses[index]
+                for index in range(piece_count)
+            },
+            "seam_by_index": {
+                index: transformed_by_index[index]["seam_polygon"]
+                for index in range(piece_count)
+            },
+            "outline_by_index": {
+                index: transformed_by_index[index]["outline_polygon"]
+                for index in range(piece_count)
+            },
+        },
+        float(closure_error),
+    )
 
 
 def _solve_unknown_graph_fast_path_steps(
@@ -2104,12 +2386,14 @@ def _solve_unknown_graph_fast_path_steps(
         容错候选只更新外层最优值，不会因枚举顺序提前结束。
         """
         nonlocal best_relaxed, best_relaxed_score, best_relaxed_metrics
-        placed_by_index, closure_error = _propagate_graph_layout(
+        layout_state, closure_error = _propagate_graph_layout(
             solver_pieces,
             relations,
         )
-        if placed_by_index is None:
+        if layout_state is None:
             return None
+        # 接缝候选只负责传播位姿；尺寸、重叠和填充率必须读取同一位姿下的完整轮廓。
+        placed_by_index = layout_state["outline_by_index"]
         diagnostics["graph_layouts_checked"] += 1
         strict_metrics = {}
         canonical_result, rejection_reason = _canonicalize_complete_layout(

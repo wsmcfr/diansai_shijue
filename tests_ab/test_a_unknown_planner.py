@@ -291,6 +291,218 @@ def test_solver_piece_uses_outline_and_ranked_shape_hypotheses():
     )
 
 
+def test_edge_alignment_pose_is_rigid_and_reverses_shared_edge():
+    """候选接缝对齐只能旋转和平移，并使两条共享边反向重合。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    source = np.asarray(((0, 0), (40, 0), (15, 30)), dtype=np.float64)
+    target = np.asarray(((80, 20), (80, 60), (45, 45)), dtype=np.float64)
+
+    pose = assembly_planner._edge_alignment_pose(source, 0, target, 0)
+    transformed = assembly_planner._transform_polygon_with_pose(source, pose)
+    rotation, _translation = pose
+
+    # 源边起点必须落到目标边终点，源边终点必须落到目标边起点。
+    np.testing.assert_allclose(transformed[0], target[1], atol=1e-6)
+    np.testing.assert_allclose(transformed[1], target[0], atol=1e-6)
+    # 正交矩阵且行列式为+1，证明没有缩放或镜像。
+    np.testing.assert_allclose(rotation @ rotation.T, np.eye(2), atol=1e-6)
+    assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-6)
+    np.testing.assert_allclose(
+        _cyclic_edge_lengths(transformed),
+        _cyclic_edge_lengths(source),
+        atol=1e-6,
+    )
+
+
+def test_transform_solver_outline_applies_one_pose_to_seam_and_full_outline():
+    """接缝候选与高保真完整轮廓必须共享完全相同的刚体位姿。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    seam = np.asarray(((-20, -15), (20, -15), (20, 15), (-20, 15)), dtype=np.float64)
+    outline = np.asarray(
+        ((-20, -15), (0, -16), (20, -15), (20, 15), (0, 16), (-20, 15)),
+        dtype=np.float64,
+    )
+    solver_piece = {
+        "outline_local": outline,
+        "hypotheses": [{"rank": 0, "local_vertices": seam}],
+    }
+    angle = math.radians(37.0)
+    pose = (
+        np.asarray(
+            ((math.cos(angle), -math.sin(angle)), (math.sin(angle), math.cos(angle))),
+            dtype=np.float64,
+        ),
+        np.asarray((73.0, 41.0), dtype=np.float64),
+    )
+
+    transformed = assembly_planner._transform_solver_outline(solver_piece, 0, pose)
+
+    np.testing.assert_allclose(
+        transformed["seam_polygon"],
+        assembly_planner._transform_polygon_with_pose(seam, pose),
+    )
+    np.testing.assert_allclose(
+        transformed["outline_polygon"],
+        assembly_planner._transform_polygon_with_pose(outline, pose),
+    )
+
+
+def test_hypothesis_edge_graph_records_rank_score_and_consistent_matching_sets():
+    """边关系必须携带候选身份，连接集合不得让同一碎片混用候选。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    def solver_piece(index, lengths_by_rank):
+        """构造只包含边长和候选分数的最小求解片，隔离测试边图元数据。"""
+        hypotheses = []
+        for rank, lengths in enumerate(lengths_by_rank):
+            vertices = np.asarray(((0, 0), (lengths[0], 0), (0, 30)), dtype=np.float64)
+            hypotheses.append(
+                {
+                    "rank": rank,
+                    "local_vertices": vertices,
+                    "edge_lengths": tuple(float(value) for value in lengths),
+                    "edge_features": [None] * len(lengths),
+                    "score": float(rank) + 0.25,
+                }
+            )
+        return {
+            "index": index,
+            "hypotheses": hypotheses,
+            "outline_local": hypotheses[0]["local_vertices"].copy(),
+        }
+
+    pieces = [
+        solver_piece(0, ((40.0, 50.0, 30.0), (60.0, 50.0, 30.0))),
+        solver_piece(1, ((40.0, 45.0, 35.0),)),
+        solver_piece(2, ((60.0, 45.0, 35.0),)),
+    ]
+    candidates = assembly_planner._build_graph_edge_candidates(pieces, candidate_limit=32)
+
+    assert candidates
+    assert all(
+        {
+            "source_hypothesis",
+            "target_hypothesis",
+            "maximum_rank",
+            "hypothesis_score",
+        }.issubset(relation)
+        for relation in candidates
+    )
+
+    # 两条关系分别要求U1使用候选0和候选1；它们不能组成同一个三片布局。
+    conflicting = (
+        {
+            "relative_error": 0.0,
+            "first_index": 0,
+            "first_edge": 1,
+            "second_index": 1,
+            "second_edge": 0,
+            "source_hypothesis": 0,
+            "target_hypothesis": 0,
+            "maximum_rank": 0,
+            "hypothesis_score": 0.5,
+        },
+        {
+            "relative_error": 0.0,
+            "first_index": 0,
+            "first_edge": 0,
+            "second_index": 2,
+            "second_edge": 0,
+            "source_hypothesis": 1,
+            "target_hypothesis": 0,
+            "maximum_rank": 1,
+            "hypothesis_score": 1.5,
+        },
+    )
+    matching_sets = assembly_planner._collect_graph_matching_sets(3, conflicting)
+    assert matching_sets == tuple()
+
+
+def test_solver_state_pose_key_includes_hypothesis_identity():
+    """相同刚体位姿但候选编号不同的状态不能在硬验收前被去重。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    poses = {
+        0: (np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64)),
+        1: (np.eye(2, dtype=np.float64), np.asarray((40.0, 0.0), dtype=np.float64)),
+    }
+
+    first = assembly_planner._solver_state_pose_key(poses, {0: 0, 1: 0})
+    second = assembly_planner._solver_state_pose_key(poses, {0: 0, 1: 1})
+
+    assert first != second
+
+
+def test_graph_propagation_uses_relation_hypothesis_and_transforms_outline():
+    """GRAPH传播必须采用关系指定候选，同时生成接缝和完整轮廓两套布局。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    def hypothesis(rank, vertices):
+        """由测试顶点构造带完整边长字段的最小形状候选。"""
+        points = np.asarray(vertices, dtype=np.float64)
+        return {
+            "rank": rank,
+            "local_vertices": points,
+            "edge_lengths": tuple(float(value) for value in _cyclic_edge_lengths(points)),
+            "edge_features": [None] * len(points),
+            "score": float(rank),
+        }
+
+    first_outline = np.asarray(
+        ((-30, -20), (0, -21), (30, -20), (30, 20), (0, 21), (-30, 20)),
+        dtype=np.float64,
+    )
+    second_outline = np.asarray(
+        ((-20, -20), (0, -21), (20, -20), (20, 20), (0, 21), (-20, 20)),
+        dtype=np.float64,
+    )
+    solver_pieces = [
+        {
+            "outline_local": first_outline,
+            "hypotheses": [
+                hypothesis(0, ((-25, -20), (25, -20), (25, 20), (-25, 20))),
+                hypothesis(1, ((-30, -20), (30, -20), (30, 20), (-30, 20))),
+            ],
+        },
+        {
+            "outline_local": second_outline,
+            "hypotheses": [
+                hypothesis(0, ((-20, -20), (20, -20), (20, 20), (-20, 20))),
+            ],
+        },
+    ]
+    relation = {
+        "first_index": 0,
+        "first_edge": 1,
+        "second_index": 1,
+        "second_edge": 3,
+        "source_hypothesis": 1,
+        "target_hypothesis": 0,
+        "relative_error": 0.0,
+        "maximum_rank": 1,
+        "hypothesis_score": 1.0,
+    }
+
+    state, closure_error = assembly_planner._propagate_graph_layout(
+        solver_pieces,
+        (relation,),
+    )
+
+    assert closure_error == pytest.approx(0.0)
+    assert state["hypothesis_by_index"] == {0: 1, 1: 0}
+    assert set(state["pose_by_index"]) == {0, 1}
+    assert len(state["seam_by_index"][0]) == 4
+    assert len(state["outline_by_index"][0]) == len(first_outline)
+    assert len(state["outline_by_index"][1]) == len(second_outline)
+    # 关系指定的两条竖边在目标坐标中必须反向重合。
+    first_seam = state["seam_by_index"][0]
+    second_seam = state["seam_by_index"][1]
+    np.testing.assert_allclose(first_seam[1], second_seam[0], atol=1e-6)
+    np.testing.assert_allclose(first_seam[2], second_seam[3], atol=1e-6)
+
+
 def test_white_solver_cleanup_macro_and_device_short_edges():
     """默认12mm宏必须清除实机U2/U3伪短边，且不修改输入数组。"""
     from maixcam2_app_A_quad import assembly_planner
