@@ -146,6 +146,14 @@ MODE_KNOWN = "known"
 MODE_UNKNOWN = "unknown"
 # FOUR只用于设备内部路径隔离；发送UART结果时仍映射为协议既有的UNKNOWN模式。
 MODE_FOUR = "four"
+# FOUR第三功能按钮循环的纸面预览；camera显示实景，其余三项直接显示分割阶段掩膜。
+FOUR_DEBUG_VIEWS = ("camera", "strict", "support", "final")
+FOUR_DEBUG_VIEW_LABELS = {
+    "camera": "CAM",
+    "strict": "CORE",
+    "support": "SUPPORT",
+    "final": "FINAL",
+}
 
 
 def log_auto_roi_diagnostics(location, debug_enabled=None):
@@ -195,6 +203,19 @@ def toggle_unknown_profile(current_profile):
     if normalized_profile == UNKNOWN_PROFILE_CARD:
         return UNKNOWN_PROFILE_WHITE
     raise ValueError("UNKNOWN子模式必须是white或card")
+
+
+def toggle_four_debug_view(current_view):
+    """循环切换FOUR相机、严格核心、宽松支撑和最终掩膜预览。
+
+    关键参数current_view大小写不敏感但必须属于FOUR_DEBUG_VIEWS；返回下一个规范小写
+    视图。切换只影响显示，不重置锁定快照、求解任务或UART结果。
+    """
+    normalized = str(current_view).strip().lower()
+    if normalized not in FOUR_DEBUG_VIEWS:
+        raise ValueError("FOUR调试视图必须是camera、strict、support或final")
+    index = FOUR_DEBUG_VIEWS.index(normalized)
+    return FOUR_DEBUG_VIEWS[(index + 1) % len(FOUR_DEBUG_VIEWS)]
 
 
 def _validate_capture_runtime(planner_runtime):
@@ -856,6 +877,33 @@ def select_planning_status(
     return f"{locked_prefix}PLAN {assembly_plan.reason.upper()}"
 
 
+def select_four_runtime_status(current_status, four_runtime, preserve_current=False):
+    """按FOUR检测、稳定、求解和终态优先级生成正常页状态文字。
+
+    失败计划优先且永久保留；求解显示锁定和候选数；检测阶段显示真实连通域数量、
+    稳定帧以及是否执行受限拆分。关键参数four_runtime提供组合运行器公开属性。
+    """
+    if preserve_current:
+        return str(current_status)
+    plan = getattr(four_runtime, "plan", None)
+    if plan is not None:
+        if bool(getattr(plan, "success", False)):
+            return f"LOCKED FOUR PLAN OK N={len(getattr(plan, 'placements', ())) }"
+        return f"LOCKED FOUR {str(getattr(plan, 'reason', 'fail')).upper()}"
+    if bool(getattr(four_runtime, "is_solving", False)):
+        return f"LOCKED FOUR SOLVING N={int(getattr(four_runtime, 'search_nodes', 0))}"
+    detection = getattr(four_runtime, "last_detection", None)
+    if detection is None:
+        return str(current_status)
+    stable_count = int(getattr(four_runtime, "stable_count", 0))
+    stable_frames = int(getattr(four_runtime, "stable_frames", 3))
+    split_suffix = " SPLIT" if bool(getattr(detection, "split_applied", False)) else ""
+    if stable_count > 0:
+        return f"FOUR STABLE {stable_count}/{stable_frames}{split_suffix}"
+    count = int(getattr(detection, "valid_contour_count", 0))
+    return f"FOUR COUNT {count}/4{split_suffix}"
+
+
 class InterfaceState:
     """维护正常/调参界面切换和当前未保存调参会话。
 
@@ -1129,6 +1177,8 @@ def draw_overlay(
     unknown_profile=UNKNOWN_PROFILE_WHITE,
     paper_orientation="portrait",
     capture_armed=False,
+    four_debug_view="camera",
+    four_debug_mask=None,
 ):
     """把相机几何映射后绘制到固定显示画布。
 
@@ -1136,7 +1186,7 @@ def draw_overlay(
     内容，并用同一显示Homography转换ROI、纸张、有效区和碎片几何。按钮始终位于显示
     坐标。关键参数pieces保持采集坐标，unknown_profile控制第三按钮文字，
     capture_armed控制START绿色活动态。返回新的BGR画布，原始帧、碎片字典和机械毫米
-    数据均不修改。
+    数据均不修改。four_debug_mask为可选完整A4二维掩膜，只覆盖纸面内容区。
     """
     if frame_bgr is None or not isinstance(frame_bgr, np.ndarray):
         raise ValueError("frame_bgr必须是有效图像")
@@ -1169,12 +1219,32 @@ def draw_overlay(
             None if active_quad is None else map_display_points(active_quad)
         )
     else:
-        output, display_transform, _content_roi = build_paper_display_canvas(
+        output, display_transform, content_roi = build_paper_display_canvas(
             frame_bgr,
             paper_quad,
             paper_orientation=paper_orientation,
             canvas_size=(target_width, target_height),
         )
+        normalized_four_view = str(four_debug_view).strip().lower()
+        if normalized_four_view not in FOUR_DEBUG_VIEWS:
+            raise ValueError("FOUR调试视图无效")
+        if four_debug_mask is not None:
+            if (
+                not isinstance(four_debug_mask, np.ndarray)
+                or four_debug_mask.ndim != 2
+                or four_debug_mask.dtype != np.uint8
+            ):
+                raise ValueError("four_debug_mask必须是二维uint8掩膜")
+            content_x, content_y, content_width, content_height = content_roi
+            resized_mask = cv2.resize(
+                four_debug_mask,
+                (content_width, content_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            output[
+                content_y : content_y + content_height,
+                content_x : content_x + content_width,
+            ] = cv2.cvtColor(resized_mask, cv2.COLOR_GRAY2BGR)
 
         def map_display_points(points):
             """纸面专用分支通过统一Homography转换相机点。"""
@@ -1289,11 +1359,16 @@ def draw_overlay(
         y2 = int(round(button.y + button.height))
         # 模式按钮表示当前选择；START单独表示本轮是否已经由用户确认开始。
         active = name == mode or (name == "start" and bool(capture_armed))
-        enabled = name != "save" or mode in (MODE_KNOWN, MODE_UNKNOWN)
+        enabled = name != "save" or mode in (MODE_KNOWN, MODE_UNKNOWN, MODE_FOUR)
         button_label = name.upper()
         if name == "save":
             if mode == MODE_KNOWN:
                 button_label = "SAVE"
+            elif mode == MODE_FOUR:
+                normalized_four_view = str(four_debug_view).strip().lower()
+                if normalized_four_view not in FOUR_DEBUG_VIEW_LABELS:
+                    raise ValueError("FOUR调试视图无效")
+                button_label = FOUR_DEBUG_VIEW_LABELS[normalized_four_view]
             else:
                 normalized_profile = str(unknown_profile).lower()
                 if normalized_profile not in (
@@ -1310,12 +1385,23 @@ def draw_overlay(
             fill_color = (25, 25, 25)
         cv2.rectangle(output, (x1, y1), (x2, y2), fill_color, -1)
         cv2.rectangle(output, (x1, y1), (x2, y2), (220, 220, 220), 1)
+        # 六按钮布局中SUPPORT等长标签按按钮实际宽度缩小，避免覆盖相邻触摸控件。
+        button_scale = scale
+        text_width = cv2.getTextSize(
+            button_label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            button_scale,
+            text_thickness,
+        )[0][0]
+        available_text_width = max(1, int(button.width) - 12)
+        if text_width > available_text_width:
+            button_scale = max(0.32, button_scale * available_text_width / text_width)
         cv2.putText(
             output,
             button_label,
             (x1 + 7, y1 + int(button.height * 0.68)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            scale,
+            button_scale,
             (255, 255, 255) if enabled else (100, 100, 100),
             text_thickness,
             cv2.LINE_AA,
@@ -1417,6 +1503,8 @@ def run_app():
     mode = MODE_UNKNOWN
     # 现场白色覆膜可能因反光产生伪纹理，因此启动默认明确选择几何首解即停的WHITE。
     unknown_profile = UNKNOWN_PROFILE_WHITE
+    # FOUR默认显示相机实景；第三功能按钮只切换调试预览，不改变检测和求解数据。
+    four_debug_view = "camera"
     # 正常页默认完全待机；只有START能把该状态改为True并开启视觉、稳定门与求解器。
     capture_armed = False
     status_message = "PRESS START"
@@ -1636,6 +1724,11 @@ def run_app():
                 )
                 preserve_planning_status = True
                 capture_reset_requested = True
+            elif action == "save" and mode == MODE_FOUR:
+                # FOUR第三功能按钮只切换纸面诊断视图，不能清快照或重复启动求解器。
+                four_debug_view = toggle_four_debug_view(four_debug_view)
+                status_message = f"FOUR VIEW {FOUR_DEBUG_VIEW_LABELS[four_debug_view]}"
+                preserve_planning_status = True
             elif action == "start":
                 # START是正常页唯一的分析入口；重复点击会清空旧快照并从下一帧重拍。
                 capture_armed, status_message = start_capture(
@@ -1692,15 +1785,10 @@ def run_app():
             if capture_armed and not capture_reset_requested:
                 if mode == MODE_FOUR:
                     assembly_plan = four_runtime.plan
-                    status_message = select_planning_status(
+                    status_message = select_four_runtime_status(
                         status_message,
-                        assembly_plan,
-                        four_runtime.stable_count,
-                        four_runtime.stable_frames,
+                        four_runtime,
                         preserve_current=preserve_planning_status,
-                        solving=four_runtime.is_solving,
-                        search_nodes=four_runtime.search_nodes,
-                        snapshot_locked=four_runtime.snapshot_locked,
                     )
                 elif mode == MODE_KNOWN:
                     templates, template_error = match_known_pieces_safely(
@@ -1772,6 +1860,16 @@ def run_app():
             if resolution_fallback and "RES LOW" not in display_status:
                 display_status = f"{display_status} RES LOW".strip()
             display_status = append_uart_status(display_status, serial_runtime.link_text)
+            four_debug_mask = None
+            if (
+                mode == MODE_FOUR
+                and four_detection is not None
+                and four_debug_view != "camera"
+            ):
+                four_debug_mask = getattr(
+                    four_detection.masks,
+                    four_debug_view,
+                )
             display_frame = draw_overlay(
                 frame_bgr,
                 display_pieces,
@@ -1789,6 +1887,8 @@ def run_app():
                 unknown_profile=unknown_profile,
                 paper_orientation=runtime_settings["paper_orientation"],
                 capture_armed=capture_armed,
+                four_debug_view=four_debug_view,
+                four_debug_mask=four_debug_mask,
             )
         display_image = image.cv2image(display_frame, bgr=True, copy=False)
         disp.show(display_image, fit=image.Fit.FIT_CONTAIN)

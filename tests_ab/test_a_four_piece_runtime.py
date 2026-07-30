@@ -235,3 +235,38 @@ def test_combined_four_runtime_failure_does_not_restart_detection_or_solver():
     runtime.reset()
     assert runtime.plan is None
     assert vision_runtime.reset_count == 1
+
+
+def test_four_runtime_debug_switch_controls_snapshot_and_result_logs(capsys):
+    """调试开启时输出一次锁定与结果，关闭时不得构造可见日志。"""
+    from maixcam2_app_A_quad.four_piece_solver import FourPieceRuntime
+    from tests_ab.test_a_four_piece_solver import _four_grid_pieces
+
+    common = (
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        np.float32(((0, 0), (19, 0), (19, 19), (0, 19))),
+        "portrait",
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+    )
+    enabled = FourPieceRuntime(
+        vision_runtime=_LockedVisionRuntime(_four_grid_pieces()),
+        debug_enabled=True,
+    )
+    enabled.update(*common)
+    while enabled.plan is None:
+        enabled.update(*common, time_budget_ms=1000.0, work_unit_limit=128)
+    enabled_output = capsys.readouterr().out
+
+    disabled = FourPieceRuntime(
+        vision_runtime=_LockedVisionRuntime(_four_grid_pieces()),
+        debug_enabled=False,
+    )
+    disabled.update(*common)
+    while disabled.plan is None:
+        disabled.update(*common, time_budget_ms=1000.0, work_unit_limit=128)
+    disabled_output = capsys.readouterr().out
+
+    assert "[FOUR] SNAPSHOT count=4" in enabled_output
+    assert "[FOUR] RESULT success=1 reason=ok" in enabled_output
+    assert disabled_output == ""

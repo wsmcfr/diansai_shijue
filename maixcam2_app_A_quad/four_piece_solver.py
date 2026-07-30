@@ -43,6 +43,8 @@ FOUR_INTERMEDIATE_MAX_OVERLAP_RATIO = 0.06
 FOUR_ACTIVE_BUDGET_SECONDS = 3.0
 # 中间几何重叠使用较低像素密度，仅消除共享边栅格误差，不参与最终填充计算。
 FOUR_OVERLAP_PIXELS_PER_MM = 2.0
+# True时向电脑控制台输出一次锁定快照和最终结果；关闭后不构造明细字符串。
+FOUR_SOLVER_DEBUG = True
 # ===============================================================================
 
 
@@ -1062,6 +1064,7 @@ class FourPieceRuntime:
         active_budget_seconds=FOUR_ACTIVE_BUDGET_SECONDS,
         solver_time_budget_ms=24.0,
         solver_work_unit_limit=64,
+        debug_enabled=FOUR_SOLVER_DEBUG,
     ):
         """初始化独立视觉运行器和求解时间片参数并进入完全待机。
 
@@ -1079,6 +1082,7 @@ class FourPieceRuntime:
         self.active_budget_seconds = float(active_budget_seconds)
         self.solver_time_budget_ms = float(solver_time_budget_ms)
         self.solver_work_unit_limit = int(solver_work_unit_limit)
+        self.debug_enabled = bool(debug_enabled)
         if self.beam_width < 1:
             raise ValueError("beam_width必须至少为1")
         if self.active_budget_seconds <= 0.0:
@@ -1098,6 +1102,38 @@ class FourPieceRuntime:
         self.solve_job = None
         self.plan = None
         self.solve_start_count = 0
+        self._result_logged = False
+
+    def _debug_snapshot(self):
+        """调试开启时输出一次冻结四片的编号、重心和形状顶点数。"""
+        if not self.debug_enabled:
+            return
+        print(f"[FOUR] SNAPSHOT count={len(self.locked_pieces)}")
+        for piece in self.locked_pieces:
+            center = np.asarray(piece.get("center_mm", (0.0, 0.0)), dtype=np.float64)
+            vertices = piece.get("vertices_mm", ())
+            print(
+                "[FOUR] PIECE "
+                f"id={piece.get('id', '?')} "
+                f"center_mm=({center[0]:.1f},{center[1]:.1f}) "
+                f"vertices={len(vertices)}"
+            )
+
+    def _cache_result(self, result):
+        """缓存成功或失败计划，并在调试开启时只输出一次最终诊断。"""
+        self.plan = result
+        if self._result_logged or not self.debug_enabled or result is None:
+            return
+        diagnostics = getattr(result, "diagnostics", {})
+        print(
+            "[FOUR] RESULT "
+            f"success={1 if bool(getattr(result, 'success', False)) else 0} "
+            f"reason={getattr(result, 'reason', 'unknown')} "
+            f"nodes={int(getattr(result, 'search_nodes', 0))} "
+            f"fill={int(diagnostics.get('fill_milli', 0)) / 10.0:.1f}% "
+            f"overlap={int(diagnostics.get('overlap_milli', 0)) / 10.0:.1f}%"
+        )
+        self._result_logged = True
 
     @property
     def stable_count(self):
@@ -1179,7 +1215,7 @@ class FourPieceRuntime:
                 ),
             )
             if result is not None:
-                self.plan = result
+                self._cache_result(result)
             return self.plan
 
         detection = self.vision_runtime.update(
@@ -1198,6 +1234,7 @@ class FourPieceRuntime:
             active_budget_seconds=self.active_budget_seconds,
         )
         self.solve_start_count += 1
+        self._debug_snapshot()
         if self.solve_job.done:
-            self.plan = self.solve_job.result
+            self._cache_result(self.solve_job.result)
         return self.plan

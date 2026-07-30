@@ -429,6 +429,19 @@ def test_unknown_profile_toggle_cycles_white_and_card():
     assert toggle_unknown_profile(UNKNOWN_PROFILE_CARD) == UNKNOWN_PROFILE_WHITE
 
 
+def test_four_debug_view_cycles_camera_core_support_and_final():
+    """FOUR第三功能按钮必须循环四种可现场判断阈值的预览。"""
+    from maixcam2_app_A_quad.main import toggle_four_debug_view
+
+    view = "camera"
+    observed = []
+    for _ in range(4):
+        view = toggle_four_debug_view(view)
+        observed.append(view)
+
+    assert observed == ["strict", "support", "final", "camera"]
+
+
 def test_select_capture_mode_resets_even_when_current_mode_is_clicked_again():
     """重复选择当前模式也必须释放旧快照，并保持完全待机等待START。"""
     from maixcam2_app_A_quad.main import (
@@ -609,6 +622,86 @@ def test_runtime_overlay_uses_white_card_button_in_unknown_and_save_in_known(
     )
     assert "SAVE" in rendered_labels
     assert "CARD" not in rendered_labels
+
+
+def test_four_overlay_labels_mask_button_and_renders_selected_paper_mask(monkeypatch):
+    """FOUR调试视图必须显示当前掩膜名，并把掩膜限制在A4内容区域。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.touch_ui import build_button_layout
+
+    rendered_labels = []
+    original_put_text = main.cv2.putText
+
+    def record_put_text(image, text, *args, **kwargs):
+        """记录按钮文字并保留真实OpenCV绘制。"""
+        rendered_labels.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(main.cv2, "putText", record_put_text)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    paper_quad = np.float32(((110, 20), (530, 20), (530, 460), (110, 460)))
+    debug_mask = np.full((891, 630), 255, dtype=np.uint8)
+
+    output = main.draw_overlay(
+        frame,
+        [],
+        (0, 0, 640, 480),
+        build_button_layout(640, 480),
+        main.MODE_FOUR,
+        0.0,
+        "FOUR COUNT 0/4",
+        paper_quad=paper_quad,
+        active_quad=paper_quad,
+        work_region_mm=(0.0, 0.0, 210.0, 297.0),
+        split_y_mm=148.5,
+        display_size=(640, 480),
+        paper_orientation="portrait",
+        four_debug_view="strict",
+        four_debug_mask=debug_mask,
+    )
+
+    assert "CORE" in rendered_labels
+    assert np.all(output[120, 320] >= 240)
+    assert np.all(output[220, 20] == 0)
+
+
+def test_four_status_reports_count_stability_solving_and_cached_failure():
+    """FOUR正常页必须显示当前真正阶段，失败结果不能被下一帧覆盖。"""
+    from types import SimpleNamespace
+
+    from maixcam2_app_A_quad.main import select_four_runtime_status
+
+    count_runtime = SimpleNamespace(
+        plan=None,
+        is_solving=False,
+        snapshot_locked=False,
+        stable_count=0,
+        stable_frames=3,
+        search_nodes=0,
+        last_detection=SimpleNamespace(valid_contour_count=3, split_applied=False),
+    )
+    stable_runtime = SimpleNamespace(
+        **{
+            **count_runtime.__dict__,
+            "stable_count": 2,
+            "last_detection": SimpleNamespace(valid_contour_count=4, split_applied=True),
+        }
+    )
+    solving_runtime = SimpleNamespace(
+        **{
+            **stable_runtime.__dict__,
+            "is_solving": True,
+            "snapshot_locked": True,
+            "search_nodes": 37,
+        }
+    )
+    failed_plan = SimpleNamespace(success=False, placements=[], reason="no_rect")
+    failed_runtime = SimpleNamespace(**{**solving_runtime.__dict__, "is_solving": False, "plan": failed_plan})
+
+    assert select_four_runtime_status("FOUR CAPTURE", count_runtime) == "FOUR COUNT 3/4"
+    assert select_four_runtime_status("FOUR CAPTURE", stable_runtime) == "FOUR STABLE 2/3 SPLIT"
+    assert select_four_runtime_status("FOUR CAPTURE", solving_runtime) == "LOCKED FOUR SOLVING N=37"
+    assert select_four_runtime_status("IGNORED", failed_runtime) == "LOCKED FOUR NO_RECT"
 
 
 def test_run_app_wires_unknown_profile_to_runtime_overlay_and_toggle():
