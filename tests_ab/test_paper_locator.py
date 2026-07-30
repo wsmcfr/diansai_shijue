@@ -84,13 +84,16 @@ def test_order_a4_quad_rejects_duplicate_points():
 
 @pytest.mark.parametrize("module_name", LOCATOR_MODULES)
 def test_active_quad_crops_long_edges_and_applies_inset_mm(module_name):
-    """验证完整A4上下各裁33.5mm后再对四边整体内缩2mm。"""
+    """验证A版从完整A4内缩，B版继续从230mm裁剪区内缩。"""
     module = importlib.import_module(module_name)
     paper_quad = np.float32([[100, 20], [310, 20], [310, 317], [100, 317]])
 
     active_quad = module.build_active_quad(paper_quad, inset_mm=2.0)
 
-    expected = np.float32([[102, 55.5], [308, 55.5], [308, 281.5], [102, 281.5]])
+    if module_name == "maixcam2_app_A_quad.paper_locator":
+        expected = np.float32([[102, 22], [308, 22], [308, 315], [102, 315]])
+    else:
+        expected = np.float32([[102, 55.5], [308, 55.5], [308, 281.5], [102, 281.5]])
     np.testing.assert_allclose(active_quad, expected, atol=1.0)
 
 
@@ -156,7 +159,7 @@ def test_a_locator_detects_strongly_skewed_landscape_paper():
     assert result.success is True
     assert result.paper_orientation == module.PAPER_ORIENTATION_LANDSCAPE
     assert module.default_work_region_mm(result.paper_orientation) == pytest.approx(
-        (33.5, 0.0, 230.0, 210.0)
+        (0.0, 0.0, 297.0, 210.0)
     )
     assert module.default_split_y_mm(result.paper_orientation) == pytest.approx(105.0)
 
@@ -179,8 +182,8 @@ def test_a_landscape_homography_round_trip_uses_297_by_210_mm():
     assert recovered == pytest.approx((231.5, 84.25), abs=0.02)
 
 
-def test_a_landscape_default_active_quad_trims_left_and_right():
-    """横放默认机械区应左右各裁33.5mm，并完整保留210mm纸面高度。"""
+def test_a_landscape_default_active_quad_uses_full_paper():
+    """A版横放默认黄色区应等于完整297×210mm蓝框。"""
     module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
     paper_quad = np.float32([[0, 0], [594, 0], [594, 420], [0, 420]])
 
@@ -190,11 +193,11 @@ def test_a_landscape_default_active_quad_trims_left_and_right():
         paper_orientation=module.PAPER_ORIENTATION_LANDSCAPE,
     )
 
-    expected = np.float32([[67, 0], [527, 0], [527, 420], [67, 420]])
+    expected = paper_quad
     np.testing.assert_allclose(active_quad, expected, atol=0.05)
     assert module.default_work_region_mm(
         module.PAPER_ORIENTATION_LANDSCAPE
-    ) == pytest.approx((33.5, 0.0, 230.0, 210.0))
+    ) == pytest.approx((0.0, 0.0, 297.0, 210.0))
     assert module.default_split_y_mm(
         module.PAPER_ORIENTATION_LANDSCAPE
     ) == pytest.approx(105.0)

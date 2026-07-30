@@ -14,11 +14,12 @@ VARIANT_RELEASES = (
     (
         "maixcam2_app_A_quad",
         "diansai_quad",
-        "1.9.2",
-        "diansai_quad-v1.9.2.zip",
+        "2.0.0",
+        "diansai_quad-v2.0.0.zip",
         {
             "__init__.py",
             "A版实机调试手册.md",
+            "MaixCAM2与STM32F4串口协议说明.md",
             "app.yaml",
             "assembly_planner.py",
             "calibration_ui.py",
@@ -26,6 +27,7 @@ VARIANT_RELEASES = (
             "main.py",
             "paper_locator.py",
             "puzzle_vision.py",
+            "serial_protocol.py",
             "settings_store.py",
             "template_store.py",
             "touch_ui.py",

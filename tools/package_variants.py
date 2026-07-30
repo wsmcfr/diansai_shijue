@@ -9,10 +9,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 每个发布规格同时固定目录、ZIP名和运行模块，防止缓存或设备JSON被意外打包。
 RELEASE_SPECS = {
     "maixcam2_app_A_quad": {
-        "archive": "diansai_quad-v1.9.2.zip",
+        "archive": "diansai_quad-v2.0.0.zip",
         "files": (
             "__init__.py",
             "A版实机调试手册.md",
+            "MaixCAM2与STM32F4串口协议说明.md",
             "app.yaml",
             "assembly_planner.py",
             "calibration_ui.py",
@@ -20,6 +21,7 @@ RELEASE_SPECS = {
             "main.py",
             "paper_locator.py",
             "puzzle_vision.py",
+            "serial_protocol.py",
             "settings_store.py",
             "template_store.py",
             "touch_ui.py",
