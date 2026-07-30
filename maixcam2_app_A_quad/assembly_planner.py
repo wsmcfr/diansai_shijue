@@ -120,7 +120,9 @@ class AssemblyPlan:
     ):
         """初始化结构化规划结果，失败结果默认不携带任何机械目标。
 
-        diagnostics保存搜索阶段的拒绝次数，只用于屏幕和测试诊断，不参与电机控制。
+        diagnostics保存搜索阶段的计数和最终候选编号，只用于屏幕和测试诊断，不参与
+        电机控制。普通值统一转为整数；候选编号序列保留为整数元组，便于成功日志逐片
+        输出而不额外保存求解器内部对象。
         """
         self.success = bool(success)
         self.placements = list(placements or [])
@@ -132,9 +134,12 @@ class AssemblyPlan:
         self.score = float(score)
         self.reason = str(reason)
         self.search_nodes = int(search_nodes)
-        self.diagnostics = {
-            str(name): int(count) for name, count in (diagnostics or {}).items()
-        }
+        self.diagnostics = {}
+        for name, count in (diagnostics or {}).items():
+            if isinstance(count, (tuple, list)):
+                self.diagnostics[str(name)] = tuple(int(value) for value in count)
+            else:
+                self.diagnostics[str(name)] = int(count)
 
     @classmethod
     def failed(cls, reason, search_nodes=0, diagnostics=None):
@@ -1012,27 +1017,62 @@ def _align_source_edge_candidates(
     结果分别覆盖长边左端和右端，允许一条长边由多条短边共同组成接缝。
     返回值：一至两个保持源多边形形状不变的N×2候选数组。
     """
-    source_start = source_vertices[source_edge]
-    source_end = source_vertices[(source_edge + 1) % len(source_vertices)]
-    target_start = target_vertices[target_edge]
-    target_end = target_vertices[(target_edge + 1) % len(target_vertices)]
-    source_vector = source_end - source_start
-    target_reverse_vector = target_start - target_end
-    source_angle = math.atan2(source_vector[1], source_vector[0])
-    target_angle = math.atan2(target_reverse_vector[1], target_reverse_vector[0])
-    angle = target_angle - source_angle
-    rotation = np.asarray(
-        [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]],
-        dtype=np.float64,
+    poses = _edge_alignment_pose_candidates(
+        source_vertices,
+        source_edge,
+        target_vertices,
+        target_edge,
     )
-    rotated_polygon = source_vertices @ rotation.T
-    rotated_start = rotated_polygon[source_edge]
-    rotated_end = rotated_polygon[(source_edge + 1) % len(source_vertices)]
-    candidates = [rotated_polygon + (target_end - rotated_start)]
-    anchored_at_start = rotated_polygon + (target_start - rotated_end)
-    if not np.allclose(candidates[0], anchored_at_start, atol=1e-6):
-        candidates.append(anchored_at_start)
-    return candidates
+    return [
+        _transform_polygon_with_pose(source_vertices, pose)
+        for pose in poses
+    ]
+
+
+def _edge_alignment_pose_candidates(
+    source_vertices,
+    source_edge,
+    target_vertices,
+    target_edge,
+):
+    """返回源边贴合目标边两端时的一至两个刚体位姿。
+
+    主要流程：分别计算“源起点对目标终点”和“源终点对目标起点”两种无缩放位姿；
+    等长边或数值等价时，两种位姿会得到同一接缝多边形并被去重。返回位姿而不是仅
+    返回简化多边形，使调用方能把同一旋转和平移同步应用到高保真完整轮廓。
+
+    参数为两套候选顶点和各自边号；返回`(旋转矩阵, 平移向量)`组成的列表。
+    """
+    source = np.asarray(source_vertices, dtype=np.float64)
+    target = np.asarray(target_vertices, dtype=np.float64)
+    poses = [
+        _edge_alignment_pose(
+            source,
+            source_edge,
+            target,
+            target_edge,
+            anchor="source_start",
+        ),
+        _edge_alignment_pose(
+            source,
+            source_edge,
+            target,
+            target_edge,
+            anchor="source_end",
+        ),
+    ]
+    unique_poses = []
+    transformed_candidates = []
+    for pose in poses:
+        transformed = _transform_polygon_with_pose(source, pose)
+        if any(
+            np.allclose(transformed, previous, atol=1e-6)
+            for previous in transformed_candidates
+        ):
+            continue
+        unique_poses.append(pose)
+        transformed_candidates.append(transformed)
+    return unique_poses
 
 
 def _segmented_seam_is_possible(
@@ -1907,7 +1947,7 @@ def _build_unknown_success_plan(
     for index, solver_piece in enumerate(solver_pieces):
         target_polygon = canonical_by_index[index] + target_origin
         rotation_delta, _ = _best_rotation_delta_deg(
-            solver_piece["source_vertices"],
+            solver_piece["outline_source"],
             target_polygon,
         )
         placements.append(
@@ -2348,6 +2388,8 @@ def _solve_unknown_graph_fast_path_steps(
         "graph_relaxed_candidates": 0,
         "graph_relaxed_fill_reject": 0,
         "graph_outer_edge_reject": 0,
+        "maximum_hypothesis_rank": -1,
+        "selected_hypotheses": tuple(),
     }
     progress = progress if isinstance(progress, dict) else {}
     pieces = list(pieces)
@@ -2377,7 +2419,9 @@ def _solve_unknown_graph_fast_path_steps(
     diagnostics["graph_matching_sets"] = int(len(matching_sets))
     best_relaxed = None
     best_relaxed_score = float("inf")
+    best_relaxed_priority = None
     best_relaxed_metrics = {}
+    best_relaxed_hypotheses = tuple()
 
     def evaluate_relations(relations):
         """验收一组连接关系，并在得到严格解时返回规划。
@@ -2385,7 +2429,8 @@ def _solve_unknown_graph_fast_path_steps(
         该辅助函数把一次最昂贵的传播、栅格验收和计划构造收拢成一个工作单元；
         容错候选只更新外层最优值，不会因枚举顺序提前结束。
         """
-        nonlocal best_relaxed, best_relaxed_score, best_relaxed_metrics
+        nonlocal best_relaxed, best_relaxed_score, best_relaxed_priority
+        nonlocal best_relaxed_metrics, best_relaxed_hypotheses
         layout_state, closure_error = _propagate_graph_layout(
             solver_pieces,
             relations,
@@ -2431,13 +2476,34 @@ def _solve_unknown_graph_fast_path_steps(
         )
         geometry_score = float(canonical_result[3])
         score = geometry_score + relation_error * 10.0 + closure_error * 0.1
+        selected_hypotheses = tuple(
+            int(layout_state["hypothesis_by_index"][index])
+            for index in range(len(solver_pieces))
+        )
+        maximum_hypothesis_rank = max(selected_hypotheses, default=0)
+        hypothesis_score = sum(
+            float(
+                solver_pieces[index]["hypotheses"][hypothesis_index].get(
+                    "score",
+                    0.0,
+                )
+            )
+            for index, hypothesis_index in enumerate(selected_hypotheses)
+        )
         if accepted_relaxed:
             # 不能在首个86%候选处结束，否则候选枚举顺序会影响目标。记录最多90组中
             # 的最低分容错候选，循环结束且始终没有严格解时才允许返回它。
-            if score < best_relaxed_score:
+            relaxed_priority = (
+                int(maximum_hypothesis_rank),
+                float(hypothesis_score),
+                float(score),
+            )
+            if best_relaxed_priority is None or relaxed_priority < best_relaxed_priority:
+                best_relaxed_priority = relaxed_priority
                 best_relaxed_score = float(score)
                 best_relaxed = canonical_result
                 best_relaxed_metrics = dict(candidate_metrics)
+                best_relaxed_hypotheses = selected_hypotheses
             return None
 
         success_diagnostics = dict(diagnostics)
@@ -2453,6 +2519,10 @@ def _solve_unknown_graph_fast_path_steps(
         success_diagnostics["outer_piece_count"] = int(
             candidate_metrics.get("outer_piece_count", 0)
         )
+        success_diagnostics["maximum_hypothesis_rank"] = int(
+            maximum_hypothesis_rank
+        )
+        success_diagnostics["selected_hypotheses"] = selected_hypotheses
         # 图快路径在第一个硬验收合格布局处返回；以0节点记录首解，兼容WHITE既有诊断。
         success_diagnostics["first_solution_node"] = 0
         plan = _build_unknown_success_plan(
@@ -2497,6 +2567,11 @@ def _solve_unknown_graph_fast_path_steps(
         success_diagnostics["outer_piece_count"] = int(
             best_relaxed_metrics.get("outer_piece_count", 0)
         )
+        success_diagnostics["maximum_hypothesis_rank"] = max(
+            best_relaxed_hypotheses,
+            default=0,
+        )
+        success_diagnostics["selected_hypotheses"] = best_relaxed_hypotheses
         success_diagnostics["first_solution_node"] = 0
         plan = _build_unknown_success_plan(
             solver_pieces,
@@ -2600,6 +2675,8 @@ def _solve_unknown_four_fast_path_steps(
         "four_active_limit_reached": 0,
         "four_active_elapsed_ms": 0,
         "four_used_segmented": 0,
+        "maximum_hypothesis_rank": -1,
+        "selected_hypotheses": tuple(),
         "fast_convex_checks": 0,
         "fast_raster_fallbacks": 0,
     }
@@ -2633,7 +2710,7 @@ def _solve_unknown_four_fast_path_steps(
             abs(
                 float(
                     cv2.contourArea(
-                        solver_piece["local_vertices"].astype(np.float32)
+                        solver_piece["outline_local"].astype(np.float32)
                     )
                 )
             )
@@ -2646,26 +2723,19 @@ def _solve_unknown_four_fast_path_steps(
     except (KeyError, TypeError, ValueError):
         return None, diagnostics
 
-    def pose_key(placed_by_index):
-        """把完整状态量化为稳定键，合并由不同接缝关系得到的同一刚体布局。"""
-        return tuple(
-            (
-                int(index),
-                tuple(
-                    int(value)
-                    for value in np.rint(
-                        np.asarray(placed_by_index[index], dtype=np.float64).flatten()
-                        * 100.0
-                    )
-                ),
-            )
-            for index in sorted(placed_by_index)
-        )
-
-    def build_priority(partial_priority, segmented_count, full_error, matched_length):
-        """构造分层全局排序键，优先紧凑布局并轻度偏向可靠整边和长接缝。"""
+    def build_priority(
+        maximum_rank,
+        hypothesis_score,
+        partial_priority,
+        segmented_count,
+        full_error,
+        matched_length,
+    ):
+        """构造分层排序键，候选等级优先于紧凑度和接缝几何分。"""
         _hint_error, gap_ratio, rectangle_area = partial_priority
         return (
+            int(maximum_rank),
+            float(hypothesis_score),
             float(gap_ratio) + float(segmented_count) * 0.015,
             float(full_error),
             -float(matched_length),
@@ -2691,20 +2761,112 @@ def _solve_unknown_four_fast_path_steps(
         diagnostics["four_active_limit_reached"] = 1
         return True
 
+    def diverse_state_order(candidate_states, limit):
+        """按候选组合分组轮询，避免有限Beam只保留同一混合候选。
+
+        每个分组由“已放置碎片及其候选编号”唯一标识；组内仍按候选等级、候选分数
+        和原几何优先级排序。轮询时每组先取一个状态，再进入下一轮，因此四片全为
+        候选1的必要路径不会被大量“根片候选0+其余候选1”的近似位姿全部挤出。
+        返回至多`limit`个状态，工作单元计数仍由实际展开过程统一累计。
+        """
+        maximum = max(0, int(limit))
+        grouped = {}
+        for candidate_state in candidate_states:
+            signature = tuple(
+                (int(index), int(hypothesis_index))
+                for index, hypothesis_index in sorted(
+                    candidate_state["hypothesis_by_index"].items()
+                )
+            )
+            grouped.setdefault(signature, []).append(candidate_state)
+        for group in grouped.values():
+            group.sort(key=lambda item: item["priority"])
+        group_keys = sorted(
+            grouped,
+            key=lambda signature: grouped[signature][0]["priority"],
+        )
+        ordered = []
+        group_offset = 0
+        while len(ordered) < maximum:
+            appended = False
+            for signature in group_keys:
+                group = grouped[signature]
+                if group_offset >= len(group):
+                    continue
+                ordered.append(group[group_offset])
+                appended = True
+                if len(ordered) >= maximum:
+                    break
+            if not appended:
+                break
+            group_offset += 1
+        return ordered
+
+    def diverse_source_relations(relations, limit):
+        """在片对关系上限内按源候选轮询取边，防止候选0独占全部名额。
+
+        目标候选已经由当前状态固定，因此这里只按`source_hypothesis`分组。各组内部
+        保持边图原有的等级、候选分数、整边和误差顺序；每轮从各组取一条，最终仍不
+        超过现场宏`UNKNOWN_FOUR_FAST_RELATION_LIMIT`规定的关系总数。
+        """
+        maximum = max(0, int(limit))
+        grouped = {}
+        for relation in relations:
+            grouped.setdefault(int(relation["source_hypothesis"]), []).append(relation)
+        group_keys = sorted(
+            grouped,
+            key=lambda hypothesis_index: (
+                grouped[hypothesis_index][0]["maximum_rank"],
+                grouped[hypothesis_index][0]["hypothesis_score"],
+                hypothesis_index,
+            ),
+        )
+        selected = []
+        relation_offset = 0
+        while len(selected) < maximum:
+            appended = False
+            for hypothesis_index in group_keys:
+                group = grouped[hypothesis_index]
+                if relation_offset >= len(group):
+                    continue
+                selected.append(group[relation_offset])
+                appended = True
+                if len(selected) >= maximum:
+                    break
+            if not appended:
+                break
+            relation_offset += 1
+        return tuple(selected)
+
     if active_budget_reached():
         return None, diagnostics
 
-    initial_polygon = solver_pieces[0]["local_vertices"].copy()
-    states = [
-        {
-            "placed": {0: initial_polygon},
-            "remaining": (1, 2, 3),
-            "segmented_count": 0,
-            "full_error": 0.0,
-            "matched_length": 0.0,
-            "priority": (0.0, 0.0, 0.0, 0.0),
-        }
-    ]
+    states = []
+    for hypothesis_index, hypothesis in enumerate(solver_pieces[0]["hypotheses"]):
+        first_pose = (np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64))
+        transformed = _transform_solver_outline(
+            solver_pieces[0],
+            hypothesis_index,
+            first_pose,
+        )
+        rank = int(hypothesis.get("rank", hypothesis_index))
+        hypothesis_score = float(hypothesis.get("score", 0.0))
+        states.append(
+            {
+                "hypothesis_by_index": {0: hypothesis_index},
+                "pose_by_index": {0: first_pose},
+                "seam_by_index": {0: transformed["seam_polygon"]},
+                "outline_by_index": {0: transformed["outline_polygon"]},
+                "remaining": (1, 2, 3),
+                "maximum_rank": rank,
+                "hypothesis_score": hypothesis_score,
+                "segmented_count": 0,
+                "full_error": 0.0,
+                "matched_length": 0.0,
+                "priority": (rank, hypothesis_score, 0.0, 0.0, 0.0, 0.0),
+            }
+        )
+    states.sort(key=lambda state: state["priority"])
 
     for placed_count in (2, 3, 4):
         if active_budget_reached():
@@ -2714,7 +2876,7 @@ def _solve_unknown_four_fast_path_steps(
         # 下一层，会无故降低快路径召回并把可解输入推回慢FALLBACK。
         next_by_pose = {}
         work_limit_reached = False
-        parent_states = states[:selected_beam_width]
+        parent_states = diverse_state_order(states, selected_beam_width)
         parent_diagnostic_key = {
             2: "four_pair_parents_expanded",
             3: "four_triple_parents_expanded",
@@ -2728,32 +2890,47 @@ def _solve_unknown_four_fast_path_steps(
             # 只有真正进入展开循环的父状态才计数。工作量在层中途触顶时，这个值会
             # 小于保留状态数，现场即可判断召回受限于候选不足还是预算不足。
             diagnostics[parent_diagnostic_key] += 1
-            placed_by_index = state["placed"]
-            placed_polygons = list(placed_by_index.values())
+            placed_outlines = list(state["outline_by_index"].values())
             for source_index in state["remaining"]:
                 if active_budget_reached():
                     return None, diagnostics
                 if work_limit_reached:
                     break
-                source_polygon = solver_pieces[source_index]["local_vertices"]
-                for target_index, target_polygon in placed_by_index.items():
+                for target_index, target_polygon in state["seam_by_index"].items():
                     if active_budget_reached():
                         return None, diagnostics
                     if work_limit_reached:
                         break
-                    relations = edge_graph.get((source_index, target_index), ())
-                    for relation in relations[:UNKNOWN_FOUR_FAST_RELATION_LIMIT]:
+                    # 先固定已放置目标片的候选，再应用每个片对的关系上限；若先切片，
+                    # 排名0关系可能把目标候选1的全部合法连接挤出有限列表。
+                    compatible_relations = tuple(
+                        relation
+                        for relation in edge_graph.get((source_index, target_index), ())
+                        if int(relation["target_hypothesis"])
+                        == int(state["hypothesis_by_index"][target_index])
+                    )
+                    relations = diverse_source_relations(
+                        compatible_relations,
+                        UNKNOWN_FOUR_FAST_RELATION_LIMIT,
+                    )
+                    for relation in relations:
                         if active_budget_reached():
                             return None, diagnostics
                         if work_limit_reached:
                             break
-                        candidates = _align_source_edge_candidates(
-                            source_polygon,
+                        source_hypothesis_index = int(
+                            relation["source_hypothesis"]
+                        )
+                        source_hypothesis = solver_pieces[source_index]["hypotheses"][
+                            source_hypothesis_index
+                        ]
+                        candidate_poses = _edge_alignment_pose_candidates(
+                            source_hypothesis["local_vertices"],
                             relation["source_edge"],
                             target_polygon,
                             relation["target_edge"],
                         )
-                        for candidate_polygon in candidates:
+                        for candidate_pose in candidate_poses:
                             if active_budget_reached():
                                 return None, diagnostics
                             if diagnostics["four_work_units"] >= selected_work_limit:
@@ -2761,9 +2938,15 @@ def _solve_unknown_four_fast_path_steps(
                                 work_limit_reached = True
                                 break
                             diagnostics["four_work_units"] += 1
+                            transformed = _transform_solver_outline(
+                                solver_pieces[source_index],
+                                source_hypothesis_index,
+                                candidate_pose,
+                            )
+                            candidate_outline = transformed["outline_polygon"]
                             if _candidate_overlaps_fast(
-                                candidate_polygon,
-                                placed_polygons,
+                                candidate_outline,
+                                placed_outlines,
                                 pixels_per_mm=selected_pixels_per_mm,
                                 diagnostics=diagnostics,
                                 final_total_piece_area=final_total_piece_area,
@@ -2771,10 +2954,10 @@ def _solve_unknown_four_fast_path_steps(
                                 diagnostics["four_overlap_reject"] += 1
                                 yield None
                                 continue
-                            updated = dict(placed_by_index)
-                            updated[source_index] = candidate_polygon
+                            updated_outlines = dict(state["outline_by_index"])
+                            updated_outlines[source_index] = candidate_outline
                             partial_priority = _partial_layout_priority(
-                                list(updated.values()),
+                                list(updated_outlines.values()),
                                 tolerance_mm=length_tolerance,
                             )
                             if partial_priority is None:
@@ -2802,20 +2985,48 @@ def _solve_unknown_four_fast_path_steps(
                                 for index in state["remaining"]
                                 if index != source_index
                             )
+                            updated_hypotheses = dict(state["hypothesis_by_index"])
+                            updated_hypotheses[source_index] = source_hypothesis_index
+                            updated_poses = dict(state["pose_by_index"])
+                            updated_poses[source_index] = candidate_pose
+                            updated_seams = dict(state["seam_by_index"])
+                            updated_seams[source_index] = transformed["seam_polygon"]
+                            maximum_rank = max(
+                                int(state["maximum_rank"]),
+                                int(
+                                    source_hypothesis.get(
+                                        "rank",
+                                        source_hypothesis_index,
+                                    )
+                                ),
+                            )
+                            hypothesis_score = float(state["hypothesis_score"]) + float(
+                                source_hypothesis.get("score", 0.0)
+                            )
                             candidate_state = {
-                                "placed": updated,
+                                "hypothesis_by_index": updated_hypotheses,
+                                "pose_by_index": updated_poses,
+                                "seam_by_index": updated_seams,
+                                "outline_by_index": updated_outlines,
                                 "remaining": remaining,
+                                "maximum_rank": maximum_rank,
+                                "hypothesis_score": hypothesis_score,
                                 "segmented_count": segmented_count,
                                 "full_error": full_error,
                                 "matched_length": total_matched_length,
                                 "priority": build_priority(
+                                    maximum_rank,
+                                    hypothesis_score,
                                     partial_priority,
                                     segmented_count,
                                     full_error,
                                     total_matched_length,
                                 ),
                             }
-                            key = pose_key(updated)
+                            key = _solver_state_pose_key(
+                                updated_poses,
+                                updated_hypotheses,
+                            )
                             previous = next_by_pose.get(key)
                             if previous is not None:
                                 diagnostics["four_deduplicated"] += 1
@@ -2843,7 +3054,7 @@ def _solve_unknown_four_fast_path_steps(
         if not next_states:
             return None, diagnostics
         if placed_count < 4:
-            states = next_states[:selected_beam_width]
+            states = diverse_state_order(next_states, selected_beam_width)
             if work_limit_reached:
                 # 未完整生成中间层会使全局排序带有父状态顺序偏差；交给旧FALLBACK比
                 # 在不完整Beam上继续给出机械结果更稳妥。
@@ -2852,16 +3063,20 @@ def _solve_unknown_four_fast_path_steps(
 
         # 完整层最多验收四倍Beam；尺寸不合格在栅格化前即可快速拒绝。达到工作上限时
         # 已生成的完整状态仍然是合法候选，可安全完成硬验收。
-        complete_states = next_states[: selected_beam_width * 4]
+        complete_states = diverse_state_order(
+            next_states,
+            selected_beam_width * 4,
+        )
         best_relaxed = None
         best_relaxed_score = float("inf")
+        best_relaxed_priority = None
         for state in complete_states:
             if active_budget_reached():
                 return None, diagnostics
             diagnostics["four_complete_checked"] += 1
             strict_metrics = {}
             canonical_result, rejection_reason = _canonicalize_complete_layout(
-                state["placed"],
+                state["outline_by_index"],
                 pixels_per_mm=selected_pixels_per_mm,
                 min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
                 metrics=strict_metrics,
@@ -2878,7 +3093,7 @@ def _solve_unknown_four_fast_path_steps(
                     continue
                 relaxed_metrics = {}
                 canonical_result, relaxed_reason = _canonicalize_complete_layout(
-                    state["placed"],
+                    state["outline_by_index"],
                     pixels_per_mm=selected_pixels_per_mm,
                     min_fill_ratio=UNKNOWN_RELAXED_MIN_FILL_RATIO,
                     require_all_outer_edges=True,
@@ -2908,8 +3123,26 @@ def _solve_unknown_four_fast_path_steps(
             success_diagnostics["outer_piece_count"] = int(
                 candidate_metrics.get("outer_piece_count", 0)
             )
+            selected_hypotheses = tuple(
+                int(state["hypothesis_by_index"][index])
+                for index in range(len(solver_pieces))
+            )
+            success_diagnostics["maximum_hypothesis_rank"] = max(
+                selected_hypotheses,
+                default=0,
+            )
+            success_diagnostics["selected_hypotheses"] = selected_hypotheses
             if accepted_relaxed:
-                if geometry_score < best_relaxed_score:
+                relaxed_priority = (
+                    int(state["maximum_rank"]),
+                    float(state["hypothesis_score"]),
+                    float(geometry_score),
+                )
+                if (
+                    best_relaxed_priority is None
+                    or relaxed_priority < best_relaxed_priority
+                ):
+                    best_relaxed_priority = relaxed_priority
                     best_relaxed_score = geometry_score
                     best_relaxed = (
                         state,
@@ -3006,15 +3239,31 @@ def _coincident_edge(first_polygon, first_edge, second_polygon, second_edge, tol
     )
 
 
-def _complete_layout_texture_score(canonical_by_index, solver_pieces):
-    """汇总完整布局中所有反向重合内部边的牌面接缝分数。"""
+def _complete_layout_texture_score(
+    seam_by_index,
+    solver_pieces,
+    hypothesis_by_index=None,
+):
+    """汇总接缝候选布局中所有反向重合内部边的牌面分数。
+
+    `seam_by_index`必须是用于提出位姿的简化候选，而不是可能含数十个点的完整轮廓；
+    `hypothesis_by_index`指定每片最终候选编号，缺省时兼容旧调用并使用排名0。这样边号
+    与候选纹理特征始终一一对应，完整轮廓只负责几何硬验收。
+    """
     total_score = 0.0
     seam_count = 0
-    indices = sorted(canonical_by_index)
+    selected_hypotheses = hypothesis_by_index or {}
+    indices = sorted(seam_by_index)
     for first_position, first_index in enumerate(indices):
-        first_polygon = canonical_by_index[first_index]
+        first_polygon = seam_by_index[first_index]
+        first_hypothesis = solver_pieces[first_index]["hypotheses"][
+            int(selected_hypotheses.get(first_index, 0))
+        ]
         for second_index in indices[first_position + 1 :]:
-            second_polygon = canonical_by_index[second_index]
+            second_polygon = seam_by_index[second_index]
+            second_hypothesis = solver_pieces[second_index]["hypotheses"][
+                int(selected_hypotheses.get(second_index, 0))
+            ]
             for first_edge in range(len(first_polygon)):
                 for second_edge in range(len(second_polygon)):
                     if not _coincident_edge(
@@ -3025,8 +3274,8 @@ def _complete_layout_texture_score(canonical_by_index, solver_pieces):
                     ):
                         continue
                     total_score += edge_feature_match_score(
-                        solver_pieces[first_index]["edge_features"][first_edge],
-                        solver_pieces[second_index]["edge_features"][second_edge],
+                        first_hypothesis["edge_features"][first_edge],
+                        second_hypothesis["edge_features"][second_edge],
                     )
                     seam_count += 1
     return 0.0 if seam_count == 0 else total_score / seam_count
@@ -3094,7 +3343,11 @@ def _solve_unknown_layout_steps(
             solver_pieces,
             base_tolerance_mm=length_tolerance,
         )
-    except (KeyError, TypeError, ValueError):
+    except ValueError as error:
+        if str(error) == "shape_hypothesis_empty":
+            return AssemblyPlan.failed("shape_hypothesis_empty")
+        return AssemblyPlan.failed("unknown_geometry_invalid")
+    except (KeyError, TypeError):
         return AssemblyPlan.failed("unknown_geometry_invalid")
 
     # progress由增量任务持有。同步入口不需要进度时仍使用局部字典，保持同一核心。
@@ -3104,6 +3357,14 @@ def _solve_unknown_layout_steps(
     progress["edge_candidates"] = int(
         sum(len(relations) for relations in edge_graph.values())
     )
+
+    # 两片及以上没有任何有向兼容关系时不必进入递归；候选本身有效，失败应明确归因
+    # 于边图为空。单片没有内部接缝是正常情况，仍需进入完整轮廓硬验收。
+    if len(solver_pieces) > 1 and int(progress["edge_candidates"]) == 0:
+        return AssemblyPlan.failed(
+            "edge_graph_empty",
+            diagnostics={"edge_candidates": 0},
+        )
     progress["max_frontier_width"] = 0
     progress["first_solution_node"] = None
 
@@ -3111,9 +3372,35 @@ def _solve_unknown_layout_steps(
         feature
         and float(feature.get("pattern_energy", 0.0)) >= PATTERN_ENERGY_THRESHOLD
         for solver_piece in solver_pieces
-        for feature in solver_piece["edge_features"]
+        for hypothesis in solver_piece["hypotheses"]
+        for feature in hypothesis["edge_features"]
     )
-    first_polygon = solver_pieces[0]["local_vertices"].copy()
+    initial_states = []
+    for hypothesis_index, hypothesis in enumerate(solver_pieces[0]["hypotheses"]):
+        first_pose = (np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64))
+        first_transformed = _transform_solver_outline(
+            solver_pieces[0],
+            hypothesis_index,
+            first_pose,
+        )
+        rank = int(hypothesis.get("rank", hypothesis_index))
+        hypothesis_score = float(hypothesis.get("score", 0.0))
+        initial_states.append(
+            {
+                "hypothesis_by_index": {0: hypothesis_index},
+                "pose_by_index": {0: first_pose},
+                "seam_by_index": {0: first_transformed["seam_polygon"]},
+                "outline_by_index": {0: first_transformed["outline_polygon"]},
+                "maximum_rank": rank,
+                "hypothesis_score": hypothesis_score,
+            }
+        )
+    initial_states.sort(
+        key=lambda state: (
+            state["maximum_rank"],
+            state["hypothesis_score"],
+        )
+    )
     best_candidate = None
     best_score = float("inf")
     best_is_relaxed = False
@@ -3169,14 +3456,14 @@ def _solve_unknown_layout_steps(
             rejection_counts,
         )
 
-    def evaluate_complete(placed_by_index):
-        """先严格、后WHITE容错验收完整组合，并保存同层内分数最低的候选。"""
+    def evaluate_complete(state):
+        """用完整轮廓执行两级硬验收，并按已选接缝候选计算可选纹理分。"""
         nonlocal best_candidate, best_score, best_is_relaxed, best_metrics
         nonlocal first_solution_node, stop_search
         rejection_counts["complete_candidates"] += 1
         strict_metrics = {}
         canonical_result, rejection_reason = _canonicalize_complete_layout(
-            placed_by_index,
+            state["outline_by_index"],
             pixels_per_mm=pixels_per_mm,
             min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
             metrics=strict_metrics,
@@ -3189,7 +3476,7 @@ def _solve_unknown_layout_steps(
                 return
             relaxed_metrics = {}
             canonical_result, relaxed_reason = _canonicalize_complete_layout(
-                placed_by_index,
+                state["outline_by_index"],
                 pixels_per_mm=pixels_per_mm,
                 min_fill_ratio=UNKNOWN_RELAXED_MIN_FILL_RATIO,
                 require_all_outer_edges=True,
@@ -3207,9 +3494,11 @@ def _solve_unknown_layout_steps(
         else:
             candidate_metrics = strict_metrics
         canonical_by_index, width_mm, height_mm, geometry_score = canonical_result
-        texture_score = _complete_layout_texture_score(
-            canonical_by_index,
+        # WHITE只需几何合法性；CARD才根据同一候选的接缝边与纹理特征择优。
+        texture_score = 0.0 if stop_at_first_solution else _complete_layout_texture_score(
+            state["seam_by_index"],
             solver_pieces,
+            state["hypothesis_by_index"],
         )
         score = geometry_score + texture_score * 20.0
         candidate_is_better = bool(
@@ -3222,6 +3511,15 @@ def _solve_unknown_layout_steps(
             best_is_relaxed = bool(accepted_relaxed)
             best_metrics = dict(candidate_metrics)
             best_candidate = (canonical_by_index, width_mm, height_mm)
+            selected_hypotheses = tuple(
+                int(state["hypothesis_by_index"][index])
+                for index in range(len(solver_pieces))
+            )
+            rejection_counts["maximum_hypothesis_rank"] = max(
+                selected_hypotheses,
+                default=0,
+            )
+            rejection_counts["selected_hypotheses"] = selected_hypotheses
             # 每个更优候选都立即生成独立规划快照。CARD后续可以继续比较花纹，但即使
             # 活动预算或硬墙钟随后到期，也不会丢掉已经验证通过的矩形布局。
             best_plan = build_success_plan(best_candidate, best_score)
@@ -3244,13 +3542,17 @@ def _solve_unknown_layout_steps(
             elif has_pattern and texture_refinement_nodes == 0:
                 stop_search = True
 
-    def search(placed_by_index, remaining_indices):
-        """按紧凑度递归枚举，并在每个高成本候选后yield一个工作单元。"""
+    def search(state, remaining_indices):
+        """按候选等级和完整轮廓紧凑度递归枚举，并逐工作单元让出。
+
+        状态同时携带候选编号、刚体位姿、接缝多边形和完整轮廓。边对齐只读取接缝
+        多边形；重叠、局部外框和最终硬验收只读取完整轮廓，保证两套几何不再混用。
+        """
         nonlocal search_nodes, reached_limit, stop_search
         if stop_search or reached_limit:
             return
         if not remaining_indices:
-            evaluate_complete(placed_by_index)
+            evaluate_complete(state)
             # 完整布局的栅格验收和纹理评分也计为一个可让出的高成本工作单元。
             yield None
             return
@@ -3258,52 +3560,75 @@ def _solve_unknown_layout_steps(
         expansions = []
         seen_poses = set()
         for source_index in tuple(remaining_indices):
-            source_polygon = solver_pieces[source_index]["local_vertices"]
-            for target_index, target_polygon in tuple(placed_by_index.items()):
+            for target_index, target_polygon in tuple(state["seam_by_index"].items()):
                 for relation in edge_graph.get((source_index, target_index), ()):
+                    source_hypothesis_index = int(relation["source_hypothesis"])
+                    target_hypothesis_index = int(relation["target_hypothesis"])
+                    if (
+                        state["hypothesis_by_index"].get(target_index)
+                        != target_hypothesis_index
+                    ):
+                        continue
+                    source_hypothesis = solver_pieces[source_index]["hypotheses"][
+                        source_hypothesis_index
+                    ]
+                    source_polygon = source_hypothesis["local_vertices"]
                     source_edge = relation["source_edge"]
                     target_edge = relation["target_edge"]
                     lengths_are_equal = relation["kind"] == "full"
-                    candidates = _align_source_edge_candidates(
+                    candidate_poses = _edge_alignment_pose_candidates(
                         source_polygon,
                         source_edge,
                         target_polygon,
                         target_edge,
                     )
-                    for candidate_polygon in candidates:
+                    for candidate_pose in candidate_poses:
+                        transformed = _transform_solver_outline(
+                            solver_pieces[source_index],
+                            source_hypothesis_index,
+                            candidate_pose,
+                        )
+                        candidate_outline = transformed["outline_polygon"]
                         # WHITE已有最终3%硬验收，可使用三角化快速剪枝；CARD继续保留
                         # 原MASK语义，避免牌面纹理择优路径在本次优化中发生额外变化。
                         if stop_at_first_solution:
                             overlaps = _candidate_overlaps_fast(
-                                candidate_polygon,
-                                list(placed_by_index.values()),
+                                candidate_outline,
+                                list(state["outline_by_index"].values()),
                                 pixels_per_mm=pixels_per_mm,
                                 diagnostics=rejection_counts,
                                 final_total_piece_area=final_total_piece_area,
                             )
                         else:
                             overlaps = _candidate_overlaps(
-                                candidate_polygon,
-                                list(placed_by_index.values()),
+                                candidate_outline,
+                                list(state["outline_by_index"].values()),
                                 pixels_per_mm=pixels_per_mm,
                             )
                         if overlaps:
                             rejection_counts["overlap_reject"] += 1
                             yield None
                             continue
-                        # 同一碎片可能通过多组共线边得到完全相同位姿，只保留一次。
-                        pose_key = (
-                            source_index,
-                            tuple(np.rint(candidate_polygon.flatten() * 100.0).astype(int)),
+                        updated_poses = dict(state["pose_by_index"])
+                        updated_poses[source_index] = candidate_pose
+                        updated_hypotheses = dict(state["hypothesis_by_index"])
+                        updated_hypotheses[source_index] = source_hypothesis_index
+                        # 去重键包含全部已放置片的候选编号与刚体位姿，不能让不同候选
+                        # 因简化外框接近而在完整轮廓硬验收前被合并。
+                        pose_key = _solver_state_pose_key(
+                            updated_poses,
+                            updated_hypotheses,
                         )
                         if pose_key in seen_poses:
                             yield None
                             continue
                         seen_poses.add(pose_key)
-                        updated = dict(placed_by_index)
-                        updated[source_index] = candidate_polygon
+                        updated_seams = dict(state["seam_by_index"])
+                        updated_seams[source_index] = transformed["seam_polygon"]
+                        updated_outlines = dict(state["outline_by_index"])
+                        updated_outlines[source_index] = candidate_outline
                         partial_priority = _partial_layout_priority(
-                            list(updated.values()),
+                            list(updated_outlines.values()),
                             tolerance_mm=length_tolerance,
                             target_size_hint_mm=target_size_hint_mm,
                         )
@@ -3317,14 +3642,25 @@ def _solve_unknown_layout_steps(
                             -relation["matched_length_mm"],
                             relation["length_error_mm"],
                         )
+                        maximum_rank = max(
+                            int(state["maximum_rank"]),
+                            int(source_hypothesis.get("rank", source_hypothesis_index)),
+                        )
+                        hypothesis_score = float(state["hypothesis_score"]) + float(
+                            source_hypothesis.get("score", 0.0)
+                        )
                         if target_size_hint_mm is None:
                             priority = (
+                                maximum_rank,
+                                hypothesis_score,
                                 partial_priority[1],
                                 *relation_priority,
                                 partial_priority[2],
                             )
                         else:
                             priority = (
+                                maximum_rank,
+                                hypothesis_score,
                                 partial_priority[0],
                                 partial_priority[1],
                                 *relation_priority,
@@ -3333,7 +3669,15 @@ def _solve_unknown_layout_steps(
                         next_remaining = tuple(
                             index for index in remaining_indices if index != source_index
                         )
-                        expansions.append((priority, updated, next_remaining))
+                        updated_state = {
+                            "hypothesis_by_index": updated_hypotheses,
+                            "pose_by_index": updated_poses,
+                            "seam_by_index": updated_seams,
+                            "outline_by_index": updated_outlines,
+                            "maximum_rank": maximum_rank,
+                            "hypothesis_score": hypothesis_score,
+                        }
+                        expansions.append((priority, updated_state, next_remaining))
                         # 重叠和外框计算完成后立即让出，继续保持相机主循环可响应。
                         yield None
 
@@ -3344,7 +3688,7 @@ def _solve_unknown_layout_steps(
             int(frontier_width),
         )
         rejection_counts["max_frontier_width"] = int(progress["max_frontier_width"])
-        for _, updated, next_remaining in expansions[:search_width]:
+        for _, updated_state, next_remaining in expansions[:search_width]:
             search_nodes += 1
             progress["search_nodes"] = int(search_nodes)
             if search_nodes > max_nodes:
@@ -3365,34 +3709,39 @@ def _solve_unknown_layout_steps(
                 # 这条停止条件既减少候选顺序影响，又防止已有答案后跑满总上限。
                 stop_search = True
                 return
-            yield from search(updated, next_remaining)
+            yield from search(updated_state, next_remaining)
             if stop_search or reached_limit:
                 return
 
-    yield from search({0: first_polygon}, tuple(range(1, len(solver_pieces))))
+    # 根片也必须参与候选分级；各根状态共享同一节点上限和累计进度，不重置预算。
+    for initial_state in initial_states:
+        yield from search(initial_state, tuple(range(1, len(solver_pieces))))
+        if stop_search or reached_limit:
+            break
     if best_candidate is None:
         if reached_limit:
-            reason = "search_limit"
+            reason = "solver_timeout"
         elif rejection_counts["complete_candidates"] > 0:
             # 单片无需接缝也会直接进入完整验收；只要存在完整候选，就应报告真实的
             # 尺寸、填充或重叠原因，不能因为search_nodes为0误报EDGE_MISMATCH。
             reason_priority = ("size_reject", "fill_reject", "overlap_reject")
-            reason = max(
+            internal_reason = max(
                 reason_priority,
                 key=lambda name: (rejection_counts[name], -reason_priority.index(name)),
             )
-        elif search_nodes == 0:
-            reason = "edge_mismatch"
-            rejection_counts["edge_mismatch"] += 1
+            reason = {
+                "size_reject": "layout_size",
+                "fill_reject": "layout_fill",
+                "overlap_reject": "layout_overlap",
+            }[internal_reason]
         else:
-            # 有边候选却始终无法放完全部碎片，通常是接缝组合不闭合；若所有扩展
-            # 都被实体重叠剪掉，则优先提示重叠，便于现场判断顶点误差。
+            # 边图非空但无法放完时，以中间完整轮廓剪枝的主导计数分类。没有重叠
+            # 拒绝通常意味着全部接缝组合形成了题目尺寸之外的外框，归入layout_size。
             reason = (
-                "overlap_reject"
+                "layout_overlap"
                 if rejection_counts["overlap_reject"] > 0
-                else "edge_mismatch"
+                else "layout_size"
             )
-            rejection_counts[reason] += 1
         return AssemblyPlan.failed(
             reason,
             search_nodes=search_nodes,

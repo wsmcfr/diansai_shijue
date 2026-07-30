@@ -503,6 +503,371 @@ def test_graph_propagation_uses_relation_hypothesis_and_transforms_outline():
     np.testing.assert_allclose(first_seam[2], second_seam[3], atol=1e-6)
 
 
+def _ranked_solver_strips(primary_is_correct, piece_count=3):
+    """构造三块竖条完整轮廓，并为每片提供正确/错误两个已排序接缝候选。
+
+    正确候选能恢复100x60mm矩形；错误候选是边长互不兼容的等边三角形。参数决定
+    正确候选排在0还是1，用于验证分级搜索既能回退，也不会无故进入更高等级。
+    返回值为可直接替换`_solver_piece`结果的三个求解片。
+    """
+    count = int(piece_count)
+    if count == 3:
+        strip_widths = (30.0, 30.0, 40.0)
+    elif count == 4:
+        strip_widths = (25.0, 25.0, 25.0, 25.0)
+    else:
+        raise ValueError("测试竖条只支持三片或四片")
+    wrong_sides = (22.0, 48.0, 85.0, 130.0)[:count]
+    solver_pieces = []
+    left_mm = 0.0
+    for index, (width_mm, wrong_side) in enumerate(zip(strip_widths, wrong_sides)):
+        outline_source = np.asarray(
+            (
+                (left_mm, 0.0),
+                (left_mm + width_mm * 0.5, -0.4),
+                (left_mm + width_mm, 0.0),
+                (left_mm + width_mm, 60.0),
+                (left_mm + width_mm * 0.5, 60.4),
+                (left_mm, 60.0),
+            ),
+            dtype=np.float64,
+        )
+        center = np.asarray((left_mm + width_mm * 0.5, 30.0), dtype=np.float64)
+        outline_local = outline_source - center
+        correct_vertices = np.asarray(
+            (
+                (-width_mm * 0.5, -30.0),
+                (width_mm * 0.5, -30.0),
+                (width_mm * 0.5, 30.0),
+                (-width_mm * 0.5, 30.0),
+            ),
+            dtype=np.float64,
+        )
+        triangle_height = wrong_side * math.sqrt(3.0) * 0.5
+        wrong_vertices = np.asarray(
+            (
+                (-wrong_side * 0.5, triangle_height / 3.0),
+                (wrong_side * 0.5, triangle_height / 3.0),
+                (0.0, -triangle_height * 2.0 / 3.0),
+            ),
+            dtype=np.float64,
+        )
+
+        def make_hypothesis(rank, vertices, score):
+            """为测试候选补齐搜索器依赖的边长、纹理和质量字段。"""
+            return {
+                "rank": int(rank),
+                "local_vertices": vertices.copy(),
+                "source_vertices": vertices + center,
+                "edge_lengths": tuple(
+                    float(value) for value in _cyclic_edge_lengths(vertices)
+                ),
+                "edge_features": [None] * len(vertices),
+                "score": float(score),
+            }
+
+        ordered_vertices = (
+            (correct_vertices, wrong_vertices)
+            if primary_is_correct
+            else (wrong_vertices, correct_vertices)
+        )
+        hypotheses = [
+            make_hypothesis(rank, vertices, 0.1 + rank)
+            for rank, vertices in enumerate(ordered_vertices)
+        ]
+        solver_pieces.append(
+            {
+                "index": index,
+                "id": f"U{index + 1}",
+                "source_center": tuple(float(value) for value in center),
+                "outline_source": outline_source,
+                "outline_local": outline_local,
+                "hypotheses": hypotheses,
+                # 兼容字段故意指向排名0；搜索成功不能依赖这些字段偷换候选。
+                "source_vertices": hypotheses[0]["source_vertices"],
+                "local_vertices": hypotheses[0]["local_vertices"],
+                "edge_lengths": hypotheses[0]["edge_lengths"],
+                "edge_features": hypotheses[0]["edge_features"],
+            }
+        )
+        left_mm += width_mm
+    return solver_pieces
+
+
+def test_graph_uses_rank1_when_rank0_edges_cannot_form_layout(monkeypatch):
+    """排名0关系无解时，GRAPH必须在同一任务中使用排名1恢复完整轮廓矩形。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=False)
+
+    def prepared_solver_piece(_piece, index):
+        """返回预制候选，使测试只观察GRAPH的候选分级和完整轮廓验收。"""
+        return solver_pieces[index]
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    plan, diagnostics = assembly_planner._solve_unknown_graph_fast_path(
+        [{"id": "raw"}] * 3,
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+    )
+
+    assert plan is not None and plan.success is True
+    assert diagnostics["maximum_hypothesis_rank"] == 1
+    assert diagnostics["selected_hypotheses"] == (1, 1, 1)
+
+
+def test_graph_rank0_success_does_not_enter_higher_hypothesis(monkeypatch):
+    """三片排名0已经通过硬验收时，GRAPH不得继续检查或采用更高候选。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=True)
+
+    def prepared_solver_piece(_piece, index):
+        """返回首选即正确的预制候选，用于验证早停等级。"""
+        return solver_pieces[index]
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    plan, diagnostics = assembly_planner._solve_unknown_graph_fast_path(
+        [{"id": "raw"}] * 3,
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+    )
+
+    assert plan is not None and plan.success is True
+    assert diagnostics["maximum_hypothesis_rank"] == 0
+    assert diagnostics["selected_hypotheses"] == (0, 0, 0)
+
+
+def test_fallback_hard_acceptance_receives_full_outline(monkeypatch):
+    """FALLBACK最终尺寸、填充和重叠验收必须使用完整轮廓。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_piece = _ranked_solver_strips(primary_is_correct=True)[0]
+    observed_vertex_counts = []
+
+    def prepared_solver_piece(_piece, _index):
+        """返回含4点接缝候选和6点完整轮廓的单片求解结构。"""
+        return solver_piece
+
+    def observe_canonicalize(placed_by_index, **_kwargs):
+        """记录硬验收收到的顶点数，并以尺寸失败结束该搜索。"""
+        observed_vertex_counts.append(len(placed_by_index[0]))
+        return None, "size_reject"
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    monkeypatch.setattr(
+        assembly_planner,
+        "_canonicalize_complete_layout",
+        observe_canonicalize,
+    )
+    plan = assembly_planner._consume_solver_steps(
+        assembly_planner._solve_unknown_layout_steps(
+            [{"id": "raw"}],
+            work_region_mm=(0.0, 33.5, 210.0, 230.0),
+            split_y_mm=148.5,
+            stop_at_first_solution=True,
+        )
+    )
+
+    assert plan.success is False
+    assert observed_vertex_counts
+    assert all(
+        vertex_count == len(solver_piece["outline_local"])
+        for vertex_count in observed_vertex_counts
+    )
+
+
+def test_four_fast_hard_acceptance_receives_full_outlines(monkeypatch):
+    """FOURFAST中间状态与最终硬验收必须传递四片高保真完整轮廓。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=True, piece_count=4)
+    observed_vertex_counts = []
+
+    def prepared_solver_piece(_piece, index):
+        """返回每片4点接缝候选和6点完整轮廓的预制结构。"""
+        return solver_pieces[index]
+
+    def observe_canonicalize(placed_by_index, **_kwargs):
+        """记录完整状态顶点数，并用尺寸失败让快路径继续受控结束。"""
+        observed_vertex_counts.append(
+            tuple(len(placed_by_index[index]) for index in sorted(placed_by_index))
+        )
+        return None, "size_reject"
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    monkeypatch.setattr(
+        assembly_planner,
+        "_canonicalize_complete_layout",
+        observe_canonicalize,
+    )
+    _plan, _diagnostics = assembly_planner._solve_unknown_four_fast_path(
+        [{"id": "raw"}] * 4,
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        max_work_units=assembly_planner.UNKNOWN_FOUR_FAST_MAX_WORK_UNITS,
+    )
+
+    assert observed_vertex_counts
+    assert all(vertex_counts == (6, 6, 6, 6) for vertex_counts in observed_vertex_counts)
+
+
+def test_four_fast_opens_rank1_within_same_work_budget(monkeypatch):
+    """四片排名0无解时，FOURFAST必须在同一累计工作预算内采用排名1。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=False, piece_count=4)
+
+    def prepared_solver_piece(_piece, index):
+        """返回排名1才具有正确接缝的四片预制结构。"""
+        return solver_pieces[index]
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    plan, diagnostics = assembly_planner._solve_unknown_four_fast_path(
+        [{"id": "raw"}] * 4,
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        max_work_units=assembly_planner.UNKNOWN_FOUR_FAST_MAX_WORK_UNITS,
+    )
+
+    assert plan is not None and plan.success is True
+    assert (
+        diagnostics["four_work_units"]
+        <= assembly_planner.UNKNOWN_FOUR_FAST_MAX_WORK_UNITS
+    )
+    assert diagnostics["maximum_hypothesis_rank"] == 1
+    assert diagnostics["selected_hypotheses"] == (1, 1, 1, 1)
+
+
+def test_fallback_can_select_rank1_for_root_and_remaining_pieces(monkeypatch):
+    """FALLBACK不能把第0片锁死为候选0，排名1正确时三片仍须成功。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=False)
+
+    def prepared_solver_piece(_piece, index):
+        """返回根片和其余碎片均需候选1的三片预制结构。"""
+        return solver_pieces[index]
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    plan = assembly_planner._consume_solver_steps(
+        assembly_planner._solve_unknown_layout_steps(
+            [{"id": "raw"}] * 3,
+            work_region_mm=(0.0, 33.5, 210.0, 230.0),
+            split_y_mm=148.5,
+            stop_at_first_solution=True,
+            max_nodes=12000,
+        )
+    )
+
+    assert plan.success is True, (plan.reason, plan.search_nodes, plan.diagnostics)
+    assert plan.diagnostics["maximum_hypothesis_rank"] == 1
+    assert plan.diagnostics["selected_hypotheses"] == (1, 1, 1)
+
+
+def test_fallback_reports_shape_hypothesis_empty(monkeypatch):
+    """候选质量门清空任一碎片时必须保留专用失败原因。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    def reject_all_hypotheses(_piece, _index):
+        """模拟候选评分器因伪短边或面积保持不足而拒绝全部候选。"""
+        raise ValueError("shape_hypothesis_empty")
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", reject_all_hypotheses)
+    plan = assembly_planner._consume_solver_steps(
+        assembly_planner._solve_unknown_layout_steps(
+            [{"id": "raw"}],
+            work_region_mm=(0.0, 33.5, 210.0, 230.0),
+            split_y_mm=148.5,
+            stop_at_first_solution=True,
+        )
+    )
+
+    assert plan.reason == "shape_hypothesis_empty"
+
+
+def test_fallback_reports_edge_graph_empty(monkeypatch):
+    """候选存在但任意片对都没有兼容边时必须返回边图为空。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=True)[:2]
+
+    def prepared_solver_piece(_piece, index):
+        """返回几何有效求解片，确保失败只来自空边图。"""
+        return solver_pieces[index]
+
+    def empty_edge_graph(pieces, base_tolerance_mm):
+        """为全部有向片对返回空关系，模拟没有长度兼容接缝。"""
+        del base_tolerance_mm
+        return {
+            (source_index, target_index): tuple()
+            for source_index in range(len(pieces))
+            for target_index in range(len(pieces))
+            if source_index != target_index
+        }
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    monkeypatch.setattr(
+        assembly_planner,
+        "_build_edge_compatibility_graph",
+        empty_edge_graph,
+    )
+    plan = assembly_planner._consume_solver_steps(
+        assembly_planner._solve_unknown_layout_steps(
+            [{"id": "raw"}] * 2,
+            work_region_mm=(0.0, 33.5, 210.0, 230.0),
+            split_y_mm=148.5,
+            stop_at_first_solution=True,
+        )
+    )
+
+    assert plan.reason == "edge_graph_empty"
+
+
+@pytest.mark.parametrize(
+    ("internal_reason", "public_reason"),
+    (
+        ("size_reject", "layout_size"),
+        ("fill_reject", "layout_fill"),
+        ("overlap_reject", "layout_overlap"),
+    ),
+)
+def test_fallback_maps_dominant_hard_gate_failure(
+    monkeypatch,
+    internal_reason,
+    public_reason,
+):
+    """完整候选失败时必须把内部硬门名称映射为稳定现场原因。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_piece = _ranked_solver_strips(primary_is_correct=True)[0]
+
+    def prepared_solver_piece(_piece, _index):
+        """返回可直接进入单片完整验收的有效候选结构。"""
+        return solver_piece
+
+    def reject_layout(_placed_by_index, **_kwargs):
+        """用参数化内部原因拒绝每个完整轮廓候选。"""
+        return None, internal_reason
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    monkeypatch.setattr(
+        assembly_planner,
+        "_canonicalize_complete_layout",
+        reject_layout,
+    )
+    plan = assembly_planner._consume_solver_steps(
+        assembly_planner._solve_unknown_layout_steps(
+            [{"id": "raw"}],
+            work_region_mm=(0.0, 33.5, 210.0, 230.0),
+            split_y_mm=148.5,
+            stop_at_first_solution=False,
+        )
+    )
+
+    assert plan.reason == public_reason
+
+
 def test_white_solver_cleanup_macro_and_device_short_edges():
     """默认12mm宏必须清除实机U2/U3伪短边，且不修改输入数组。"""
     from maixcam2_app_A_quad import assembly_planner
@@ -710,7 +1075,7 @@ def test_card_keeps_strict_fill_for_noisy_corner_device_shape():
     )
 
     assert plan.success is False
-    assert plan.reason == "fill_reject"
+    assert plan.reason == "layout_fill"
 
 
 def test_relaxed_fill_rejects_piece_without_target_outer_edge():
@@ -1185,11 +1550,11 @@ def test_unknown_solver_returns_bounded_failure_for_non_rectangular_set():
 
     assert plan.success is False
     assert plan.reason in {
-        "edge_mismatch",
-        "size_reject",
-        "fill_reject",
-        "overlap_reject",
-        "search_limit",
+        "edge_graph_empty",
+        "layout_size",
+        "layout_fill",
+        "layout_overlap",
+        "solver_timeout",
     }
     assert plan.search_nodes <= 80
     assert plan.placements == []
