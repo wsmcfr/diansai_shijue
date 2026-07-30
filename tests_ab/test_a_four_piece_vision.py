@@ -103,3 +103,66 @@ def test_warp_full_paper_rejects_invalid_scale_or_quad(paper_quad, pixels_per_mm
             "portrait",
             pixels_per_mm=pixels_per_mm,
         )
+
+
+def _four_piece_mask_scene():
+    """构造含2mm黑缝、灰色裸露区、内部孔和小亮点的展开纸面测试图。"""
+    image = np.zeros((300, 420, 3), dtype=np.uint8)
+    rectangles = (
+        (30, 30, 130, 120),
+        (136, 30, 236, 120),
+        (30, 150, 130, 240),
+        (136, 150, 236, 240),
+    )
+    for x1, y1, x2, y2 in rectangles:
+        cv2.rectangle(image, (x1, y1), (x2, y2), (245, 245, 245), -1)
+
+    # 第一片右侧30像素模拟白纸未完全覆盖的灰色金属；它与严格白色核心直接相连。
+    cv2.rectangle(image, (100, 30), (130, 120), (115, 115, 115), -1)
+    # 第三片内部黑孔应由拓扑填孔恢复，但不能改变对外连通的片间黑缝。
+    cv2.circle(image, (80, 195), 7, (0, 0, 0), -1)
+    # 远离碎片的单像素亮点属于现场反光噪声，最终掩膜必须删除。
+    image[270, 350] = (255, 255, 255)
+    return image
+
+
+def test_dual_mask_recovers_gray_support_without_bridging_two_mm_gap():
+    """宽松支撑必须补回同片灰区，同时保持约2mm的黑色片间间隔。"""
+    from maixcam2_app_A_quad.four_piece_vision import build_four_piece_masks
+
+    masks = build_four_piece_masks(_four_piece_mask_scene(), pixels_per_mm=3.0)
+    component_count, _ = cv2.connectedComponents(masks.final)
+
+    assert component_count - 1 == 4
+    assert masks.strict[70, 115] == 0
+    assert masks.support[70, 115] == 255
+    assert masks.final[70, 115] == 255
+    # 两片横向间距为5个有效像素；任何全局膨胀都会使这里变白并导致粘连。
+    assert np.all(masks.final[30:121, 131:136] == 0)
+
+
+def test_dual_mask_fills_internal_hole_and_removes_isolated_bright_noise():
+    """单片内部闭合孔应恢复，但没有严格核心支持的小亮点必须被删除。"""
+    from maixcam2_app_A_quad.four_piece_vision import build_four_piece_masks
+
+    masks = build_four_piece_masks(_four_piece_mask_scene(), pixels_per_mm=3.0)
+
+    assert masks.final[195, 80] == 255
+    assert masks.strict[270, 350] == 255
+    assert masks.final[270, 350] == 0
+
+
+@pytest.mark.parametrize(
+    "invalid_image",
+    (
+        None,
+        np.zeros((40, 40), dtype=np.uint8),
+        np.zeros((40, 40, 4), dtype=np.uint8),
+    ),
+)
+def test_dual_mask_rejects_non_bgr_input(invalid_image):
+    """双掩膜入口只接受三通道BGR图，避免颜色空间静默误用。"""
+    from maixcam2_app_A_quad.four_piece_vision import build_four_piece_masks
+
+    with pytest.raises(ValueError):
+        build_four_piece_masks(invalid_image, pixels_per_mm=3.0)

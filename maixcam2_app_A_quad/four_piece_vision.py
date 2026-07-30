@@ -25,6 +25,16 @@ except ModuleNotFoundError as error:
 # ======================== FOUR现场调试常量（仅影响四片模式） ========================
 # 完整A4展开图的默认像素密度。3px/mm让2mm黑缝在处理图上约有6像素宽。
 FOUR_WARP_PIXELS_PER_MM = 3.0
+# 严格白色核心需要低饱和、高HSV亮度和高LAB亮度同时成立，优先保护片间黑缝。
+FOUR_HSV_S_MAX = 80
+FOUR_HSV_V_MIN = 150
+FOUR_LAB_L_MIN = 150
+# 宽松支撑只允许被可靠核心选中的连通域进入结果，用于补回阴影和裸露金属。
+FOUR_SUPPORT_S_MAX = 160
+FOUR_SUPPORT_V_MIN = 90
+FOUR_SUPPORT_L_MIN = 95
+# 没有达到该严格核心面积的亮点不能独立成为碎片，单位平方毫米。
+FOUR_MIN_CORE_AREA_MM2 = 4.0
 # True时允许构造并输出四片视觉与求解诊断；关闭后应跳过高成本调试字符串。
 FOUR_SOLVER_DEBUG = True
 # ===============================================================================
@@ -102,6 +112,21 @@ class PaperWarpResult:
         return mapped.astype(np.float32)
 
 
+class FourPieceMasks:
+    """保存FOUR分割的严格核心、宽松支撑和最终恢复掩膜。"""
+
+    def __init__(self, strict, support, final):
+        """复制并保存三张同尺寸uint8二值掩膜，构造函数无返回值。"""
+        masks = []
+        for name, mask in (("strict", strict), ("support", support), ("final", final)):
+            if not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.dtype != np.uint8:
+                raise ValueError(f"{name}必须是二维uint8掩膜")
+            masks.append(mask.copy())
+        if len({mask.shape for mask in masks}) != 1:
+            raise ValueError("strict、support和final掩膜尺寸必须一致")
+        self.strict, self.support, self.final = masks
+
+
 def _normalize_point(point, field_name):
     """校验单个二维有限点并返回独立float64数组。"""
     normalized = np.asarray(point, dtype=np.float64)
@@ -142,6 +167,92 @@ def _validate_pixels_per_mm(pixels_per_mm):
     if normalized <= 0.0 or not math.isfinite(normalized):
         raise ValueError("pixels_per_mm必须是正有限数")
     return normalized
+
+
+def _fill_internal_mask_holes(mask):
+    """只填补与图像外部背景不连通的黑孔，不扩大任何白色外边界。
+
+    主要流程：外加一圈确定黑边，从(0,0)泛洪所有外部背景；取反后仅剩封闭黑孔，
+    再与原掩膜合并。对外开放的凹口和片间黑缝都与背景连通，因此不会被误填。
+    """
+    if not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.dtype != np.uint8:
+        raise ValueError("mask必须是二维uint8掩膜")
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    flooded = padded.copy()
+    flood_mask = np.zeros(
+        (padded.shape[0] + 2, padded.shape[1] + 2),
+        dtype=np.uint8,
+    )
+    cv2.floodFill(flooded, flood_mask, (0, 0), 255)
+    enclosed_holes = cv2.bitwise_not(flooded)
+    return cv2.bitwise_or(padded, enclosed_holes)[1:-1, 1:-1].copy()
+
+
+def _select_supported_components(strict_mask, support_mask, min_core_pixels):
+    """保留拥有足够严格白色核心的宽松连通域，并删除孤立反光噪声。
+
+    关键参数两张掩膜必须同尺寸；min_core_pixels是每个支撑域内所需的最小严格核心
+    像素数。返回独立uint8掩膜。该过程不做膨胀，支撑域之间的黑缝不会被改变。
+    """
+    if strict_mask.shape != support_mask.shape:
+        raise ValueError("严格核心和宽松支撑掩膜尺寸必须一致")
+    component_count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(
+        support_mask,
+        connectivity=8,
+    )
+    selected = np.zeros_like(support_mask)
+    for label in range(1, int(component_count)):
+        component = labels == label
+        core_pixels = int(np.count_nonzero(strict_mask[component]))
+        if core_pixels < min_core_pixels:
+            continue
+        selected[component] = 255
+    return selected
+
+
+def build_four_piece_masks(
+    warped_bgr,
+    pixels_per_mm=FOUR_WARP_PIXELS_PER_MM,
+):
+    """在完整A4展开图中构造不跨越黑缝的HSV/LAB双阈值白片掩膜。
+
+    主要流程：严格核心同时满足HSV低饱和高亮和LAB高亮；宽松支撑降低亮度并允许
+    更高饱和度，用于包含灰色裸露金属。随后只保留内部拥有足够严格核心的支撑连通
+    域，删除孤立反光，并用拓扑泛洪填补单片内部孔洞。函数不使用膨胀或闭运算。
+    关键参数warped_bgr必须是透视展开后的三通道BGR图；返回FourPieceMasks。
+    """
+    _validate_frame(warped_bgr)
+    scale = _validate_pixels_per_mm(pixels_per_mm)
+    hsv = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2LAB)
+    saturation = hsv[:, :, 1]
+    hsv_value = hsv[:, :, 2]
+    lab_lightness = lab[:, :, 0]
+
+    strict_condition = (
+        (saturation <= int(FOUR_HSV_S_MAX))
+        & (hsv_value >= int(FOUR_HSV_V_MIN))
+        & (lab_lightness >= int(FOUR_LAB_L_MIN))
+    )
+    support_condition = (
+        (saturation <= int(FOUR_SUPPORT_S_MAX))
+        & (hsv_value >= int(FOUR_SUPPORT_V_MIN))
+        & (lab_lightness >= int(FOUR_SUPPORT_L_MIN))
+    )
+    strict_mask = np.where(strict_condition, 255, 0).astype(np.uint8)
+    # 严格核心必须始终属于支撑域，防止现场阈值调整后出现核心被支撑排除的矛盾状态。
+    support_mask = np.where(support_condition | strict_condition, 255, 0).astype(np.uint8)
+    min_core_pixels = max(
+        1,
+        int(round(float(FOUR_MIN_CORE_AREA_MM2) * scale * scale)),
+    )
+    final_mask = _select_supported_components(
+        strict_mask,
+        support_mask,
+        min_core_pixels,
+    )
+    final_mask = _fill_internal_mask_holes(final_mask)
+    return FourPieceMasks(strict_mask, support_mask, final_mask)
 
 
 def build_paper_warp(
