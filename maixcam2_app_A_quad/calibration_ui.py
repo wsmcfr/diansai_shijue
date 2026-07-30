@@ -369,10 +369,11 @@ class CalibrationSession:
         return self.current_item
 
     def bottom_actions(self):
-        """按当前页面返回五个固定触摸槽对应的逻辑动作。
+        """按当前页面返回六个固定触摸槽对应的逻辑动作。
 
         ROI/MASK/RESULT保持简化纸张操作；只有ADV显示详细分割参数，避免默认界面
-        同时堆叠过多现场参数。
+        同时堆叠过多现场参数。普通页第六槽发送A4帧；ADV第六槽明确禁用，确保
+        所有页面触摸区域不漂移。
         """
         if self.view == VIEW_ADV:
             return (
@@ -381,6 +382,7 @@ class CalibrationSession:
                 "select_value",
                 "value_inc",
                 "save_segmentation",
+                "disabled",
             )
         return (
             "auto_roi",
@@ -388,6 +390,7 @@ class CalibrationSession:
             "work_value",
             "work_inc",
             "lock_roi",
+            "send_a4",
         )
 
     def cycle_work_item(self):
@@ -454,7 +457,7 @@ class CalibrationSession:
         return True
 
     def resolve_control_action(self, control_name):
-        """把control_1～control_5转换为当前页面逻辑动作。"""
+        """把control_1～control_6转换为当前页面逻辑动作。"""
         if not str(control_name).startswith("control_"):
             return str(control_name)
         try:
@@ -469,7 +472,9 @@ class CalibrationSession:
     def apply_auto_roi(self, location):
         """把一次自动定位结果应用到会话副本，失败时完整保留旧四角。
 
-        成功只更新内存工作副本和置信度，必须再按LOCK ROI才会由入口持久化。
+        成功后以本次蓝框作为新的完整纸面基准，因此无论方向是否改变，都会把
+        黄色区域重置为完整A4、分界线重置到纸面中线并清零整体内缩量。结果只
+        更新内存工作副本，必须再按LOCK ROI才会由入口持久化。
         返回值：成功返回True，失败返回False。
         """
         if not getattr(location, "success", False) or location.paper_quad is None:
@@ -483,19 +488,20 @@ class CalibrationSession:
             "paper_orientation",
             self.settings["paper_orientation"],
         )
-        if detected_orientation != self.settings["paper_orientation"]:
-            # 自动判向改变时同步重置毫米区域；否则保留用户此前对同方向做的手动微调。
-            work_region = default_work_region_mm(detected_orientation)
-            updated.update(
-                {
-                    "paper_orientation": detected_orientation,
-                    "work_x_mm": work_region[0],
-                    "work_y_mm": work_region[1],
-                    "work_width_mm": work_region[2],
-                    "work_height_mm": work_region[3],
-                    "split_y_mm": default_split_y_mm(detected_orientation),
-                }
-            )
+        # AUTO代表重新建立纸面坐标系。保留旧裁剪或INSET会让新蓝框与黄色区域
+        # 使用不同标定语义，因此每次成功都从完整纸面重新开始，再允许用户微调。
+        work_region = default_work_region_mm(detected_orientation)
+        updated.update(
+            {
+                "paper_orientation": detected_orientation,
+                "inset_mm": 0.0,
+                "work_x_mm": work_region[0],
+                "work_y_mm": work_region[1],
+                "work_width_mm": work_region[2],
+                "work_height_mm": work_region[3],
+                "split_y_mm": default_split_y_mm(detected_orientation),
+            }
+        )
         # 复用完整设置校验，确保候选四角在保存前已经满足画面边界与凸性约束。
         self.settings = validate_runtime_settings(updated, self.frame_size)
         self.measurement_tracker.reset()
@@ -1016,8 +1022,10 @@ def _draw_roi_preview(frame_bgr, session, display_size=None):
         [np.rint(paper_array * display_scale).astype(np.int32)],
         True,
         COLOR_PAPER,
-        2,
+        4,
     )
+    # 黄色区域允许等于完整A4。蓝框先画粗线、黄框后画细线，可在完全重合时仍
+    # 同时看见外侧蓝边和内侧黄边，现场能确认“纸面标定”和“检测区域”两个状态。
     cv2.polylines(
         output,
         [np.rint(active_array * display_scale).astype(np.int32)],
@@ -1278,7 +1286,7 @@ def draw_calibration_frame(
             ),
         )
 
-    control_names = tuple(f"control_{index}" for index in range(1, 6))
+    control_names = tuple(f"control_{index}" for index in range(1, 7))
     control_y = int(round(min(buttons[name].y for name in control_names)))
     status_height = 52
     status_y = max(0, control_y - status_height - 4)
@@ -1337,6 +1345,7 @@ def draw_calibration_frame(
             _current_value_label(session, result),
             "+",
             "SAVE",
+            "",
         )
     else:
         bottom_labels = (
@@ -1345,18 +1354,19 @@ def draw_calibration_frame(
             f"{session.current_item} {_current_value_label(session, result)}",
             "+",
             "LOCK ROI",
+            "SEND A4",
         )
     lock_enabled = session.settings.get("paper_quad") is not None
     for index, (name, label) in enumerate(zip(control_names, bottom_labels), start=1):
         if session.view == VIEW_ADV:
-            enabled = index != 5 or quality.state == "GOOD"
+            enabled = index != 6 and (index != 5 or quality.state == "GOOD")
         else:
-            enabled = index != 5 or lock_enabled
+            enabled = index not in (5, 6) or lock_enabled
         _draw_button(
             output,
             buttons[name],
             label,
-            active=(index == 5 and enabled),
+            active=(index in (5, 6) and enabled),
             enabled=enabled,
         )
 

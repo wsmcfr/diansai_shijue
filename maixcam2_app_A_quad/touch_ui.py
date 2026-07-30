@@ -131,11 +131,11 @@ def build_cal_toggle_button(width, height):
 
 
 def build_calibration_layout(width, height):
-    """创建五个顶部页签和五个固定底部控制槽。
+    """创建五个顶部页签和六个固定底部控制槽。
 
-    顶部固定为ROI/MASK/RESULT/ADV/CAL；底部使用control_1～control_5通用槽，
-    由当前页面映射成AUTO ROI/INSET/LOCK或高级分割动作。固定槽避免页面切换时
-    触摸区域漂移。返回值：按屏幕从左到右顺序排列的十个 ButtonRect 字典。
+    顶部固定为ROI/MASK/RESULT/ADV/CAL；底部使用control_1～control_6通用槽，
+    普通页第六槽用于发送A4标定帧，ADV页将它保持为空白禁用。顶部和底部独立
+    等分，避免增加底部按钮后压缩顶部页签。返回值按屏幕从左到右排列。
     """
     if width <= 0 or height <= 0:
         raise ValueError("图像宽高必须大于零")
@@ -143,21 +143,27 @@ def build_calibration_layout(width, height):
     margin = max(6, int(round(width * 0.015625)))
     gap = max(4, int(round(width * 0.008)))
     top_height = max(36, min(52, int(round(height * 0.10))))
-    available_width = width - 2 * margin - 4 * gap
-    slot_widths = [available_width // 5 for _ in range(5)]
-    slot_widths[-1] += available_width - sum(slot_widths)
+    top_available_width = width - 2 * margin - 4 * gap
+    top_slot_widths = [top_available_width // 5 for _ in range(5)]
+    top_slot_widths[-1] += top_available_width - sum(top_slot_widths)
 
     top_buttons = {}
     top_x = margin
-    for name, slot_width in zip(("roi", "mask", "result", "adv", "cal"), slot_widths):
+    for name, slot_width in zip(
+        ("roi", "mask", "result", "adv", "cal"),
+        top_slot_widths,
+    ):
         top_buttons[name] = ButtonRect(name, top_x, margin, slot_width, top_height)
         top_x += slot_width + gap
 
     control_height = max(48, min(64, int(round(height * 0.12))))
     control_y = height - margin - control_height
+    control_available_width = width - 2 * margin - 5 * gap
+    control_slot_widths = [control_available_width // 6 for _ in range(6)]
+    control_slot_widths[-1] += control_available_width - sum(control_slot_widths)
     controls = {}
     control_x = margin
-    for index, control_width in enumerate(slot_widths, start=1):
+    for index, control_width in enumerate(control_slot_widths, start=1):
         name = f"control_{index}"
         controls[name] = ButtonRect(
             name,

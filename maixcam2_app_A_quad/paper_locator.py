@@ -48,20 +48,13 @@ def paper_size_mm(paper_orientation=PAPER_ORIENTATION_PORTRAIT):
 
 
 def default_work_region_mm(paper_orientation=PAPER_ORIENTATION_PORTRAIT):
-    """返回当前方向下230×230mm龙门架能覆盖的居中纸面区域。
+    """返回当前方向下完整A4纸面的默认黄色区域。
 
-    竖放时纸宽只有210mm，因此上下各裁33.5mm；横放时纸高只有210mm，因此左右
-    各裁33.5mm。返回值为``(x, y, width, height)``毫米元组。
+    该区域用于视觉检测和目标显示，不再用230mm电机行程裁剪；机械端只需按协议
+    接收能够到达的毫米目标。返回值为``(x, y, width, height)``毫米元组。
     """
     paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
-    work_width_mm = min(WORK_HEIGHT_MM, paper_width_mm)
-    work_height_mm = min(WORK_HEIGHT_MM, paper_height_mm)
-    return (
-        (paper_width_mm - work_width_mm) / 2.0,
-        (paper_height_mm - work_height_mm) / 2.0,
-        work_width_mm,
-        work_height_mm,
-    )
+    return (0.0, 0.0, paper_width_mm, paper_height_mm)
 
 
 def default_split_y_mm(paper_orientation=PAPER_ORIENTATION_PORTRAIT):
@@ -76,8 +69,8 @@ def validate_work_region_mm(
 ):
     """校验A4纸内的机械工作矩形并返回规范化毫米元组。
 
-    主要流程：读取X/Y/W/H四个有限数字，按纸张方向取得完整纸面宽高，再限制
-    X/Y两个方向均不超过230mm行程。关键参数可为四元素序列。
+    主要流程：读取X/Y/W/H四个有限数字，按纸张方向取得完整纸面宽高，并确保
+    区域完整位于纸面内。视觉区域不再受230mm电机行程限制。关键参数可为四元素序列。
     返回值：``(x_mm, y_mm, width_mm, height_mm)``；非法输入抛出ValueError。
     """
     try:
@@ -88,17 +81,15 @@ def validate_work_region_mm(
         raise ValueError("机械区域必须包含X/Y/W/H四个有限数字")
 
     paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
-    maximum_work_width_mm = min(WORK_HEIGHT_MM, paper_width_mm)
-    maximum_work_height_mm = min(WORK_HEIGHT_MM, paper_height_mm)
     work_x_mm, work_y_mm, work_width_mm, work_height_mm = values
     if work_x_mm < 0.0:
         raise ValueError("work_x_mm不能为负数")
     if work_y_mm < 0.0:
         raise ValueError("work_y_mm不能为负数")
-    if not 0.0 < work_width_mm <= maximum_work_width_mm:
-        raise ValueError(f"work_width_mm必须位于0到{maximum_work_width_mm:g}之间")
-    if not 0.0 < work_height_mm <= maximum_work_height_mm:
-        raise ValueError(f"work_height_mm必须位于0到{maximum_work_height_mm:g}之间")
+    if not 0.0 < work_width_mm <= paper_width_mm:
+        raise ValueError(f"work_width_mm必须位于0到{paper_width_mm:g}之间")
+    if not 0.0 < work_height_mm <= paper_height_mm:
+        raise ValueError(f"work_height_mm必须位于0到{paper_height_mm:g}之间")
     if work_x_mm + work_width_mm > paper_width_mm + 1e-6:
         raise ValueError("机械区域X方向必须完整位于A4纸内")
     if work_y_mm + work_height_mm > paper_height_mm + 1e-6:

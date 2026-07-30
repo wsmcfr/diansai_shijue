@@ -1,4 +1,4 @@
-"""验证A/B共同的五页调参布局、自动ROI和两类独立保存门。"""
+"""验证A/B调参布局、自动ROI和两类独立保存门。"""
 
 import importlib
 from types import SimpleNamespace
@@ -45,13 +45,12 @@ def _make_detection(piece_count, edge_count=0):
 
 
 @pytest.mark.parametrize("package_name", VARIANTS)
-def test_calibration_layout_has_five_top_tabs_and_five_fixed_controls(package_name):
-    """验证640×480布局固定为五个顶部页签和五个底部触摸槽。"""
+def test_calibration_layout_keeps_variant_specific_fixed_controls(package_name):
+    """验证A版使用六槽发送A4，B版继续保持原五槽且所有槽互不重叠。"""
     modules = _variant_modules(package_name)
 
     buttons = modules.touch.build_calibration_layout(640, 480)
-
-    assert tuple(buttons) == (
+    expected_names = (
         "roi",
         "mask",
         "result",
@@ -63,7 +62,19 @@ def test_calibration_layout_has_five_top_tabs_and_five_fixed_controls(package_na
         "control_4",
         "control_5",
     )
+    if package_name.endswith("A_quad"):
+        expected_names += ("control_6",)
+
+    assert tuple(buttons) == expected_names
     assert all(button.width >= 90 for button in buttons.values())
+
+    # 分别检查顶部和底部同一行的相邻按钮，防止增加第六槽后触摸区相互覆盖。
+    for row_names in (expected_names[:5], expected_names[5:]):
+        row = [buttons[name] for name in row_names]
+        assert all(
+            left.x + left.width < right.x
+            for left, right in zip(row, row[1:])
+        )
 
 
 @pytest.mark.parametrize("package_name", VARIANTS)
@@ -81,6 +92,7 @@ def test_calibration_session_maps_simple_and_advanced_bottom_actions(package_nam
             "work_value",
             "work_inc",
             "lock_roi",
+            "send_a4",
         )
     else:
         assert session.bottom_actions() == (
@@ -93,13 +105,59 @@ def test_calibration_session_maps_simple_and_advanced_bottom_actions(package_nam
 
     session.select_view("adv")
 
-    assert session.bottom_actions() == (
+    expected_advanced = (
         "next_param",
         "value_dec",
         "select_value",
         "value_inc",
         "save_segmentation",
     )
+    if package_name.endswith("A_quad"):
+        expected_advanced += ("disabled",)
+    assert session.bottom_actions() == expected_advanced
+
+
+def test_a_send_a4_button_is_enabled_only_after_paper_quad_exists(monkeypatch):
+    """A版SEND A4仅在蓝框四角存在时启用，避免发送尚未标定的纸面。"""
+    modules = _variant_modules("maixcam2_app_A_quad")
+    settings = modules.settings.build_default_runtime_settings(modules.config.DEFAULT_CONFIG)
+    session = modules.calibration.CalibrationSession(settings, (640, 480))
+    detection = _make_detection(0)
+    buttons = modules.touch.build_calibration_layout(640, 480)
+    quality = modules.calibration.evaluate_calibration(detection)
+    drawn_buttons = []
+
+    def capture_button(_image, _button, label, active=False, enabled=True):
+        """记录绘制参数，以验证SEND A4按钮的启用状态而不依赖字体像素。"""
+        drawn_buttons.append((label, bool(active), bool(enabled)))
+
+    monkeypatch.setattr(modules.calibration, "_draw_button", capture_button)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    modules.calibration.draw_calibration_frame(
+        frame,
+        detection,
+        session,
+        buttons,
+        quality,
+    )
+    assert ("SEND A4", False, False) in drawn_buttons
+
+    drawn_buttons.clear()
+    session.settings["paper_quad"] = [
+        [100.0, 60.0],
+        [540.0, 60.0],
+        [540.0, 420.0],
+        [100.0, 420.0],
+    ]
+    modules.calibration.draw_calibration_frame(
+        frame,
+        detection,
+        session,
+        buttons,
+        quality,
+    )
+    assert ("SEND A4", True, True) in drawn_buttons
 
 
 @pytest.mark.parametrize("package_name", VARIANTS)
@@ -309,9 +367,9 @@ def test_a_roi_page_can_switch_paper_v_h_and_reset_default_work_region():
     assert session.current_item == "PAPER"
     assert session.adjust_work(1) is True
     assert session.settings["paper_orientation"] == "landscape"
-    assert session.settings["work_x_mm"] == pytest.approx(33.5)
+    assert session.settings["work_x_mm"] == pytest.approx(0.0)
     assert session.settings["work_y_mm"] == pytest.approx(0.0)
-    assert session.settings["work_width_mm"] == pytest.approx(230.0)
+    assert session.settings["work_width_mm"] == pytest.approx(297.0)
     assert session.settings["work_height_mm"] == pytest.approx(210.0)
     assert session.settings["split_y_mm"] == pytest.approx(105.0)
     assert session.status_text == "PAPER H"
@@ -353,8 +411,43 @@ def test_a_auto_roi_applies_detected_orientation_and_matching_defaults():
     assert session.apply_auto_roi(location) is True
 
     assert session.settings["paper_orientation"] == "landscape"
-    assert session.settings["work_x_mm"] == pytest.approx(33.5)
-    assert session.settings["work_width_mm"] == pytest.approx(230.0)
+    assert session.settings["work_x_mm"] == pytest.approx(0.0)
+    assert session.settings["work_width_mm"] == pytest.approx(297.0)
     assert session.settings["work_height_mm"] == pytest.approx(210.0)
     assert session.settings["split_y_mm"] == pytest.approx(105.0)
     assert session.status_text == "AUTO ROI OK H 92%"
+
+
+def test_a_auto_roi_resets_same_orientation_region_split_and_inset_to_full_paper():
+    """AUTO成功即以本次蓝框为准重置完整纸面，不能保留上次同方向的裁剪值。"""
+    modules = _variant_modules("maixcam2_app_A_quad")
+    saved = modules.settings.build_default_runtime_settings(modules.config.DEFAULT_CONFIG)
+    saved.update(
+        {
+            "inset_mm": 8.0,
+            "work_x_mm": 10.0,
+            "work_y_mm": 30.0,
+            "work_width_mm": 180.0,
+            "work_height_mm": 220.0,
+            "split_y_mm": 140.0,
+        }
+    )
+    session = modules.calibration.CalibrationSession(saved, (640, 480))
+    location = modules.locator.PaperLocation(
+        True,
+        paper_quad=np.float32([[180, 40], [460, 60], [440, 440], [160, 420]]),
+        paper_orientation=modules.locator.PAPER_ORIENTATION_PORTRAIT,
+        confidence=0.90,
+        threshold=100.0,
+        reason="ok",
+    )
+
+    assert session.apply_auto_roi(location) is True
+    assert session.settings["inset_mm"] == pytest.approx(0.0)
+    assert (
+        session.settings["work_x_mm"],
+        session.settings["work_y_mm"],
+        session.settings["work_width_mm"],
+        session.settings["work_height_mm"],
+    ) == pytest.approx((0.0, 0.0, 210.0, 297.0))
+    assert session.settings["split_y_mm"] == pytest.approx(148.5)

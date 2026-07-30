@@ -36,16 +36,22 @@ def _empty_detection():
 
 
 def test_a_defaults_expose_v5_work_region_and_split():
-    """A版首次启动必须使用210×230mm默认机械区域和A4中线。"""
+    """A版首次启动必须使用完整210×297mm纸面区域和A4中线。"""
     settings = settings_store.build_default_runtime_settings(DEFAULT_CONFIG)
 
     assert settings_store.SETTINGS_VERSION == 5
     assert settings["paper_orientation"] == "portrait"
     assert settings["work_x_mm"] == 0.0
-    assert settings["work_y_mm"] == 33.5
+    assert settings["work_y_mm"] == 0.0
     assert settings["work_width_mm"] == 210.0
-    assert settings["work_height_mm"] == 230.0
+    assert settings["work_height_mm"] == 297.0
     assert settings["split_y_mm"] == 148.5
+
+
+def test_a_default_work_region_uses_full_a4_in_both_orientations():
+    """横放和竖放默认黄色区域都必须等于完整蓝色A4区域。"""
+    assert paper_locator.default_work_region_mm("portrait") == (0.0, 0.0, 210.0, 297.0)
+    assert paper_locator.default_work_region_mm("landscape") == (0.0, 0.0, 297.0, 210.0)
 
 
 def test_a_v5_settings_round_trip_work_region(tmp_path):
@@ -100,20 +106,39 @@ def test_a_loads_v2_inset_as_equivalent_v3_region(tmp_path):
     [
         ({"work_x_mm": -0.5}, "work_x_mm"),
         ({"work_width_mm": 210.5}, "work_width_mm"),
-        ({"work_height_mm": 230.5}, "work_height_mm"),
+        ({"work_height_mm": 297.5}, "work_height_mm"),
         ({"work_x_mm": 20.0, "work_width_mm": 200.0}, "A4"),
         ({"work_y_mm": 100.0, "work_height_mm": 210.0}, "A4"),
-        ({"split_y_mm": 20.0}, "split_y_mm"),
-        ({"split_y_mm": 280.0}, "split_y_mm"),
+        ({"split_y_mm": 0.0}, "split_y_mm"),
+        ({"split_y_mm": 297.0}, "split_y_mm"),
     ],
 )
 def test_a_rejects_work_region_outside_physical_limits(updates, message):
-    """机械区域必须位于A4内且不超过电机覆盖高宽，分界线必须在区域中。"""
+    """黄色区域只受当前A4纸面和内部分界线约束，不再受230mm行程约束。"""
     settings = settings_store.build_default_runtime_settings(DEFAULT_CONFIG)
     settings.update(updates)
 
     with pytest.raises(ValueError, match=message):
         settings_store.validate_runtime_settings(settings, (640, 480))
+
+
+def test_a_accepts_work_region_larger_than_230_mm_when_inside_current_paper():
+    """竖纸高度和横纸宽度超过230mm仍应通过，供黄色框扩展到蓝框。"""
+    portrait = settings_store.build_default_runtime_settings(DEFAULT_CONFIG)
+    assert settings_store.validate_runtime_settings(portrait, (640, 480))["work_height_mm"] == 297.0
+
+    landscape = dict(portrait)
+    landscape.update(
+        {
+            "paper_orientation": "landscape",
+            "work_x_mm": 0.0,
+            "work_y_mm": 0.0,
+            "work_width_mm": 297.0,
+            "work_height_mm": 210.0,
+            "split_y_mm": 105.0,
+        }
+    )
+    assert settings_store.validate_runtime_settings(landscape, (640, 480))["work_width_mm"] == 297.0
 
 
 def test_build_work_quad_and_split_use_full_homography():
@@ -167,8 +192,8 @@ def test_a_runtime_builds_active_quad_from_work_region_not_legacy_inset():
     np.testing.assert_allclose(actual, expected, atol=0.01)
 
 
-def test_a_simple_calibration_cycles_and_adjusts_five_work_values():
-    """默认调参页中间按钮循环X/Y/W/H/SPLIT，正负键直接调整所选毫米值。"""
+def test_a_simple_calibration_cycles_and_adjusts_six_work_values():
+    """默认调参页循环X/Y/W/H/SPLIT/PAPER，并按完整纸面边界限制调整。"""
     session = calibration_ui.CalibrationSession(
         settings_store.build_default_runtime_settings(DEFAULT_CONFIG),
         (640, 480),
@@ -180,15 +205,18 @@ def test_a_simple_calibration_cycles_and_adjusts_five_work_values():
         "work_value",
         "work_inc",
         "lock_roi",
+        "send_a4",
     )
     assert session.current_item == "X"
     assert session.adjust_work(1) is False
     assert session.cycle_work_item() == "Y"
-    assert session.adjust_work(1) is True
-    assert session.settings["work_y_mm"] == 34.0
+    assert session.adjust_work(1) is False
     assert session.cycle_work_item() == "W"
     assert session.adjust_work(-1) is True
     assert session.settings["work_width_mm"] == 209.5
+    assert session.cycle_work_item() == "H"
+    assert session.adjust_work(-1) is True
+    assert session.settings["work_height_mm"] == 296.5
 
 
 def test_a_roi_preview_draws_paper_work_region_and_split_colors():
@@ -220,9 +248,9 @@ def test_a_landscape_roi_preview_draws_horizontal_split_at_105_mm():
         {
             "paper_orientation": "landscape",
             "paper_quad": [[20, 20], [614, 20], [614, 440], [20, 440]],
-            "work_x_mm": 33.5,
+            "work_x_mm": 0.0,
             "work_y_mm": 0.0,
-            "work_width_mm": 230.0,
+            "work_width_mm": 297.0,
             "work_height_mm": 210.0,
             "split_y_mm": 105.0,
         }

@@ -431,13 +431,15 @@ def load_runtime_settings(path, config, frame_size=None):
             "close_kernel",
         ):
             migrated[key] = payload.get(key)
-        portrait_region = default_work_region_mm(PAPER_ORIENTATION_PORTRAIT)
+        # V2发布时黄色区域固定为竖纸中间210×230mm。新版本默认已扩展为完整
+        # A4，因此迁移不能再调用当前默认函数，否则旧设备升级后区域会静默跳变。
+        legacy_portrait_region = (0.0, 33.5, 210.0, 230.0)
         migrated.update(
             {
-                "work_x_mm": portrait_region[0] + legacy_inset,
-                "work_y_mm": portrait_region[1] + legacy_inset,
-                "work_width_mm": portrait_region[2] - 2.0 * legacy_inset,
-                "work_height_mm": portrait_region[3] - 2.0 * legacy_inset,
+                "work_x_mm": legacy_portrait_region[0] + legacy_inset,
+                "work_y_mm": legacy_portrait_region[1] + legacy_inset,
+                "work_width_mm": legacy_portrait_region[2] - 2.0 * legacy_inset,
+                "work_height_mm": legacy_portrait_region[3] - 2.0 * legacy_inset,
                 "split_y_mm": default_split_y_mm(PAPER_ORIENTATION_PORTRAIT),
             }
         )
