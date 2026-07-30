@@ -688,6 +688,66 @@ def _polygon_boundary_max_distance(source_vertices, target_vertices):
     return maximum
 
 
+def _compress_high_fidelity_outline(
+    outline_vertices,
+    area_retention_minimum=0.99,
+    maximum_deviation_mm=0.75,
+):
+    """在面积和边界双重约束下压缩UNKNOWN完整轮廓。
+
+    主要流程：先保留原始规范化轮廓，再按从大到小的毫米epsilon尝试OpenCV闭合
+    多边形压缩；Douglas-Peucker的epsilon本身限制边界偏差不超过0.75mm，候选还
+    必须保持至少99%面积才能替换原轮廓。参数用于内部测试和后续标定适配；返回
+    压缩后的独立毫米数组，任何异常或无合格候选时原样返回。
+    """
+    outline = _normalize_vertices(outline_vertices)
+    if len(outline) <= 32:
+        return outline.copy()
+    retention_limit = float(area_retention_minimum)
+    deviation_limit = float(maximum_deviation_mm)
+    if (
+        not 0.0 < retention_limit <= 1.0
+        or deviation_limit <= 0.0
+        or not math.isfinite(deviation_limit)
+    ):
+        raise ValueError("完整轮廓压缩参数无效")
+    contour = outline.astype(np.float32).reshape(-1, 1, 2)
+    original_area = abs(float(cv2.contourArea(contour)))
+    perimeter = float(cv2.arcLength(contour, True))
+    if original_area <= 1e-6 or perimeter <= 1e-6:
+        return outline.copy()
+
+    # 上限0.75mm与远景约1～2像素误差同量级；多个比例用于兼顾大小不同的碎片。
+    epsilon_values = sorted(
+        {float(deviation_limit)}
+        | {
+            max(0.05, min(deviation_limit, perimeter * ratio))
+            for ratio in (0.00025, 0.0005, 0.001, 0.0015, 0.002)
+        },
+        reverse=True,
+    )
+    try:
+        for epsilon_mm in epsilon_values:
+            candidate = cv2.approxPolyDP(contour, float(epsilon_mm), True)
+            # OpenCV返回N×1×2轮廓；毫米几何层统一使用N×2，必须先显式展平。
+            candidate = _normalize_vertices(candidate.reshape(-1, 2))
+            if len(candidate) >= len(outline):
+                continue
+            candidate_area = abs(
+                float(cv2.contourArea(candidate.astype(np.float32)))
+            )
+            area_retention = min(original_area, candidate_area) / max(
+                original_area,
+                candidate_area,
+            )
+            if area_retention >= retention_limit:
+                # 从最大epsilon开始，第一个合格项就是本组中压缩最充分的安全轮廓。
+                return candidate.copy()
+    except (cv2.error, TypeError, ValueError):
+        return outline.copy()
+    return outline.copy()
+
+
 def _polygon_hypothesis_key(vertices):
     """生成与循环起点和顺逆方向无关的毫米候选去重键。
 
@@ -771,7 +831,10 @@ def _build_solver_shape_hypotheses(piece, outline_vertices, outline_center):
     if legacy_input:
         raw_candidates = [piece["vertices_mm"]]
     raw_candidates = list(raw_candidates)
-    deduplicated = {}
+    deduplicated = []
+    # 该容差只合并同顶点数候选的亚毫米抖动；不同顶点数代表不同接缝拓扑，必须
+    # 分别保留。现场最大偏差宏降低时，去重容差也同步收紧。
+    duplicate_boundary_tolerance = min(0.75, maximum_deviation * 0.25)
     for candidate_index, raw_candidate in enumerate(raw_candidates):
         candidate = _normalize_vertices(raw_candidate)
         if not 3 <= len(candidate) <= 5:
@@ -827,12 +890,26 @@ def _build_solver_shape_hypotheses(piece, outline_vertices, outline_center):
             "short_edge_count": int(np.count_nonzero(edge_lengths_array < real_edge_minimum)),
         }
         key = _polygon_hypothesis_key(candidate)
-        previous = deduplicated.get(key)
-        if previous is None or hypothesis["score"] < previous["score"]:
-            deduplicated[key] = hypothesis
+        duplicate_index = None
+        for existing_index, previous in enumerate(deduplicated):
+            previous_vertices = previous["source_vertices"]
+            if key == _polygon_hypothesis_key(previous_vertices) or (
+                len(previous_vertices) == len(candidate)
+                and max(
+                    _polygon_boundary_max_distance(candidate, previous_vertices),
+                    _polygon_boundary_max_distance(previous_vertices, candidate),
+                )
+                <= duplicate_boundary_tolerance
+            ):
+                duplicate_index = existing_index
+                break
+        if duplicate_index is None:
+            deduplicated.append(hypothesis)
+        elif hypothesis["score"] < deduplicated[duplicate_index]["score"]:
+            deduplicated[duplicate_index] = hypothesis
 
     hypotheses = sorted(
-        deduplicated.values(),
+        deduplicated,
         key=lambda item: (
             item["score"],
             item["max_deviation_mm"],
@@ -856,8 +933,11 @@ def _solver_piece(piece, index):
     Task 4/5逐步迁移旧GRAPH、FOURFAST和FALLBACK，不修改视觉层传入字典。
     """
     fallback_vertices = _normalize_vertices(piece["vertices_mm"])
-    outline = _normalize_vertices(piece.get("outline_mm", fallback_vertices))
-    outline_center = np.asarray(_polygon_centroid(outline), dtype=np.float64)
+    raw_outline = _normalize_vertices(piece.get("outline_mm", fallback_vertices))
+    # 机械中心必须来自压缩前的完整实体轮廓；压缩只减少后续O(N²)几何工作量，
+    # 不能让执行坐标随简化epsilon发生漂移。
+    outline_center = np.asarray(_polygon_centroid(raw_outline), dtype=np.float64)
+    outline = _compress_high_fidelity_outline(raw_outline)
     hypotheses = _build_solver_shape_hypotheses(piece, outline, outline_center)
     primary = hypotheses[0]
     primary_lengths = tuple(float(value) for value in primary["edge_lengths"])
@@ -1959,9 +2039,10 @@ def _build_unknown_success_plan(
 ):
     """把已通过硬验收的规范布局转换成下半区机械规划。
 
-    主要流程：在红线下方计算居中的目标矩形，再逐片换算目标轮廓、中心和最短旋转角。
-    canonical_result来自`_canonicalize_complete_layout()`，因此本函数不再重复尺寸、填充
-    和重叠判断。返回独立AssemblyPlan；下半工作区放不下时返回None。
+    主要流程：在红线下方计算居中的目标矩形，再逐片换算目标轮廓和最短旋转角，并把
+    压缩前实体质心通过同一刚体位姿映射为机械目标中心。canonical_result来自
+    `_canonicalize_complete_layout()`，因此本函数不再重复尺寸、填充和重叠判断。
+    返回独立AssemblyPlan；下半工作区放不下时返回None。
     """
     canonical_by_index, target_width, target_height, _geometry_score = canonical_result
     target_rect = _target_rect_in_lower_region(
@@ -1979,11 +2060,35 @@ def _build_unknown_success_plan(
             solver_piece["outline_source"],
             target_polygon,
         )
+        # 有序配准以压缩轮廓的算术中心消除平移；恢复同一刚体位姿后，再把压缩前
+        # 实体质心映射过去。这样target_center不会随高保真压缩后的面积质心漂移。
+        source_outline = np.asarray(
+            solver_piece["outline_source"],
+            dtype=np.float64,
+        )
+        source_vertex_center = np.mean(source_outline, axis=0)
+        target_vertex_center = np.mean(target_polygon, axis=0)
+        rotation_radians = math.radians(rotation_delta)
+        rigid_rotation = np.asarray(
+            (
+                (math.cos(rotation_radians), -math.sin(rotation_radians)),
+                (math.sin(rotation_radians), math.cos(rotation_radians)),
+            ),
+            dtype=np.float64,
+        )
+        target_center = (
+            (
+                np.asarray(solver_piece["source_center"], dtype=np.float64)
+                - source_vertex_center
+            )
+            @ rigid_rotation.T
+            + target_vertex_center
+        )
         placements.append(
             AssemblyPlacement(
                 solver_piece["id"],
                 solver_piece["source_center"],
-                _polygon_centroid(target_polygon),
+                target_center,
                 target_polygon,
                 rotation_delta,
             )
@@ -2460,6 +2565,13 @@ def _solve_unknown_graph_fast_path_steps(
         """
         nonlocal best_relaxed, best_relaxed_score, best_relaxed_priority
         nonlocal best_relaxed_metrics, best_relaxed_hypotheses
+        if relations:
+            # 即使传播或最终硬验收失败，也要记录本次真实尝试过的最高候选层；
+            # 否则现场只看到GRAPH失败，却无法判断候选1/2是否已经开放。
+            diagnostics["maximum_hypothesis_rank"] = max(
+                int(diagnostics["maximum_hypothesis_rank"]),
+                max(int(relation.get("maximum_rank", 0)) for relation in relations),
+            )
         layout_state, closure_error = _propagate_graph_layout(
             solver_pieces,
             relations,
@@ -2967,6 +3079,12 @@ def _solve_unknown_four_fast_path_steps(
                                 work_limit_reached = True
                                 break
                             diagnostics["four_work_units"] += 1
+                            # 只在候选真正占用一个工作单元时更新等级，确保失败TIER日志
+                            # 表示实际展开过的层，而不是仅存在于边图但从未运行的关系。
+                            diagnostics["maximum_hypothesis_rank"] = max(
+                                int(diagnostics["maximum_hypothesis_rank"]),
+                                int(relation.get("maximum_rank", 0)),
+                            )
                             transformed = _transform_solver_outline(
                                 solver_pieces[source_index],
                                 source_hypothesis_index,
@@ -3362,7 +3480,7 @@ def _solve_unknown_layout_steps(
             abs(
                 float(
                     cv2.contourArea(
-                        solver_piece["local_vertices"].astype(np.float32)
+                        solver_piece["outline_local"].astype(np.float32)
                     )
                 )
             )

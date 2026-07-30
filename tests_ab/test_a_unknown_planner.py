@@ -291,6 +291,113 @@ def test_solver_piece_uses_outline_and_ranked_shape_hypotheses():
     )
 
 
+def test_solver_piece_compresses_dense_outline_with_99_percent_area_retention():
+    """密集完整轮廓必须高保真压缩，避免后续O(N²)工作单元阻塞主循环。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    top = np.column_stack((np.linspace(0.0, 100.0, 250, endpoint=False), np.zeros(250)))
+    right = np.column_stack((np.full(150, 100.0), np.linspace(0.0, 60.0, 150, endpoint=False)))
+    bottom = np.column_stack((np.linspace(100.0, 0.0, 250, endpoint=False), np.full(250, 60.0)))
+    left = np.column_stack((np.zeros(150), np.linspace(60.0, 0.0, 150, endpoint=False)))
+    dense_outline = np.vstack((top, right, bottom, left))
+    seam_candidate = np.asarray(
+        ((0.0, 0.0), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)),
+        dtype=np.float64,
+    )
+    piece = {
+        "id": "U1",
+        "vertices_mm": seam_candidate.tolist(),
+        "outline_mm": dense_outline.tolist(),
+        "shape_hypotheses_mm": [seam_candidate.tolist()],
+        "shape_edge_features": [[None] * 4],
+    }
+
+    solver_piece = assembly_planner._solver_piece(piece, 0)
+    original_area = abs(float(cv2.contourArea(dense_outline.astype(np.float32))))
+    compressed_area = abs(
+        float(cv2.contourArea(solver_piece["outline_source"].astype(np.float32)))
+    )
+
+    assert len(solver_piece["outline_source"]) <= 16
+    assert compressed_area / original_area >= 0.99
+    np.testing.assert_allclose(solver_piece["source_center"], (50.0, 30.0), atol=1e-6)
+
+
+def test_high_fidelity_outline_uses_full_deviation_limit_for_jagged_edge():
+    """安全的0.58mm锯齿边应使用0.75mm上限压缩，避免保留数十个噪声点。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    # 四条边各取50点；只有上边在0/0.58mm间交替，模拟远景二值轮廓的一像素锯齿。
+    # 直接使用允许的0.75mm epsilon可去掉锯齿，且仍满足99%实体面积保持门。
+    samples_per_edge = 50
+    top_x = np.linspace(0.0, 50.0, samples_per_edge, endpoint=False)
+    top = np.column_stack(
+        (
+            top_x,
+            np.where(
+                np.arange(samples_per_edge) % 2 == 0,
+                0.0,
+                0.58,
+            ),
+        )
+    )
+    right = np.column_stack(
+        (
+            np.full(samples_per_edge, 50.0),
+            np.linspace(0.0, 30.0, samples_per_edge, endpoint=False),
+        )
+    )
+    bottom = np.column_stack(
+        (
+            np.linspace(50.0, 0.0, samples_per_edge, endpoint=False),
+            np.full(samples_per_edge, 30.0),
+        )
+    )
+    left = np.column_stack(
+        (
+            np.zeros(samples_per_edge),
+            np.linspace(30.0, 0.0, samples_per_edge, endpoint=False),
+        )
+    )
+    jagged_outline = np.vstack((top, right, bottom, left)).astype(np.float64)
+
+    compressed = assembly_planner._compress_high_fidelity_outline(jagged_outline)
+    original_area = abs(
+        float(cv2.contourArea(jagged_outline.astype(np.float32)))
+    )
+    compressed_area = abs(float(cv2.contourArea(compressed.astype(np.float32))))
+
+    assert len(compressed) == 4
+    assert compressed_area / original_area >= 0.99
+
+
+def test_solver_piece_near_duplicate_five_sided_candidates_keep_quadrilateral():
+    """三个近重复五边形必须合并，不能挤掉得分稍低但接缝正确的四边形。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    candidates = [
+        ((0.0, 0.0), (20.0, -3.0), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)),
+        ((0.0, 0.0), (20.1, -2.9), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)),
+        ((0.0, 0.0), (19.9, -3.1), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)),
+        ((0.0, 0.0), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)),
+    ]
+    piece = {
+        "id": "U1",
+        "vertices_mm": candidates[0],
+        "outline_mm": candidates[0],
+        "shape_hypotheses_mm": candidates,
+        "shape_edge_features": [[None] * len(candidate) for candidate in candidates],
+    }
+
+    solver_piece = assembly_planner._solver_piece(piece, 0)
+    retained_vertex_counts = [
+        len(hypothesis["source_vertices"])
+        for hypothesis in solver_piece["hypotheses"]
+    ]
+
+    assert retained_vertex_counts == [5, 4]
+
+
 def test_edge_alignment_pose_is_rigid_and_reverses_shared_edge():
     """候选接缝对齐只能旋转和平移，并使两条共享边反向重合。"""
     from maixcam2_app_A_quad import assembly_planner
@@ -638,6 +745,101 @@ def test_graph_rank0_success_does_not_enter_higher_hypothesis(monkeypatch):
     assert diagnostics["selected_hypotheses"] == (0, 0, 0)
 
 
+def test_graph_failure_reports_highest_attempted_hypothesis_rank(monkeypatch):
+    """GRAPH无解时也必须报告实际传播过的最高候选等级，供TIER日志定位。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=False)
+    attempted_ranks = []
+    original_propagate = assembly_planner._propagate_graph_layout
+
+    def prepared_solver_piece(_piece, index):
+        """返回包含排名0/1候选的预制三片。"""
+        return solver_pieces[index]
+
+    def record_attempted_relations(pieces, relations):
+        """记录本次GRAPH传播实际读取的候选等级，再执行真实传播。"""
+        for relation in relations:
+            attempted_ranks.extend(
+                (
+                    int(relation["source_hypothesis"]),
+                    int(relation["target_hypothesis"]),
+                )
+            )
+        return original_propagate(pieces, relations)
+
+    def reject_every_layout(_placed_by_index, **_kwargs):
+        """让全部传播布局在最终尺寸门失败，确保观察失败诊断。"""
+        return None, "size_reject"
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    monkeypatch.setattr(
+        assembly_planner,
+        "_propagate_graph_layout",
+        record_attempted_relations,
+    )
+    monkeypatch.setattr(
+        assembly_planner,
+        "_canonicalize_complete_layout",
+        reject_every_layout,
+    )
+    plan, diagnostics = assembly_planner._solve_unknown_graph_fast_path(
+        [{"id": "raw"}] * 3,
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+    )
+
+    assert plan is None
+    assert attempted_ranks
+    assert diagnostics["maximum_hypothesis_rank"] == max(attempted_ranks)
+
+
+def test_four_fast_failure_reports_highest_attempted_hypothesis_rank(monkeypatch):
+    """FOURFAST失败或触顶时仍须报告实际变换过的最高候选等级。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=False, piece_count=4)
+    attempted_ranks = []
+    original_transform = assembly_planner._transform_solver_outline
+
+    def prepared_solver_piece(_piece, index):
+        """返回包含排名0/1候选的预制四片。"""
+        return solver_pieces[index]
+
+    def record_transformed_hypothesis(solver_piece, hypothesis_index, pose):
+        """记录FOURFAST实际变换的候选等级，再执行真实完整轮廓变换。"""
+        attempted_ranks.append(
+            int(solver_piece["hypotheses"][hypothesis_index].get("rank", hypothesis_index))
+        )
+        return original_transform(solver_piece, hypothesis_index, pose)
+
+    def reject_every_layout(_placed_by_index, **_kwargs):
+        """拒绝全部完整状态，使快路径以失败诊断结束。"""
+        return None, "size_reject"
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    monkeypatch.setattr(
+        assembly_planner,
+        "_transform_solver_outline",
+        record_transformed_hypothesis,
+    )
+    monkeypatch.setattr(
+        assembly_planner,
+        "_canonicalize_complete_layout",
+        reject_every_layout,
+    )
+    plan, diagnostics = assembly_planner._solve_unknown_four_fast_path(
+        [{"id": "raw"}] * 4,
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        max_work_units=assembly_planner.UNKNOWN_FOUR_FAST_MAX_WORK_UNITS,
+    )
+
+    assert plan is None
+    assert attempted_ranks
+    assert diagnostics["maximum_hypothesis_rank"] == max(attempted_ranks)
+
+
 def test_fallback_hard_acceptance_receives_full_outline(monkeypatch):
     """FALLBACK最终尺寸、填充和重叠验收必须使用完整轮廓。"""
     from maixcam2_app_A_quad import assembly_planner
@@ -674,6 +876,51 @@ def test_fallback_hard_acceptance_receives_full_outline(monkeypatch):
     assert all(
         vertex_count == len(solver_piece["outline_local"])
         for vertex_count in observed_vertex_counts
+    )
+
+
+def test_fallback_intermediate_overlap_uses_full_outline_total_area(monkeypatch):
+    """FALLBACK中间重叠分母必须来自完整轮廓，不能读取首选接缝候选别名。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    solver_pieces = _ranked_solver_strips(primary_is_correct=True)[:2]
+    expected_total_area = sum(
+        abs(float(cv2.contourArea(piece["outline_local"].astype(np.float32))))
+        for piece in solver_pieces
+    )
+    for solver_piece in solver_pieces:
+        # 只缩小旧兼容别名，候选和完整轮廓保持原状，用于暴露错误面积数据源。
+        solver_piece["local_vertices"] = solver_piece["local_vertices"] * 0.5
+    observed_total_areas = []
+
+    def prepared_solver_piece(_piece, index):
+        """按索引返回完整轮廓面积与兼容别名面积不同的预制求解片。"""
+        return solver_pieces[index]
+
+    def observe_intermediate_overlap(_candidate, _placed, **kwargs):
+        """记录快速重叠预筛收到的最终总面积并允许搜索继续。"""
+        observed_total_areas.append(float(kwargs["final_total_piece_area"]))
+        return False
+
+    monkeypatch.setattr(assembly_planner, "_solver_piece", prepared_solver_piece)
+    monkeypatch.setattr(
+        assembly_planner,
+        "_candidate_overlaps_fast",
+        observe_intermediate_overlap,
+    )
+    assembly_planner._consume_solver_steps(
+        assembly_planner._solve_unknown_layout_steps(
+            [{"id": "raw"}] * 2,
+            work_region_mm=(0.0, 33.5, 210.0, 230.0),
+            split_y_mm=148.5,
+            stop_at_first_solution=True,
+        )
+    )
+
+    assert observed_total_areas
+    assert all(
+        area == pytest.approx(expected_total_area)
+        for area in observed_total_areas
     )
 
 
@@ -929,6 +1176,113 @@ def test_unknown_placement_rigid_transform_recovers_full_target_outline():
         reconstructed,
         np.asarray(placement.target_polygon_mm, dtype=np.float64),
         atol=0.15,
+    )
+
+
+def test_unknown_placement_keeps_precompression_mechanical_center():
+    """轮廓压缩改变多边形质心后，机械中心仍必须对应压缩前实体质心。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    # 用不对称的0.7mm局部凸起模拟白纸覆膜边缘反光；该轮廓可以安全压缩，但压缩后
+    # 多边形质心不会再与压缩前实体质心完全重合，正好覆盖机械落点的边界条件。
+    top_x = np.linspace(0.0, 100.0, 250, endpoint=False)
+    top = np.column_stack(
+        (
+            top_x,
+            -0.7 * np.exp(-((top_x - 20.0) / 7.0) ** 2),
+        )
+    )
+    right = np.column_stack(
+        (
+            np.full(150, 100.0),
+            np.linspace(0.0, 60.0, 150, endpoint=False),
+        )
+    )
+    bottom = np.column_stack(
+        (
+            np.linspace(100.0, 0.0, 250, endpoint=False),
+            np.full(250, 60.0),
+        )
+    )
+    left = np.column_stack(
+        (
+            np.zeros(150),
+            np.linspace(60.0, 0.0, 150, endpoint=False),
+        )
+    )
+    raw_outline = np.vstack((top, right, bottom, left))
+    seam_candidate = np.asarray(
+        ((0.0, 0.0), (100.0, 0.0), (100.0, 60.0), (0.0, 60.0)),
+        dtype=np.float64,
+    )
+    solver_piece = assembly_planner._solver_piece(
+        {
+            "id": "U1",
+            "vertices_mm": seam_candidate.tolist(),
+            "outline_mm": raw_outline.tolist(),
+            "shape_hypotheses_mm": [seam_candidate.tolist()],
+            "shape_edge_features": [[None] * 4],
+        },
+        0,
+    )
+
+    source_center = np.asarray(solver_piece["source_center"], dtype=np.float64)
+    compressed_center = np.asarray(
+        assembly_planner._polygon_centroid(solver_piece["outline_source"]),
+        dtype=np.float64,
+    )
+    assert np.linalg.norm(compressed_center - source_center) > 0.05
+
+    # 模拟最终规范化：先把完整局部轮廓旋转29度，再平移到目标矩形原点。局部
+    # 坐标(0,0)代表的压缩前机械中心必须经历同一刚体变换，不能改用压缩多边形质心。
+    local_outline = np.asarray(solver_piece["outline_local"], dtype=np.float64)
+    target_angle_deg = 29.0
+    target_angle = math.radians(target_angle_deg)
+    target_rotation = np.asarray(
+        (
+            (math.cos(target_angle), -math.sin(target_angle)),
+            (math.sin(target_angle), math.cos(target_angle)),
+        ),
+        dtype=np.float64,
+    )
+    rotated_local_outline = local_outline @ target_rotation.T
+    local_minimum = np.min(rotated_local_outline, axis=0)
+    canonical_outline = rotated_local_outline - local_minimum
+    target_size = np.max(canonical_outline, axis=0)
+    plan = assembly_planner._build_unknown_success_plan(
+        [solver_piece],
+        (
+            {0: canonical_outline},
+            float(target_size[0]),
+            float(target_size[1]),
+            0.0,
+        ),
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        score=0.0,
+        search_nodes=1,
+        diagnostics={},
+    )
+
+    assert plan is not None and plan.success is True
+    placement = plan.placements[0]
+    expected_target_center = (
+        np.asarray(plan.target_rect_mm[:2], dtype=np.float64) - local_minimum
+    )
+    np.testing.assert_allclose(
+        placement.target_center_mm,
+        expected_target_center,
+        atol=1e-6,
+    )
+    assert placement.rotation_delta_deg == pytest.approx(target_angle_deg, abs=1e-6)
+    reconstructed = (
+        (solver_piece["outline_source"] - source_center) @ target_rotation.T
+        + np.asarray(placement.target_center_mm, dtype=np.float64)
+    )
+    np.testing.assert_allclose(
+        reconstructed,
+        np.asarray(placement.target_polygon_mm, dtype=np.float64),
+        atol=1e-6,
     )
 
 

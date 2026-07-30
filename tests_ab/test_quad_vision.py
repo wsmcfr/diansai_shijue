@@ -54,6 +54,45 @@ def test_polygon_hypotheses_keep_later_clean_quadrilateral():
     assert len(vertex_counts) == len(set(tuple(item.reshape(-1)) for item in candidates))
 
 
+def test_polygon_hypotheses_merge_near_duplicate_same_vertex_candidates(monkeypatch):
+    """相邻epsilon的近重复五边形只能占一个名额，四边形必须继续保留。"""
+    from maixcam2_app_A_quad import puzzle_vision
+
+    generated = [
+        np.asarray(points, dtype=np.int32).reshape(-1, 1, 2)
+        for points in (
+            ((0, 0), (20, -3), (100, 0), (100, 60), (0, 60)),
+            ((0, 0), (21, -3), (100, 0), (100, 60), (0, 60)),
+            ((0, 0), (20, -2), (100, 0), (100, 60), (0, 60)),
+            ((0, 0), (100, 0), (100, 60), (0, 60)),
+        )
+    ]
+    call_index = [0]
+
+    def approximate_in_epsilon_order(_contour, _epsilon, _closed):
+        """按epsilon调用次序返回三组近重复五边形和一个正确四边形。"""
+        candidate = generated[call_index[0]]
+        call_index[0] += 1
+        return candidate.copy()
+
+    config = dict(DEFAULT_CONFIG)
+    config.update(
+        {
+            "approx_epsilon_min": 0.01,
+            "approx_epsilon_max": 0.04,
+            "approx_epsilon_step": 0.01,
+        }
+    )
+    monkeypatch.setattr(cv2, "approxPolyDP", approximate_in_epsilon_order)
+
+    candidates = puzzle_vision.approximate_polygon_candidates(
+        _noisy_rectangle_contour(),
+        config,
+    )
+
+    assert [len(candidate) for candidate in candidates] == [5, 4]
+
+
 def test_piece_geometry_exposes_independent_pixel_hypotheses():
     """单片结果必须保留独立像素候选，后续排序不能原地修改显示主轮廓。"""
     from maixcam2_app_A_quad.puzzle_vision import compute_piece_geometry

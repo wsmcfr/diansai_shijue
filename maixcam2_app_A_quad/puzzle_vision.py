@@ -247,6 +247,37 @@ def _polygon_candidate_key(candidate):
     return min(variants)
 
 
+def _polygon_candidate_boundary_distance(first_candidate, second_candidate):
+    """计算两个像素候选闭合边界之间的对称最大距离。
+
+    主要流程：把两组候选转换为OpenCV浮点轮廓，逐顶点计算到另一条闭合边界的
+    有符号距离并取绝对值，最后取双向最大值。参数必须是至少三点的像素多边形；
+    返回值单位为像素，用于合并相邻epsilon产生的轻微坐标抖动候选。
+    """
+    first = np.asarray(first_candidate, dtype=np.float32).reshape(-1, 1, 2)
+    second = np.asarray(second_candidate, dtype=np.float32).reshape(-1, 1, 2)
+
+    def directed_distance(source, target):
+        """返回source全部顶点到target闭合边界的最大绝对距离。"""
+        return max(
+            abs(
+                float(
+                    cv2.pointPolygonTest(
+                        target,
+                        (float(point[0]), float(point[1])),
+                        True,
+                    )
+                )
+            )
+            for point in source.reshape(-1, 2)
+        )
+
+    return max(
+        directed_distance(first, second),
+        directed_distance(second, first),
+    )
+
+
 def approximate_polygon_candidates(contour, config):
     """收集像素轮廓在全部epsilon下得到的三至五边候选。
 
@@ -263,11 +294,20 @@ def approximate_polygon_candidates(contour, config):
     )
     candidates = []
     seen = set()
+    # 一像素是远景轮廓常见的量化抖动；较大碎片按周长给少量比例余量。只比较相同
+    # 顶点数，避免把“带伪角的五边形”和应保留的四边形错误聚为一类。
+    duplicate_distance_px = max(1.0, perimeter * 0.0025)
     while epsilon <= epsilon_max + 1e-12:
         candidate = cv2.approxPolyDP(contour, epsilon * perimeter, True)
         if min_vertices <= len(candidate) <= max_vertices:
             key = _polygon_candidate_key(candidate)
-            if key not in seen:
+            is_near_duplicate = any(
+                len(existing) == len(candidate)
+                and _polygon_candidate_boundary_distance(candidate, existing)
+                <= duplicate_distance_px
+                for existing in candidates
+            )
+            if key not in seen and not is_near_duplicate:
                 seen.add(key)
                 candidates.append(candidate.copy())
         epsilon += epsilon_step

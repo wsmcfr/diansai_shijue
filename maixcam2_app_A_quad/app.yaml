@@ -13,7 +13,7 @@ files:
   - touch_ui.py
 id: diansai_quad
 name: diansai_quad
-version: 1.9.2
+version: 1.10.0
 author: CFR
 icon: ''
-desc: MaixCAM2 puzzle recognition with WHITE four-piece fast solver
+desc: MaixCAM2 puzzle recognition with ranked UNKNOWN shape hypotheses

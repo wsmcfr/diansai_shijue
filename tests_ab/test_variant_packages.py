@@ -14,8 +14,8 @@ VARIANT_RELEASES = (
     (
         "maixcam2_app_A_quad",
         "diansai_quad",
-        "1.9.2",
-        "diansai_quad-v1.9.2.zip",
+        "1.10.0",
+        "diansai_quad-v1.10.0.zip",
         {
             "__init__.py",
             "A版实机调试手册.md",

@@ -165,8 +165,8 @@ def test_unknown_solver_handles_far_camera_noise_before_2000_node_limit():
     assert len(plan.placements) == 4
 
 
-def test_unknown_solver_reports_edge_mismatch_when_no_seam_candidate_exists():
-    """没有任何可用接缝时应明确报告边不匹配，而不是笼统NO_ASSEMBLY。"""
+def test_unknown_solver_reports_edge_graph_empty_when_no_seam_candidate_exists():
+    """没有任何可用接缝时应报告候选边图为空，而不是笼统NO_ASSEMBLY。"""
     pieces = [
         _solver_piece("U1", ((0.0, 0.0), (25.0, 0.0), (0.0, 33.0)), 17.0, (2.0, 3.0)),
         _solver_piece("U2", ((0.0, 0.0), (52.0, 0.0), (0.0, 68.0)), -29.0, (50.0, 4.0)),
@@ -175,11 +175,11 @@ def test_unknown_solver_reports_edge_mismatch_when_no_seam_candidate_exists():
     plan = solve_unknown_layout(pieces, WORK_REGION_MM, SPLIT_Y_MM)
 
     assert plan.success is False
-    assert plan.reason == "edge_mismatch"
+    assert plan.reason == "edge_graph_empty"
 
 
-def test_unknown_solver_reports_size_reject_for_complete_but_too_small_layout():
-    """能沿整边组合但目标尺寸小于题目下限时应明确报告尺寸拒绝。"""
+def test_unknown_solver_reports_layout_size_for_complete_but_too_small_layout():
+    """能沿整边组合但目标尺寸小于题目下限时应报告布局尺寸失败。"""
     pieces = [
         _solver_piece(
             "U1",
@@ -198,11 +198,11 @@ def test_unknown_solver_reports_size_reject_for_complete_but_too_small_layout():
     plan = solve_unknown_layout(pieces, WORK_REGION_MM, SPLIT_Y_MM)
 
     assert plan.success is False
-    assert plan.reason == "size_reject"
+    assert plan.reason == "layout_size"
 
 
-def test_unknown_single_piece_reports_geometry_rejection_instead_of_edge_mismatch():
-    """单片无需寻找接缝，尺寸不合格时必须报告几何原因而不是边不匹配。"""
+def test_unknown_single_piece_reports_layout_size_instead_of_edge_graph_empty():
+    """单片无需寻找接缝，尺寸不合格时必须报告布局尺寸而不是边图为空。"""
     piece = _solver_piece(
         "U1",
         ((0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)),
@@ -213,7 +213,7 @@ def test_unknown_single_piece_reports_geometry_rejection_instead_of_edge_mismatc
     plan = solve_unknown_layout([piece], WORK_REGION_MM, SPLIT_Y_MM)
 
     assert plan.success is False
-    assert plan.reason == "size_reject"
+    assert plan.reason == "layout_size"
 
 
 def test_known_save_registers_lower_layout_and_builds_exact_target_templates():
