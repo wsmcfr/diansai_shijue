@@ -1,0 +1,597 @@
+"""从固定相机画面中单次定位完整黑色A4纸。"""
+
+import cv2
+import numpy as np
+
+try:
+    from maixcam2_app_A_quad.config import DEFAULT_CONFIG
+except ModuleNotFoundError as error:
+    # MaixVision会把发布包平铺到临时目录，只有包本身不存在时才回退同级导入。
+    if error.name != "maixcam2_app_A_quad":
+        raise
+    from config import DEFAULT_CONFIG
+
+
+# 完整A4和龙门架机械覆盖范围都使用毫米。旧常量继续表示竖放纸面，避免已有
+# 离线工具和测试导入时失效；横放纸面的宽高由paper_size_mm统一返回。
+A4_WIDTH_MM = 210.0
+A4_HEIGHT_MM = 297.0
+WORK_HEIGHT_MM = 230.0
+WORK_TRIM_MM = (A4_HEIGHT_MM - WORK_HEIGHT_MM) / 2.0
+MAX_INSET_MM = 20.0
+PAPER_ORIENTATION_PORTRAIT = "portrait"
+PAPER_ORIENTATION_LANDSCAPE = "landscape"
+PAPER_ORIENTATIONS = (
+    PAPER_ORIENTATION_PORTRAIT,
+    PAPER_ORIENTATION_LANDSCAPE,
+)
+
+
+def validate_paper_orientation(paper_orientation):
+    """校验并返回规范化纸张方向字符串。
+
+    关键参数：paper_orientation只接受``portrait``或``landscape``。
+    返回值：小写方向字符串；非法值抛出ValueError，防止错误毫米坐标静默传播。
+    """
+    normalized = str(paper_orientation).strip().lower()
+    if normalized not in PAPER_ORIENTATIONS:
+        raise ValueError("paper_orientation必须是portrait或landscape")
+    return normalized
+
+
+def paper_size_mm(paper_orientation=PAPER_ORIENTATION_PORTRAIT):
+    """按纸张方向返回完整A4纸面的``(宽, 高)``毫米尺寸。"""
+    orientation = validate_paper_orientation(paper_orientation)
+    if orientation == PAPER_ORIENTATION_LANDSCAPE:
+        return A4_HEIGHT_MM, A4_WIDTH_MM
+    return A4_WIDTH_MM, A4_HEIGHT_MM
+
+
+def default_work_region_mm(paper_orientation=PAPER_ORIENTATION_PORTRAIT):
+    """返回当前方向下230×230mm龙门架能覆盖的居中纸面区域。
+
+    竖放时纸宽只有210mm，因此上下各裁33.5mm；横放时纸高只有210mm，因此左右
+    各裁33.5mm。返回值为``(x, y, width, height)``毫米元组。
+    """
+    paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
+    work_width_mm = min(WORK_HEIGHT_MM, paper_width_mm)
+    work_height_mm = min(WORK_HEIGHT_MM, paper_height_mm)
+    return (
+        (paper_width_mm - work_width_mm) / 2.0,
+        (paper_height_mm - work_height_mm) / 2.0,
+        work_width_mm,
+        work_height_mm,
+    )
+
+
+def default_split_y_mm(paper_orientation=PAPER_ORIENTATION_PORTRAIT):
+    """返回当前方向的水平纸面中线Y坐标，作为默认上下区分界线。"""
+    _, paper_height_mm = paper_size_mm(paper_orientation)
+    return paper_height_mm / 2.0
+
+
+def validate_work_region_mm(
+    work_region_mm,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """校验A4纸内的机械工作矩形并返回规范化毫米元组。
+
+    主要流程：读取X/Y/W/H四个有限数字，按纸张方向取得完整纸面宽高，再限制
+    X/Y两个方向均不超过230mm行程。关键参数可为四元素序列。
+    返回值：``(x_mm, y_mm, width_mm, height_mm)``；非法输入抛出ValueError。
+    """
+    try:
+        values = tuple(float(value) for value in work_region_mm)
+    except (TypeError, ValueError) as error:
+        raise ValueError("机械区域必须包含X/Y/W/H四个数字") from error
+    if len(values) != 4 or not np.all(np.isfinite(np.asarray(values))):
+        raise ValueError("机械区域必须包含X/Y/W/H四个有限数字")
+
+    paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
+    maximum_work_width_mm = min(WORK_HEIGHT_MM, paper_width_mm)
+    maximum_work_height_mm = min(WORK_HEIGHT_MM, paper_height_mm)
+    work_x_mm, work_y_mm, work_width_mm, work_height_mm = values
+    if work_x_mm < 0.0:
+        raise ValueError("work_x_mm不能为负数")
+    if work_y_mm < 0.0:
+        raise ValueError("work_y_mm不能为负数")
+    if not 0.0 < work_width_mm <= maximum_work_width_mm:
+        raise ValueError(f"work_width_mm必须位于0到{maximum_work_width_mm:g}之间")
+    if not 0.0 < work_height_mm <= maximum_work_height_mm:
+        raise ValueError(f"work_height_mm必须位于0到{maximum_work_height_mm:g}之间")
+    if work_x_mm + work_width_mm > paper_width_mm + 1e-6:
+        raise ValueError("机械区域X方向必须完整位于A4纸内")
+    if work_y_mm + work_height_mm > paper_height_mm + 1e-6:
+        raise ValueError("机械区域Y方向必须完整位于A4纸内")
+    return values
+
+
+def validate_split_y_mm(
+    work_region_mm,
+    split_y_mm,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """校验毫米分界线必须严格位于机械区域的上、下边之间。"""
+    work_x_mm, work_y_mm, work_width_mm, work_height_mm = validate_work_region_mm(
+        work_region_mm,
+        paper_orientation,
+    )
+    del work_x_mm, work_width_mm
+    try:
+        split_y_mm = float(split_y_mm)
+    except (TypeError, ValueError) as error:
+        raise ValueError("split_y_mm必须是有限数字") from error
+    if not np.isfinite(split_y_mm):
+        raise ValueError("split_y_mm必须是有限数字")
+    if not work_y_mm < split_y_mm < work_y_mm + work_height_mm:
+        raise ValueError("split_y_mm必须位于机械区域内部")
+    return split_y_mm
+
+
+class PaperLocation:
+    """保存一次黑纸定位的完整结果和失败原因。
+
+    成功结果包含按左上、右上、右下、左下排序的完整A4四角；失败结果强制把
+    ``paper_quad`` 和 ``active_quad`` 设为 None，避免调用方误锁定半有效候选。
+    """
+
+    def __init__(
+        self,
+        success,
+        paper_quad=None,
+        active_quad=None,
+        paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+        confidence=0.0,
+        threshold=0.0,
+        reason="",
+    ):
+        """初始化定位结果。
+
+        关键参数：confidence 位于0～1；threshold 为本次Otsu阈值；reason 用于屏幕状态。
+        返回值：构造函数无返回值，输入会规范化后保存为公开属性。
+        """
+        self.success = bool(success)
+        self.paper_quad = (
+            None if paper_quad is None else np.asarray(paper_quad, dtype=np.float32)
+        )
+        self.active_quad = (
+            None if active_quad is None else np.asarray(active_quad, dtype=np.float32)
+        )
+        self.paper_orientation = validate_paper_orientation(paper_orientation)
+        self.confidence = float(max(0.0, min(1.0, confidence)))
+        self.threshold = float(threshold)
+        self.reason = str(reason)
+
+    @classmethod
+    def failed(cls, reason, threshold=0.0, confidence=0.0):
+        """构造不携带任何四角的失败结果，供检测和UI回退分支统一使用。"""
+        return cls(
+            False,
+            paper_quad=None,
+            active_quad=None,
+            confidence=confidence,
+            threshold=threshold,
+            reason=reason,
+        )
+
+
+def _validate_frame(frame_bgr):
+    """校验定位输入必须是非空三通道BGR图像，非法输入直接抛出 ValueError。"""
+    if frame_bgr is None or not isinstance(frame_bgr, np.ndarray):
+        raise ValueError("frame_bgr 必须是有效的 numpy 图像")
+    if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+        raise ValueError("frame_bgr 必须是三通道 BGR 图像")
+    if frame_bgr.shape[0] < 8 or frame_bgr.shape[1] < 8:
+        raise ValueError("frame_bgr 尺寸过小，无法定位A4纸")
+
+
+def order_a4_quad(points):
+    """把四个无序角点规范为左上、右上、右下、左下。
+
+    主要流程：检查有限值和重复点，按点相对中心的极角形成连续凸轮廓，再把左上角
+    旋转到首位。关键参数 points 必须可转换为4×2浮点数组。
+    返回值：4×2 float32 数组；退化、重复或非凸输入抛出 ValueError。
+    """
+    quad = np.asarray(points, dtype=np.float32)
+    if quad.shape != (4, 2) or not np.all(np.isfinite(quad)):
+        raise ValueError("A4四边形必须包含四个有限二维角点")
+    if len(np.unique(quad, axis=0)) != 4:
+        raise ValueError("A4四边形不能包含重复角点")
+
+    center = np.mean(quad, axis=0)
+    angles = np.arctan2(quad[:, 1] - center[1], quad[:, 0] - center[0])
+    ordered = quad[np.argsort(angles)]
+    start_index = int(np.argmin(np.sum(ordered, axis=1)))
+    ordered = np.roll(ordered, -start_index, axis=0).astype(np.float32)
+
+    contour = ordered.reshape(-1, 1, 2)
+    if not cv2.isContourConvex(contour.astype(np.int32)):
+        raise ValueError("A4四边形必须是凸四边形")
+    if abs(float(cv2.contourArea(contour))) <= 1.0:
+        raise ValueError("A4四边形面积过小或已经退化")
+    return ordered
+
+
+def infer_paper_orientation(paper_quad):
+    """根据有序A4两组对边平均像素长度判断横放或竖放。
+
+    主要流程：先统一四角顺序，再分别平均上/下边和左/右边长度；水平组更长返回
+    landscape，否则返回portrait。使用对边均值可减小透视倾斜时远端单边缩短的影响。
+    """
+    ordered_quad = order_a4_quad(paper_quad)
+    edge_lengths = [
+        float(np.linalg.norm(ordered_quad[(index + 1) % 4] - ordered_quad[index]))
+        for index in range(4)
+    ]
+    horizontal_average = (edge_lengths[0] + edge_lengths[2]) * 0.5
+    vertical_average = (edge_lengths[1] + edge_lengths[3]) * 0.5
+    if horizontal_average > vertical_average:
+        return PAPER_ORIENTATION_LANDSCAPE
+    return PAPER_ORIENTATION_PORTRAIT
+
+
+def _physical_to_image_homography(
+    paper_quad,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """构造完整A4毫米平面到相机四边形的单应性矩阵。
+
+    主要流程：规范四角顺序，建立210×297毫米标准平面并求透视矩阵，再检查矩阵
+    是否有限和可逆。返回值：``(矩阵, 有序四角)``；退化输入抛出 ValueError。
+    """
+    ordered_quad = order_a4_quad(paper_quad)
+    paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
+    physical_quad = np.float32(
+        [
+            [0, 0],
+            [paper_width_mm, 0],
+            [paper_width_mm, paper_height_mm],
+            [0, paper_height_mm],
+        ]
+    )
+    matrix = cv2.getPerspectiveTransform(physical_quad, ordered_quad)
+    if not np.all(np.isfinite(matrix)) or abs(float(np.linalg.det(matrix))) <= 1e-9:
+        raise ValueError("A4四边形无法建立有效单应性矩阵")
+    return matrix, ordered_quad
+
+
+def build_active_quad(
+    paper_quad,
+    inset_mm=0.0,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """由完整A4四角生成210×230mm机械有效四边形。
+
+    主要流程：长边上下各裁33.5mm，再把左、右、上、下四边整体内缩 inset_mm，
+    最后通过完整A4单应性映射回相机坐标。inset_mm 允许0～20mm。
+    返回值：按左上、右上、右下、左下排序的4×2 float32相机坐标。
+    """
+    try:
+        inset_mm = float(inset_mm)
+    except (TypeError, ValueError) as error:
+        raise ValueError("inset_mm 必须是0到20之间的数字") from error
+    if not 0.0 <= inset_mm <= MAX_INSET_MM:
+        raise ValueError("inset_mm 必须位于0到20之间")
+
+    orientation = validate_paper_orientation(paper_orientation)
+    matrix, _ = _physical_to_image_homography(paper_quad, orientation)
+    work_x_mm, work_y_mm, work_width_mm, work_height_mm = default_work_region_mm(
+        orientation
+    )
+    active_physical = np.float32(
+        [
+            [work_x_mm + inset_mm, work_y_mm + inset_mm],
+            [work_x_mm + work_width_mm - inset_mm, work_y_mm + inset_mm],
+            [
+                work_x_mm + work_width_mm - inset_mm,
+                work_y_mm + work_height_mm - inset_mm,
+            ],
+            [work_x_mm + inset_mm, work_y_mm + work_height_mm - inset_mm],
+        ]
+    ).reshape(1, 4, 2)
+    active_quad = cv2.perspectiveTransform(active_physical, matrix)[0]
+    if not np.all(np.isfinite(active_quad)):
+        raise ValueError("A4四边形映射出的机械有效区无效")
+    return active_quad.astype(np.float32)
+
+
+def build_work_quad(
+    paper_quad,
+    work_region_mm,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """把X/Y/W/H毫米机械区域通过完整A4单应性映射成相机四边形。
+
+    关键参数：paper_quad为蓝色完整A4四角，work_region_mm为机械区域毫米矩形。
+    返回值：左上、右上、右下、左下顺序的4×2 float32相机坐标。
+    """
+    work_x_mm, work_y_mm, work_width_mm, work_height_mm = validate_work_region_mm(
+        work_region_mm,
+        paper_orientation,
+    )
+    matrix, _ = _physical_to_image_homography(paper_quad, paper_orientation)
+    physical_quad = np.float32(
+        [
+            [work_x_mm, work_y_mm],
+            [work_x_mm + work_width_mm, work_y_mm],
+            [work_x_mm + work_width_mm, work_y_mm + work_height_mm],
+            [work_x_mm, work_y_mm + work_height_mm],
+        ]
+    ).reshape(1, 4, 2)
+    work_quad = cv2.perspectiveTransform(physical_quad, matrix)[0]
+    if not np.all(np.isfinite(work_quad)):
+        raise ValueError("机械区域映射出的相机四边形无效")
+    return work_quad.astype(np.float32)
+
+
+def paper_points_to_image_px(
+    points_mm,
+    paper_quad,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """把一个或多个完整A4毫米点批量映射为相机像素坐标。
+
+    关键参数：points_mm必须能转换为N×2数组；paper_quad为完整A4蓝框。
+    返回值：N×2 float32数组，便于绘制分界线、目标轮廓和机械箭头。
+    """
+    points_array = np.asarray(points_mm, dtype=np.float32)
+    if points_array.ndim != 2 or points_array.shape[1] != 2:
+        raise ValueError("points_mm必须是N×2毫米坐标")
+    if not np.all(np.isfinite(points_array)):
+        raise ValueError("points_mm必须包含有限数字")
+    matrix, _ = _physical_to_image_homography(paper_quad, paper_orientation)
+    mapped = cv2.perspectiveTransform(points_array.reshape(1, -1, 2), matrix)[0]
+    if not np.all(np.isfinite(mapped)):
+        raise ValueError("毫米点无法映射到相机坐标")
+    return mapped.astype(np.float32)
+
+
+def paper_point_to_image_px(
+    point_mm,
+    paper_quad,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """把单个完整A4毫米点映射为相机像素浮点元组。"""
+    mapped = paper_points_to_image_px(
+        [point_mm],
+        paper_quad,
+        paper_orientation,
+    )[0]
+    return float(mapped[0]), float(mapped[1])
+
+
+def build_split_segment(
+    paper_quad,
+    work_region_mm,
+    split_y_mm,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """把机械区域内的水平毫米分界线映射为两个相机端点。"""
+    work_x_mm, _, work_width_mm, _ = validate_work_region_mm(
+        work_region_mm,
+        paper_orientation,
+    )
+    split_y_mm = validate_split_y_mm(
+        work_region_mm,
+        split_y_mm,
+        paper_orientation,
+    )
+    return paper_points_to_image_px(
+        [
+            (work_x_mm, split_y_mm),
+            (work_x_mm + work_width_mm, split_y_mm),
+        ],
+        paper_quad,
+        paper_orientation,
+    )
+
+
+def image_point_to_paper_mm(
+    point,
+    paper_quad,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """把原相机像素点反算为完整A4的毫米坐标。
+
+    关键参数：point 为 ``(x, y)`` 相机坐标；paper_quad 为已锁定完整A4四角。
+    返回值：``(x_mm, y_mm)`` 浮点元组，原点位于完整A4左上角。
+    """
+    _, ordered_quad = _physical_to_image_homography(paper_quad, paper_orientation)
+    paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
+    physical_quad = np.float32(
+        [
+            [0, 0],
+            [paper_width_mm, 0],
+            [paper_width_mm, paper_height_mm],
+            [0, paper_height_mm],
+        ]
+    )
+    inverse_matrix = cv2.getPerspectiveTransform(ordered_quad, physical_quad)
+    point_array = np.asarray(point, dtype=np.float32)
+    if point_array.shape != (2,) or not np.all(np.isfinite(point_array)):
+        raise ValueError("point 必须包含两个有限坐标")
+    mapped = cv2.perspectiveTransform(point_array.reshape(1, 1, 2), inverse_matrix)[0, 0]
+    if not np.all(np.isfinite(mapped)):
+        raise ValueError("相机点无法映射到A4毫米坐标")
+    return float(mapped[0]), float(mapped[1])
+
+
+def image_points_to_paper_mm(
+    points,
+    paper_quad,
+    paper_orientation=PAPER_ORIENTATION_PORTRAIT,
+):
+    """把一个或多个相机像素点批量反算为完整A4毫米坐标。
+
+    主要流程：用完整A4四角构造一次逆单应矩阵并批量透视变换，避免逐顶点重复求矩阵。
+    关键参数：points必须为N×2有限坐标。返回值：N×2 float32毫米数组。
+    """
+    points_array = np.asarray(points, dtype=np.float32)
+    if points_array.ndim != 2 or points_array.shape[1] != 2:
+        raise ValueError("points必须是N×2相机坐标")
+    if not np.all(np.isfinite(points_array)):
+        raise ValueError("points必须包含有限坐标")
+    _, ordered_quad = _physical_to_image_homography(paper_quad, paper_orientation)
+    paper_width_mm, paper_height_mm = paper_size_mm(paper_orientation)
+    physical_quad = np.float32(
+        [
+            [0, 0],
+            [paper_width_mm, 0],
+            [paper_width_mm, paper_height_mm],
+            [0, paper_height_mm],
+        ]
+    )
+    inverse_matrix = cv2.getPerspectiveTransform(ordered_quad, physical_quad)
+    mapped = cv2.perspectiveTransform(points_array.reshape(1, -1, 2), inverse_matrix)[0]
+    if not np.all(np.isfinite(mapped)):
+        raise ValueError("相机点无法批量映射到A4毫米坐标")
+    return mapped.astype(np.float32)
+
+
+def _candidate_quad(hull):
+    """从单个暗色凸包拟合四边形，无法形成稳定四角时返回 None。"""
+    perimeter = float(cv2.arcLength(hull, True))
+    if perimeter <= 1.0:
+        return None
+    approximation = cv2.approxPolyDP(hull, 0.02 * perimeter, True)
+    if len(approximation) != 4:
+        return None
+    try:
+        return order_a4_quad(approximation.reshape(4, 2))
+    except ValueError:
+        return None
+
+
+def _score_candidate(contour, hull, quad, gray, area_ratio, config):
+    """按A4比例、矩形度、凸性、面积与内部暗度计算0～1候选分数。
+
+    权重设计：A4长宽比最能排除龙门架细杆，权重0.42；矩形度0.18；凸性0.10；
+    可见面积0.10；纸内暗度0.20。内部白色碎片只降低暗度项，不改变外轮廓。
+    返回值：``(总分, 矩形度)``，供调用方同时执行硬门槛和候选排序。
+    """
+    edge_lengths = [
+        float(np.linalg.norm(quad[(index + 1) % 4] - quad[index]))
+        for index in range(4)
+    ]
+    opposite_pair_a = (edge_lengths[0] + edge_lengths[2]) * 0.5
+    opposite_pair_b = (edge_lengths[1] + edge_lengths[3]) * 0.5
+    long_side = max(opposite_pair_a, opposite_pair_b)
+    short_side = min(opposite_pair_a, opposite_pair_b)
+    if short_side <= 1.0 or long_side <= 1.0:
+        return 0.0, 0.0
+
+    observed_aspect = short_side / long_side
+    expected_aspect = float(config["paper_expected_aspect"])
+    aspect_score = max(0.0, 1.0 - abs(observed_aspect - expected_aspect) / 0.25)
+
+    min_rect = cv2.minAreaRect(hull)
+    rect_area = float(min_rect[1][0] * min_rect[1][1])
+    contour_area = float(cv2.contourArea(contour))
+    hull_area = float(cv2.contourArea(hull))
+    rectangularity = 0.0 if rect_area <= 1.0 else min(1.0, contour_area / rect_area)
+    convexity = 0.0 if hull_area <= 1.0 else min(1.0, contour_area / hull_area)
+
+    min_area_ratio = float(config["paper_min_area_ratio"])
+    # 面积达到画面8%后给满分，小尺寸纸仍可凭其它几项通过，不强制依赖固定拍摄距离。
+    area_score = float(
+        np.clip((area_ratio - min_area_ratio) / max(0.08 - min_area_ratio, 1e-6), 0, 1)
+    )
+
+    interior_mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.fillConvexPoly(interior_mask, quad.round().astype(np.int32), 255)
+    mean_gray = float(cv2.mean(gray, mask=interior_mask)[0])
+    darkness_score = float(np.clip(1.0 - mean_gray / 255.0, 0.0, 1.0))
+
+    confidence = (
+        0.42 * aspect_score
+        + 0.18 * rectangularity
+        + 0.10 * convexity
+        + 0.10 * area_score
+        + 0.20 * darkness_score
+    )
+    return float(np.clip(confidence, 0.0, 1.0)), rectangularity
+
+
+def locate_black_paper(frame_bgr, config=None):
+    """在整帧中定位最符合黑色A4纸的四边形候选。
+
+    主要流程：灰度与反向Otsu分割、闭运算、外轮廓提取、凸包四角拟合和加权评分。
+    关键参数：config 可覆盖 DEFAULT_CONFIG 中 ``paper_*`` 参数。
+    返回值：成功时返回 PaperLocation 四角与置信度；失败时返回不含四角的失败对象。
+    """
+    _validate_frame(frame_bgr)
+    merged_config = dict(DEFAULT_CONFIG)
+    if config:
+        merged_config.update(config)
+
+    close_kernel_size = int(merged_config["paper_close_kernel"])
+    if close_kernel_size <= 0 or close_kernel_size % 2 == 0:
+        raise ValueError("paper_close_kernel 必须是正奇数")
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    threshold, dark_mask = cv2.threshold(
+        blurred,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (close_kernel_size, close_kernel_size),
+    )
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, close_kernel)
+    contours, _ = cv2.findContours(
+        dark_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    frame_area = float(frame_bgr.shape[0] * frame_bgr.shape[1])
+    min_area_ratio = float(merged_config["paper_min_area_ratio"])
+    max_area_ratio = float(merged_config["paper_max_area_ratio"])
+    best_quad = None
+    best_confidence = 0.0
+
+    for contour in contours:
+        contour_area = float(cv2.contourArea(contour))
+        area_ratio = contour_area / frame_area
+        if not min_area_ratio <= area_ratio <= max_area_ratio:
+            continue
+
+        hull = cv2.convexHull(contour)
+        quad = _candidate_quad(hull)
+        if quad is None:
+            continue
+        confidence, rectangularity = _score_candidate(
+            contour,
+            hull,
+            quad,
+            gray,
+            area_ratio,
+            merged_config,
+        )
+        if rectangularity < float(merged_config["paper_min_rectangularity"]):
+            continue
+        if confidence > best_confidence:
+            best_quad = quad
+            best_confidence = confidence
+
+    min_confidence = float(merged_config["paper_min_confidence"])
+    if best_quad is None:
+        return PaperLocation.failed("no_candidate", threshold=threshold)
+    if best_confidence < min_confidence:
+        return PaperLocation.failed(
+            "low_confidence",
+            threshold=threshold,
+            confidence=best_confidence,
+        )
+    return PaperLocation(
+        True,
+        paper_quad=best_quad,
+        active_quad=None,
+        paper_orientation=infer_paper_orientation(best_quad),
+        confidence=best_confidence,
+        threshold=threshold,
+        reason="ok",
+    )

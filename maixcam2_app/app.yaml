@@ -1,0 +1,16 @@
+files:
+  - __init__.py
+  - app.yaml
+  - calibration_ui.py
+  - config.py
+  - main.py
+  - puzzle_vision.py
+  - settings_store.py
+  - template_store.py
+  - touch_ui.py
+id: diansai_1
+name: diansai
+version: 1.0.0
+author: CFR
+icon: ''
+desc: QQQQ

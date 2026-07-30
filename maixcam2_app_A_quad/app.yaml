@@ -1,0 +1,19 @@
+files:
+  - __init__.py
+  - A版实机调试手册.md
+  - app.yaml
+  - assembly_planner.py
+  - calibration_ui.py
+  - config.py
+  - main.py
+  - paper_locator.py
+  - puzzle_vision.py
+  - settings_store.py
+  - template_store.py
+  - touch_ui.py
+id: diansai_quad
+name: diansai_quad
+version: 1.9.2
+author: CFR
+icon: ''
+desc: MaixCAM2 puzzle recognition with WHITE four-piece fast solver

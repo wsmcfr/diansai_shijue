@@ -1,0 +1,18 @@
+files:
+  - __init__.py
+  - app.yaml
+  - calibration_ui.py
+  - config.py
+  - main.py
+  - paper_locator.py
+  - paper_warp.py
+  - puzzle_vision.py
+  - settings_store.py
+  - template_store.py
+  - touch_ui.py
+id: diansai_warp
+name: diansai_warp
+version: 1.1.0
+author: CFR
+icon: ''
+desc: MaixCAM2 puzzle recognition with perspective paper warp

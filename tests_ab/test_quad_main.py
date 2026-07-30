@@ -1,0 +1,707 @@
+"""验证A版入口构造有效四边形、调用识别并补充毫米中心。"""
+
+import ast
+import inspect
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+
+from maixcam2_app_A_quad.config import DEFAULT_CONFIG
+from maixcam2_app_A_quad.settings_store import build_default_runtime_settings
+from tests_ab.synthetic_paper import (
+    DEFAULT_PAPER_QUAD,
+    make_paper_scene,
+    make_quad_scene_with_four_pieces,
+)
+
+
+def _make_locked_settings(inset_mm=2.0):
+    """构造带合法完整A4四角的A版运行设置。"""
+    settings = build_default_runtime_settings(DEFAULT_CONFIG)
+    settings["paper_quad"] = DEFAULT_PAPER_QUAD.astype(float).tolist()
+    settings["inset_mm"] = float(inset_mm)
+    return settings
+
+
+def _unsupported_draw_calibration_keywords():
+    """找出A版主循环传给调参绘制函数、但函数签名不支持的关键字参数。
+
+    主要流程：解析实际部署入口的AST，定位唯一的 `draw_calibration_frame` 调用，
+    再与实际导入函数的签名逐项比较。返回值是不受支持的关键字名称集合；若目标
+    函数显式接受 `**kwargs`，则返回空集合。
+    """
+    from maixcam2_app_A_quad import calibration_ui, main
+
+    source_path = Path(main.__file__).resolve()
+    syntax_tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    draw_calls = [
+        node
+        for node in ast.walk(syntax_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "draw_calibration_frame"
+    ]
+    assert len(draw_calls) == 1, "A版入口必须且只能调用一次调参绘制函数"
+
+    keyword_names = {
+        keyword.arg for keyword in draw_calls[0].keywords if keyword.arg is not None
+    }
+    signature = inspect.signature(calibration_ui.draw_calibration_frame)
+    accepts_extra_keywords = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_extra_keywords:
+        return set()
+    return keyword_names - set(signature.parameters)
+
+
+def test_quad_calibration_draw_call_only_uses_supported_keywords():
+    """验证A版进入CAL时不会向绘制函数传入其不支持的关键字参数。"""
+    assert _unsupported_draw_calibration_keywords() == set()
+
+
+def test_quad_runtime_builds_active_quad_from_locked_settings():
+    """验证入口只从已锁定完整A4与毫米INSET派生机械有效区。"""
+    from maixcam2_app_A_quad.main import build_runtime_active_quad
+
+    active_quad = build_runtime_active_quad(_make_locked_settings(inset_mm=2.0))
+
+    assert active_quad.shape == (4, 2)
+    assert abs(cv2.contourArea(active_quad)) > 0
+
+
+def test_quad_runtime_returns_none_without_locked_paper():
+    """验证首次启动没有纸张四角时明确回退兼容矩形ROI。"""
+    from maixcam2_app_A_quad.main import build_runtime_active_quad
+
+    settings = build_default_runtime_settings(DEFAULT_CONFIG)
+
+    assert build_runtime_active_quad(settings) is None
+
+
+def test_quad_runtime_builds_landscape_active_quad_from_saved_orientation():
+    """横放设置必须使用297×210mm纸面生成左右裁剪后的机械四边形。"""
+    from maixcam2_app_A_quad import main, paper_locator
+
+    settings = build_default_runtime_settings(DEFAULT_CONFIG)
+    settings.update(
+        {
+            "paper_orientation": "landscape",
+            "paper_quad": [[20, 20], [614, 20], [614, 440], [20, 440]],
+            "work_x_mm": 33.5,
+            "work_y_mm": 0.0,
+            "work_width_mm": 230.0,
+            "work_height_mm": 210.0,
+            "split_y_mm": 105.0,
+        }
+    )
+
+    actual = main.build_runtime_active_quad(settings)
+    expected = paper_locator.build_work_quad(
+        settings["paper_quad"],
+        (33.5, 0.0, 230.0, 210.0),
+        paper_orientation="landscape",
+    )
+
+    np.testing.assert_allclose(actual, expected, atol=0.01)
+
+
+def test_auto_roi_debug_log_reports_orientation_confidence_and_edges(capsys):
+    """AUTO ROI调试日志必须显示H/V、置信度、阈值和四边像素长度。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.paper_locator import PaperLocation
+
+    location = PaperLocation(
+        True,
+        paper_quad=np.float32(((20, 30), (620, 45), (600, 440), (30, 430))),
+        active_quad=np.float32(((40, 50), (600, 60), (580, 420), (50, 410))),
+        paper_orientation="landscape",
+        confidence=0.82,
+        threshold=73.0,
+    )
+
+    main.log_auto_roi_diagnostics(location, debug_enabled=True)
+
+    output = capsys.readouterr().out
+    assert "[ROI] AUTO result=OK" in output
+    assert "orientation=H" in output
+    assert "confidence=82%" in output
+    assert "threshold=73.0" in output
+    assert "edges_px=[" in output
+    assert output.count(",") >= 3
+
+
+def test_auto_roi_debug_switch_disables_output(capsys):
+    """共用调试开关关闭时AUTO ROI不得输出控制台日志。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.paper_locator import PaperLocation
+
+    main.log_auto_roi_diagnostics(
+        PaperLocation.failed("paper_not_found", threshold=65.0),
+        debug_enabled=False,
+    )
+
+    assert "[ROI]" not in capsys.readouterr().out
+
+
+def test_quad_analysis_detects_four_pieces_and_adds_paper_mm_centers():
+    """验证A版单帧数据流保留相机中心并额外输出完整A4毫米中心。"""
+    from maixcam2_app_A_quad.main import analyze_quad_frame
+
+    frame, paper_quad, _active_quad = make_quad_scene_with_four_pieces(inset_mm=0.0)
+    settings = _make_locked_settings(inset_mm=0.0)
+    settings["paper_quad"] = paper_quad.astype(float).tolist()
+
+    analysis = analyze_quad_frame(frame, settings)
+
+    assert len(analysis.detection.pieces) == 4
+    assert analysis.active_quad.shape == (4, 2)
+    assert all("center_mm" in piece for piece in analysis.detection.pieces)
+    assert all(0.0 < piece["center_mm"][0] < 210.0 for piece in analysis.detection.pieces)
+    assert all(33.5 < piece["center_mm"][1] < 263.5 for piece in analysis.detection.pieces)
+
+
+def test_quad_analysis_maps_landscape_piece_to_297_by_210_mm_plane():
+    """横放识别出的相机轮廓必须反算到297×210mm纸面，而不是交换长宽。"""
+    from maixcam2_app_A_quad.main import analyze_quad_frame
+
+    paper_quad = np.float32([[60, 90], [580, 80], [550, 390], [90, 400]])
+    physical_quad = np.float32([[0, 0], [297, 0], [297, 210], [0, 210]])
+    matrix = cv2.getPerspectiveTransform(physical_quad, paper_quad)
+    piece_mm = np.float32([[[205, 45], [250, 45], [250, 90], [205, 90]]])
+    piece_px = cv2.perspectiveTransform(piece_mm, matrix)[0]
+    frame = make_paper_scene(paper_quad, white_pieces=(piece_px,))
+    settings = build_default_runtime_settings(DEFAULT_CONFIG)
+    settings.update(
+        {
+            "paper_orientation": "landscape",
+            "paper_quad": paper_quad.astype(float).tolist(),
+            "work_x_mm": 33.5,
+            "work_y_mm": 0.0,
+            "work_width_mm": 230.0,
+            "work_height_mm": 210.0,
+            "split_y_mm": 105.0,
+        }
+    )
+
+    analysis = analyze_quad_frame(frame, settings)
+
+    assert len(analysis.detection.pieces) == 1
+    center_mm = analysis.detection.pieces[0]["center_mm"]
+    assert center_mm == pytest.approx((227.5, 67.5), abs=1.5)
+    assert analysis.detection.pieces[0]["region"] == "upper"
+
+
+def test_quad_analysis_uses_compatibility_roi_when_paper_is_not_locked():
+    """验证无四角回退仍可运行旧矩形识别且不会伪造毫米坐标。"""
+    from maixcam2_app_A_quad.main import analyze_quad_frame
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    settings = build_default_runtime_settings(DEFAULT_CONFIG)
+    settings["roi"] = [20, 30, 500, 400]
+
+    analysis = analyze_quad_frame(frame, settings)
+
+    assert analysis.active_quad is None
+    assert analysis.roi == (20, 30, 500, 400)
+    assert analysis.detection.roi == analysis.roi
+
+
+def test_camera_open_prefers_high_resolution_and_reports_fallback():
+    """相机辅助接口必须优先1280x960，失败时明确回退640x480。"""
+    from maixcam2_app_A_quad.main import create_camera_with_fallback
+
+    class FakeCameraModule:
+        """记录构造参数并可选择让高分辨率构造失败。"""
+
+        def __init__(self, fail_high=False):
+            self.fail_high = bool(fail_high)
+            self.calls = []
+
+        def Camera(self, width, height, image_format):
+            """模拟Maix camera.Camera并返回构造参数。"""
+            self.calls.append((width, height, image_format))
+            if self.fail_high and (width, height) == (1280, 960):
+                raise RuntimeError("unsupported")
+            return {"width": width, "height": height}
+
+    normal_module = FakeCameraModule()
+    normal_camera, normal_size, normal_fallback = create_camera_with_fallback(
+        normal_module,
+        "BGR",
+        DEFAULT_CONFIG,
+    )
+    fallback_module = FakeCameraModule(fail_high=True)
+    fallback_camera, fallback_size, fallback_used = create_camera_with_fallback(
+        fallback_module,
+        "BGR",
+        DEFAULT_CONFIG,
+    )
+
+    assert normal_camera == {"width": 1280, "height": 960}
+    assert normal_size == (1280, 960)
+    assert normal_fallback is False
+    assert fallback_camera == {"width": 640, "height": 480}
+    assert fallback_size == (640, 480)
+    assert fallback_used is True
+
+
+def test_runtime_overlay_scales_high_resolution_frame_to_display_size():
+    """运行叠加必须缩放几何并固定输出640x480，不能修改1280x960输入。"""
+    from maixcam2_app_A_quad.main import draw_overlay
+    from maixcam2_app_A_quad.touch_ui import build_button_layout
+
+    frame = np.zeros((960, 1280, 3), dtype=np.uint8)
+    original = frame.copy()
+    piece = {
+        "id": "U1",
+        "complete": True,
+        "contour": np.asarray([[[300, 300]], [[600, 300]], [[600, 600]], [[300, 600]]]),
+        "vertices": [[300, 300], [600, 300], [600, 600], [300, 600]],
+        "center": (450.0, 450.0),
+        "angle_deg": 0.0,
+    }
+
+    output = draw_overlay(
+        frame,
+        [piece],
+        (0, 0, 1280, 960),
+        build_button_layout(640, 480),
+        "unknown",
+        108.0,
+        "READY",
+        display_size=(640, 480),
+    )
+
+    assert output.shape == (480, 640, 3)
+    assert np.array_equal(frame, original)
+    assert np.count_nonzero(output) > 0
+
+
+@pytest.mark.parametrize(
+    ("paper_orientation", "expected_content_roi"),
+    (
+        ("portrait", (150, 0, 339, 480)),
+        ("landscape", (0, 13, 640, 453)),
+    ),
+)
+def test_paper_display_canvas_preserves_a4_aspect_and_hides_outside_scene(
+    paper_orientation,
+    expected_content_roi,
+):
+    """正常纸面视图只能显示四角内部，并按横竖A4真实比例居中填充黑边。"""
+    from maixcam2_app_A_quad.main import build_paper_display_canvas
+
+    paper_quad = np.float32([[120, 60], [520, 40], [550, 420], [90, 430]])
+    frame = np.full((480, 640, 3), 240, dtype=np.uint8)
+    paper_color = (25, 45, 65)
+    cv2.fillConvexPoly(frame, np.rint(paper_quad).astype(np.int32), paper_color)
+
+    canvas, display_transform, content_roi = build_paper_display_canvas(
+        frame,
+        paper_quad,
+        paper_orientation=paper_orientation,
+        canvas_size=(640, 480),
+    )
+
+    assert canvas.shape == (480, 640, 3)
+    assert content_roi == expected_content_roi
+    content_x, content_y, content_width, content_height = content_roi
+    # 内容矩形以外必须完全为黑色，不能从纸张四角之外采到亮地面或龙门架。
+    outside_mask = np.full(canvas.shape[:2], 255, dtype=np.uint8)
+    outside_mask[
+        content_y : content_y + content_height,
+        content_x : content_x + content_width,
+    ] = 0
+    assert np.count_nonzero(canvas[outside_mask > 0]) == 0
+    center_pixel = canvas[
+        content_y + content_height // 2,
+        content_x + content_width // 2,
+    ]
+    np.testing.assert_allclose(center_pixel, paper_color, atol=2)
+
+    mapped_quad = cv2.perspectiveTransform(
+        paper_quad.reshape(1, -1, 2),
+        display_transform,
+    )[0]
+    expected_quad = np.float32(
+        [
+            [content_x, content_y],
+            [content_x + content_width - 1, content_y],
+            [content_x + content_width - 1, content_y + content_height - 1],
+            [content_x, content_y + content_height - 1],
+        ]
+    )
+    np.testing.assert_allclose(mapped_quad, expected_quad, atol=0.1)
+
+
+def test_paper_display_canvas_normalizes_cyclic_and_reversed_quad_order():
+    """显示Homography必须与毫米链同样规范四角，保存顺序变化不能旋转或镜像画面。"""
+    from maixcam2_app_A_quad.main import build_paper_display_canvas
+
+    paper_quad = np.float32([[120, 60], [520, 40], [550, 420], [90, 430]])
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    # 四个不同角使用不同颜色，单纯黑纸无法发现循环移位或反向顺序造成的旋转镜像。
+    for point, color in zip(
+        paper_quad,
+        ((0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)),
+    ):
+        cv2.circle(frame, tuple(np.rint(point).astype(int)), 24, color, -1)
+    cv2.fillConvexPoly(
+        frame,
+        np.rint(paper_quad).astype(np.int32),
+        (35, 45, 55),
+    )
+    # 在四角内部重新放置颜色标记，避免fillConvexPoly覆盖测试方向特征。
+    center = np.mean(paper_quad, axis=0)
+    for point, color in zip(
+        paper_quad,
+        ((0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)),
+    ):
+        inner = point * 0.86 + center * 0.14
+        cv2.circle(frame, tuple(np.rint(inner).astype(int)), 14, color, -1)
+
+    baseline, _, baseline_roi = build_paper_display_canvas(
+        frame,
+        paper_quad,
+        paper_orientation="portrait",
+    )
+    variants = (
+        np.roll(paper_quad, 1, axis=0),
+        paper_quad[::-1].copy(),
+        np.roll(paper_quad[::-1], 2, axis=0),
+    )
+
+    for variant in variants:
+        actual, _, actual_roi = build_paper_display_canvas(
+            frame,
+            variant,
+            paper_orientation="portrait",
+        )
+        assert actual_roi == baseline_roi
+        assert np.array_equal(actual, baseline)
+
+
+def test_runtime_overlay_uses_paper_only_canvas_after_roi_is_locked():
+    """已有A4四角时正常叠加不能继续缩放整幅相机画面显示纸外内容。"""
+    from maixcam2_app_A_quad.main import draw_overlay
+    from maixcam2_app_A_quad.touch_ui import build_button_layout
+
+    paper_quad = np.float32([[120, 60], [520, 40], [550, 420], [90, 430]])
+    frame = np.full((480, 640, 3), 220, dtype=np.uint8)
+    cv2.fillConvexPoly(frame, np.rint(paper_quad).astype(np.int32), (20, 30, 40))
+
+    output = draw_overlay(
+        frame,
+        [],
+        (90, 40, 461, 391),
+        build_button_layout(640, 480),
+        "unknown",
+        108.0,
+        "READY",
+        paper_quad=paper_quad,
+        active_quad=paper_quad,
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        display_size=(640, 480),
+        paper_orientation="portrait",
+    )
+
+    # 竖放A4左右黑边中部没有按钮或状态栏，必须看不到原相机的亮色纸外背景。
+    assert np.all(output[220, 20] == 0)
+    assert np.all(output[220, 620] == 0)
+    assert np.any(output[220, 320] != 0)
+
+
+def test_unknown_profile_toggle_cycles_white_and_card():
+    """UNKNOWN子模式必须默认支持WHITE，并在每次点击后与CARD互相切换。"""
+    from maixcam2_app_A_quad.main import (
+        UNKNOWN_PROFILE_CARD,
+        UNKNOWN_PROFILE_WHITE,
+        toggle_unknown_profile,
+    )
+
+    assert toggle_unknown_profile(UNKNOWN_PROFILE_WHITE) == UNKNOWN_PROFILE_CARD
+    assert toggle_unknown_profile(UNKNOWN_PROFILE_CARD) == UNKNOWN_PROFILE_WHITE
+
+
+def test_select_capture_mode_resets_even_when_current_mode_is_clicked_again():
+    """重复选择当前模式也必须释放旧快照，并保持完全待机等待START。"""
+    from maixcam2_app_A_quad.main import (
+        MODE_UNKNOWN,
+        select_capture_mode,
+    )
+
+    class RecordingRuntime:
+        """记录模式动作是否无条件调用运行器reset。"""
+
+        def __init__(self):
+            """初始化重置次数。"""
+            self.reset_count = 0
+
+        def reset(self):
+            """模拟释放已有锁定快照。"""
+            self.reset_count += 1
+
+    runtime = RecordingRuntime()
+
+    mode, capture_armed, status = select_capture_mode(
+        MODE_UNKNOWN,
+        runtime,
+    )
+    same_mode, same_capture_armed, same_status = select_capture_mode(
+        MODE_UNKNOWN,
+        runtime,
+    )
+
+    assert mode == MODE_UNKNOWN
+    assert same_mode == MODE_UNKNOWN
+    assert capture_armed is False
+    assert same_capture_armed is False
+    assert status == "PRESS START"
+    assert same_status == status
+    assert runtime.reset_count == 2
+
+
+def test_select_display_pieces_prefers_locked_snapshot_over_live_jitter():
+    """求解开始后正常叠加必须画锁定轮廓，不能继续显示不断跳动的实时顶点。"""
+    from maixcam2_app_A_quad.main import select_display_pieces
+
+    locked = ({"id": "U1", "center": (80.0, 80.0)},)
+
+    class LockedRuntime:
+        """提供正常界面选择绘制数据所需的最小运行器接口。"""
+
+        snapshot_locked = True
+        locked_pieces = locked
+
+    live = [{"id": "U1", "center": (150.0, 100.0)}]
+
+    assert select_display_pieces(live, LockedRuntime()) is locked
+
+
+@pytest.mark.parametrize(
+    (
+        "is_calibrating",
+        "capture_armed",
+        "snapshot_locked",
+        "has_cached_detection",
+        "expected",
+    ),
+    (
+        (False, False, False, False, False),
+        (False, True, False, False, True),
+        (False, True, True, True, False),
+        (False, True, True, False, True),
+        (True, False, True, True, True),
+    ),
+)
+def test_should_analyze_live_frame_stops_detection_only_after_snapshot_lock(
+    is_calibrating,
+    capture_armed,
+    snapshot_locked,
+    has_cached_detection,
+    expected,
+):
+    """正常页还要经过START门；CAL和START后的缺失缓存仍必须分析当前帧。"""
+    from maixcam2_app_A_quad.main import should_analyze_live_frame
+
+    actual = should_analyze_live_frame(
+        is_calibrating=is_calibrating,
+        capture_armed=capture_armed,
+        snapshot_locked=snapshot_locked,
+        has_cached_detection=has_cached_detection,
+    )
+
+    assert actual is expected
+
+
+def test_run_app_wires_locked_display_pieces_and_start_action():
+    """设备入口必须接入锁定轮廓、START动作和带确认状态的分析门。"""
+    from maixcam2_app_A_quad import main
+
+    syntax_tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8"))
+    run_function = next(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_app"
+    )
+    calls = [node for node in ast.walk(run_function) if isinstance(node, ast.Call)]
+    start_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "start_capture"
+    ]
+    display_selection_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "select_display_pieces"
+    ]
+    analysis_gate_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name)
+        and node.func.id == "should_analyze_live_frame"
+    ]
+    overlay_call = next(
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "draw_overlay"
+    )
+
+    assert len(start_calls) == 1
+    assert len(display_selection_calls) == 1
+    assert len(analysis_gate_calls) == 1
+    assert any(
+        keyword.arg == "capture_armed"
+        for keyword in analysis_gate_calls[0].keywords
+    )
+    assert isinstance(overlay_call.args[1], ast.Name)
+    assert overlay_call.args[1].id == "display_pieces"
+
+
+def test_runtime_overlay_uses_white_card_button_in_unknown_and_save_in_known(
+    monkeypatch,
+):
+    """第三按钮在UNKNOWN显示当前子模式，切回KNOWN后必须恢复SAVE文字。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.touch_ui import build_button_layout
+
+    rendered_labels = []
+    original_put_text = main.cv2.putText
+
+    def record_put_text(image, text, *args, **kwargs):
+        """记录OpenCV实际收到的文字，同时保留原绘制行为供输出图像正常生成。"""
+        rendered_labels.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(main.cv2, "putText", record_put_text)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    buttons = build_button_layout(640, 480)
+
+    main.draw_overlay(
+        frame,
+        [],
+        (0, 0, 640, 480),
+        buttons,
+        main.MODE_UNKNOWN,
+        108.0,
+        "READY",
+        unknown_profile=main.UNKNOWN_PROFILE_CARD,
+    )
+    assert "CARD" in rendered_labels
+    assert "SAVE" not in rendered_labels
+
+    rendered_labels.clear()
+    main.draw_overlay(
+        frame,
+        [],
+        (0, 0, 640, 480),
+        buttons,
+        main.MODE_KNOWN,
+        108.0,
+        "READY",
+        unknown_profile=main.UNKNOWN_PROFILE_CARD,
+    )
+    assert "SAVE" in rendered_labels
+    assert "CARD" not in rendered_labels
+
+
+def test_run_app_wires_unknown_profile_to_runtime_overlay_and_toggle():
+    """设备入口必须把子模式同时接入求解上下文、按钮绘制和SAVE触摸切换。"""
+    from maixcam2_app_A_quad import main
+
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    syntax_tree = ast.parse(source)
+    run_function = next(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run_app"
+    )
+    calls = [node for node in ast.walk(run_function) if isinstance(node, ast.Call)]
+    toggle_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name)
+        and node.func.id == "toggle_unknown_profile"
+    ]
+    runtime_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "planner_runtime"
+    ]
+    overlay_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "draw_overlay"
+    ]
+
+    assert len(toggle_calls) == 1
+    assert len(runtime_calls) == 1
+    assert any(keyword.arg == "unknown_profile" for keyword in runtime_calls[0].keywords)
+    assert len(overlay_calls) == 1
+    assert any(keyword.arg == "unknown_profile" for keyword in overlay_calls[0].keywords)
+
+
+def test_run_app_passes_saved_paper_orientation_to_runtime_overlay():
+    """设备主循环必须把V5方向传给正常界面，确保红线和规划目标按同一纸面回绘。"""
+    from maixcam2_app_A_quad import main
+
+    syntax_tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8"))
+    run_function = next(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_app"
+    )
+    overlay_call = next(
+        node
+        for node in ast.walk(run_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "draw_overlay"
+    )
+    orientation_keyword = next(
+        (item for item in overlay_call.keywords if item.arg == "paper_orientation"),
+        None,
+    )
+
+    assert orientation_keyword is not None
+
+
+def test_run_app_known_save_uses_direct_registration_without_job_start():
+    """实机SAVE必须调用带START门的同步入口，不能启动旧登记任务控制器。"""
+    from maixcam2_app_A_quad import main
+
+    syntax_tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8"))
+    run_function = next(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run_app"
+    )
+    gated_calls = [
+        node
+        for node in ast.walk(run_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "perform_known_save_request"
+    ]
+    old_job_starts = [
+        node
+        for node in ast.walk(run_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "start"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "known_save_controller"
+    ]
+
+    assert len(gated_calls) == 1
+    assert old_job_starts == []

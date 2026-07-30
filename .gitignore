@@ -1,0 +1,22 @@
+# Python解释器和测试运行产生的缓存，不进入版本库。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地虚拟环境由开发机重建，不上传依赖副本。
+.venv/
+venv/
+
+# PDF渲染、截图复盘等一次性诊断文件保留在本机。
+tmp/
+
+# 功能分支使用本地worktree隔离，禁止递归提交工作树内容。
+.worktrees/
+worktrees/
+
+# 编辑器和操作系统临时文件。
+.DS_Store
+Thumbs.db
+*.log
