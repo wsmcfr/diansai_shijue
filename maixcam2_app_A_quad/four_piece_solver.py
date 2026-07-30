@@ -8,11 +8,13 @@ import numpy as np
 
 try:
     from maixcam2_app_A_quad.assembly_planner import AssemblyPlacement, AssemblyPlan
+    from maixcam2_app_A_quad.four_piece_vision import FourPieceVisionRuntime
 except ModuleNotFoundError as error:
     # MaixVision平铺部署时顶层包不存在，四片求解器仍复用同级兼容结果结构。
     if error.name != "maixcam2_app_A_quad":
         raise
     from assembly_planner import AssemblyPlacement, AssemblyPlan
+    from four_piece_vision import FourPieceVisionRuntime
 
 
 # ======================== FOUR求解调试常量（不影响1～3片） ========================
@@ -1048,3 +1050,154 @@ def solve_four_piece_layout(
         active_budget_seconds=active_budget_seconds,
     )
     return job.run_to_completion()
+
+
+class FourPieceRuntime:
+    """组合FOUR视觉稳定门和增量求解任务，供设备主循环逐帧调用。"""
+
+    def __init__(
+        self,
+        vision_runtime=None,
+        beam_width=FOUR_BEAM_WIDTH,
+        active_budget_seconds=FOUR_ACTIVE_BUDGET_SECONDS,
+        solver_time_budget_ms=24.0,
+        solver_work_unit_limit=64,
+    ):
+        """初始化独立视觉运行器和求解时间片参数并进入完全待机。
+
+        vision_runtime允许测试或回放注入兼容对象；设备默认创建FourPieceVisionRuntime。
+        关键参数beam和活动预算只影响FOUR求解器。构造函数不启动视觉或搜索。
+        """
+        self.vision_runtime = (
+            FourPieceVisionRuntime() if vision_runtime is None else vision_runtime
+        )
+        if not callable(getattr(self.vision_runtime, "update", None)) or not callable(
+            getattr(self.vision_runtime, "reset", None)
+        ):
+            raise ValueError("vision_runtime必须提供update和reset方法")
+        self.beam_width = int(beam_width)
+        self.active_budget_seconds = float(active_budget_seconds)
+        self.solver_time_budget_ms = float(solver_time_budget_ms)
+        self.solver_work_unit_limit = int(solver_work_unit_limit)
+        if self.beam_width < 1:
+            raise ValueError("beam_width必须至少为1")
+        if self.active_budget_seconds <= 0.0:
+            raise ValueError("active_budget_seconds必须大于零")
+        if self.solver_time_budget_ms <= 0.0 or self.solver_work_unit_limit < 1:
+            raise ValueError("FOUR单帧求解预算无效")
+        self.reset(propagate=False)
+
+    def reset(self, propagate=True):
+        """取消本轮求解、清空计划，并按需把复位传播到视觉稳定门。
+
+        设备模式/CAL/START调用默认传播；构造函数使用propagate=False避免把外部注入
+        运行器的初始化状态误记为一次用户复位。
+        """
+        if propagate:
+            self.vision_runtime.reset()
+        self.solve_job = None
+        self.plan = None
+        self.solve_start_count = 0
+
+    @property
+    def stable_count(self):
+        """返回视觉运行器当前连续稳定帧数。"""
+        return int(getattr(self.vision_runtime, "stable_count", 0))
+
+    @property
+    def stable_frames(self):
+        """返回视觉运行器要求的稳定帧总数。"""
+        return int(getattr(self.vision_runtime, "stable_frames", 3))
+
+    @property
+    def snapshot_locked(self):
+        """返回本轮是否已经冻结四片视觉快照。"""
+        return bool(getattr(self.vision_runtime, "snapshot_locked", False))
+
+    @property
+    def locked_pieces(self):
+        """返回冻结四片元组；未锁定时为空元组。"""
+        return getattr(self.vision_runtime, "locked_pieces", ())
+
+    @property
+    def last_detection(self):
+        """返回最近实时或锁定的FOUR检测结果。"""
+        return getattr(self.vision_runtime, "last_detection", None)
+
+    @property
+    def is_solving(self):
+        """返回是否存在尚未完成的四片专用求解任务。"""
+        return self.solve_job is not None and not self.solve_job.done and self.plan is None
+
+    @property
+    def search_nodes(self):
+        """返回专用求解器已经检查的候选工作单元数。"""
+        return 0 if self.solve_job is None else int(self.solve_job.search_nodes)
+
+    @property
+    def stage(self):
+        """返回DETECTING、SOLVING、DONE或IDLE，供正常页状态显示。"""
+        if self.plan is not None:
+            return "done"
+        if self.is_solving:
+            return str(self.solve_job.stage)
+        if self.snapshot_locked:
+            return "locked"
+        if self.last_detection is not None:
+            return "detecting"
+        return "idle"
+
+    def update(
+        self,
+        frame_bgr,
+        paper_quad,
+        paper_orientation,
+        work_region_mm,
+        split_y_mm,
+        time_budget_ms=None,
+        work_unit_limit=None,
+    ):
+        """推进一次FOUR视觉或求解时间片并返回当前完成计划。
+
+        主要流程：已有成功或失败计划时直接返回；已有求解任务时只advance；否则调用
+        视觉运行器，锁定后恰好创建一次FourPieceSolveJob且本帧不继续重算视觉。
+        返回None表示仍在检测/求解，返回AssemblyPlan表示本轮已永久结束。
+        """
+        if self.plan is not None:
+            return self.plan
+        if self.solve_job is not None:
+            result = self.solve_job.advance(
+                time_budget_ms=(
+                    self.solver_time_budget_ms
+                    if time_budget_ms is None
+                    else float(time_budget_ms)
+                ),
+                work_unit_limit=(
+                    self.solver_work_unit_limit
+                    if work_unit_limit is None
+                    else int(work_unit_limit)
+                ),
+            )
+            if result is not None:
+                self.plan = result
+            return self.plan
+
+        detection = self.vision_runtime.update(
+            frame_bgr,
+            paper_quad,
+            paper_orientation,
+            split_y_mm=split_y_mm,
+        )
+        if not bool(getattr(detection, "locked", False)):
+            return None
+        self.solve_job = FourPieceSolveJob(
+            self.locked_pieces,
+            work_region_mm,
+            split_y_mm,
+            beam_width=self.beam_width,
+            active_budget_seconds=self.active_budget_seconds,
+        )
+        self.solve_start_count += 1
+        if self.solve_job.done:
+            self.plan = self.solve_job.result
+        return self.plan

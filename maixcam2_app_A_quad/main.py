@@ -36,6 +36,7 @@ try:
         PERSISTENT_SETTINGS_PATH,
         PERSISTENT_TEMPLATE_PATH,
     )
+    from maixcam2_app_A_quad.four_piece_solver import FourPieceRuntime
     from maixcam2_app_A_quad.paper_locator import (
         PAPER_ORIENTATION_PORTRAIT,
         build_work_quad,
@@ -100,6 +101,7 @@ except ModuleNotFoundError as error:
         evaluate_calibration_measurement,
     )
     from config import DEFAULT_CONFIG, PERSISTENT_SETTINGS_PATH, PERSISTENT_TEMPLATE_PATH
+    from four_piece_solver import FourPieceRuntime
     from paper_locator import (
         PAPER_ORIENTATION_PORTRAIT,
         build_work_quad,
@@ -205,6 +207,20 @@ def _validate_capture_runtime(planner_runtime):
         raise ValueError("planner_runtime必须提供reset方法")
 
 
+def _reset_capture_runtimes(planner_runtime, four_runtime=None):
+    """同时复位旧拼图运行器和可选FOUR运行器，确保模式之间没有共享快照。
+
+    关键参数planner_runtime始终必需；four_runtime为None时保持旧测试和离线调用兼容。
+    两个对象都必须提供reset方法。返回值为None。
+    """
+    _validate_capture_runtime(planner_runtime)
+    planner_runtime.reset()
+    if four_runtime is None:
+        return
+    _validate_capture_runtime(four_runtime)
+    four_runtime.reset()
+
+
 def _normalize_capture_mode(requested_mode):
     """把外部模式值规范为known、unknown或four，并拒绝未定义模式。
 
@@ -245,7 +261,12 @@ def _reset_serial_result_context(serial_runtime):
     reset_context()
 
 
-def select_capture_mode(requested_mode, planner_runtime, serial_runtime=None):
+def select_capture_mode(
+    requested_mode,
+    planner_runtime,
+    serial_runtime=None,
+    four_runtime=None,
+):
     """选择KNOWN或UNKNOWN，并把正常页恢复为完全待机。
 
     主要流程：校验模式与运行器，释放旧稳定计数、锁定快照、求解任务和规划缓存；只
@@ -254,8 +275,7 @@ def select_capture_mode(requested_mode, planner_runtime, serial_runtime=None):
     ``(规范模式, False, "PRESS START")``，其中False可直接写回主循环capture_armed。
     """
     mode = _normalize_capture_mode(requested_mode)
-    _validate_capture_runtime(planner_runtime)
-    planner_runtime.reset()
+    _reset_capture_runtimes(planner_runtime, four_runtime=four_runtime)
     _reset_serial_result_context(serial_runtime)
     return mode, False, "PRESS START"
 
@@ -265,6 +285,7 @@ def start_capture(
     planner_runtime,
     unknown_profile=UNKNOWN_PROFILE_WHITE,
     serial_runtime=None,
+    four_runtime=None,
 ):
     """确认当前选择并开始一次全新的稳定快照采集。
 
@@ -274,9 +295,7 @@ def start_capture(
     用于提示本轮实际采用的模式和材料。
     """
     normalized_mode = _normalize_capture_mode(mode)
-    _validate_capture_runtime(planner_runtime)
-
-    planner_runtime.reset()
+    _reset_capture_runtimes(planner_runtime, four_runtime=four_runtime)
     _reset_serial_result_context(serial_runtime)
     if normalized_mode == MODE_KNOWN:
         return True, "KNOWN CAPTURE"
@@ -286,6 +305,20 @@ def start_capture(
     if profile not in (UNKNOWN_PROFILE_WHITE, UNKNOWN_PROFILE_CARD):
         raise ValueError("UNKNOWN子模式必须是white或card")
     return True, f"UNKNOWN {profile.upper()} CAPTURE"
+
+
+def select_capture_runtime(mode, planner_runtime, four_runtime):
+    """按内部模式返回本帧状态、显示和心跳应读取的唯一运行器。
+
+    FOUR只选择专用运行器；KNOWN和普通UNKNOWN继续选择原AssemblyRuntime。两个运行器
+    均不能为空，非法模式通过统一规范函数拒绝。返回值为传入对象本身。
+    """
+    normalized_mode = _normalize_capture_mode(mode)
+    if planner_runtime is None or four_runtime is None:
+        raise ValueError("旧运行器和FOUR运行器均不能为空")
+    if normalized_mode == MODE_FOUR:
+        return four_runtime
+    return planner_runtime
 
 
 def queue_successful_plan_result(
@@ -1375,6 +1408,8 @@ def run_app():
     interface_state = InterfaceState()
     # 固定机位仍要求连续3帧；中心容差放宽到3mm以容纳远距离轮廓量化抖动。
     planner_runtime = AssemblyRuntime(stable_frames=3, position_tolerance_mm=3.0)
+    # FOUR拥有独立视觉稳定门和增量求解任务，不共享旧UNKNOWN的计数、快照或FALLBACK。
+    four_runtime = FourPieceRuntime()
     # 构造函数不打开硬件；第一次poll才配置A21/A22并尝试打开UART4，因此串口故障
     # 不会阻止相机和显示初始化。
     serial_runtime = VisionSerialRuntime(create_maix_uart4)
@@ -1415,11 +1450,16 @@ def run_app():
 
         # 每帧只推进一次非阻塞UART状态机；完整状态码让F4区分待机、调参、采集、
         # 求解和结果就绪，同时不改变相机主循环的非阻塞顺序。
+        active_capture_runtime = select_capture_runtime(
+            mode,
+            planner_runtime,
+            four_runtime,
+        )
         serial_app_state = select_serial_app_state(
             interface_state.is_calibrating,
             capture_armed,
-            planner_runtime,
-            planner_runtime.plan,
+            active_capture_runtime,
+            active_capture_runtime.plan,
         )
         serial_runtime.poll(app_state=serial_app_state)
 
@@ -1431,14 +1471,54 @@ def run_app():
         roi = tuple(int(value) for value in active_settings["roi"])
         paper_quad = active_settings.get("paper_quad")
         active_quad = None
-
-        analyze_current_frame = should_analyze_live_frame(
-            is_calibrating=interface_state.is_calibrating,
-            capture_armed=capture_armed,
-            snapshot_locked=planner_runtime.snapshot_locked,
-            has_cached_detection=detection is not None,
+        work_region_mm = (
+            runtime_settings["work_x_mm"],
+            runtime_settings["work_y_mm"],
+            runtime_settings["work_width_mm"],
+            runtime_settings["work_height_mm"],
         )
-        if analyze_current_frame:
+
+        uses_four_pipeline = not interface_state.is_calibrating and mode == MODE_FOUR
+        analyze_current_frame = False
+        if not uses_four_pipeline:
+            analyze_current_frame = should_analyze_live_frame(
+                is_calibrating=interface_state.is_calibrating,
+                capture_armed=capture_armed,
+                snapshot_locked=planner_runtime.snapshot_locked,
+                has_cached_detection=detection is not None,
+            )
+        if uses_four_pipeline:
+            # FOUR每帧调用组合运行器：锁定前执行透视分割，锁定后内部只推进有限求解
+            # 时间片。正常页不再调用旧detect_pieces或AssemblyRuntime.update。
+            roi_x, roi_y, roi_width, roi_height = roi
+            detection = DetectionResult(
+                [],
+                np.zeros((roi_height, roi_width), dtype=np.uint8),
+                0.0,
+                roi,
+                valid_contour_count=0,
+                white_ratio=0.0,
+            )
+            active_quad = build_runtime_active_quad(active_settings)
+            if capture_armed:
+                if paper_quad is None:
+                    capture_armed = False
+                    status_message = "FOUR NO PAPER"
+                else:
+                    try:
+                        four_runtime.update(
+                            frame_bgr,
+                            paper_quad,
+                            runtime_settings["paper_orientation"],
+                            work_region_mm,
+                            runtime_settings["split_y_mm"],
+                        )
+                    except Exception as error:
+                        # FOUR异常终止本次START，保留错误文字等待用户手动重试，不能自动
+                        # 重拍形成不可控循环。
+                        capture_armed = False
+                        status_message = f"FOUR ERROR {type(error).__name__}"
+        elif analyze_current_frame:
             try:
                 analysis = analyze_quad_frame(frame_bgr, active_settings)
                 detection = analysis.detection
@@ -1485,14 +1565,13 @@ def run_app():
             )
             active_quad = build_runtime_active_quad(active_settings)
 
-        pieces = detection.pieces
-        threshold = detection.threshold
-        work_region_mm = (
-            runtime_settings["work_x_mm"],
-            runtime_settings["work_y_mm"],
-            runtime_settings["work_width_mm"],
-            runtime_settings["work_height_mm"],
+        four_detection = four_runtime.last_detection if uses_four_pipeline else None
+        pieces = (
+            four_detection.pieces
+            if four_detection is not None
+            else detection.pieces
         )
+        threshold = 0.0 if uses_four_pipeline else detection.threshold
         # 触摸动作的结果在当前帧优先于规划状态，尤其不能把SAVE失败原因覆盖掉。
         preserve_planning_status = False
         capture_reset_requested = False
@@ -1511,7 +1590,7 @@ def run_app():
             action = hit_test(clicked_image, active_buttons)
             if action == "cal":
                 # CAL会改变纸张或分割参数，进入和退出都必须丢弃旧机械目标。
-                planner_runtime.reset()
+                _reset_capture_runtimes(planner_runtime, four_runtime=four_runtime)
                 serial_runtime.reset_result_context()
                 capture_armed = False
                 entered_calibration = interface_state.toggle_calibration(
@@ -1535,12 +1614,13 @@ def run_app():
                 except Exception as error:
                     # 调参动作失败保持旧运行参数和当前会话，便于用户修正后重试。
                     status_message = f"CAL ERROR {type(error).__name__}"
-            elif action in (MODE_KNOWN, MODE_UNKNOWN):
+            elif action in (MODE_KNOWN, MODE_UNKNOWN, MODE_FOUR):
                 # 模式按钮只选择上下文并回到待机；真正采集由独立START确认。
                 mode, capture_armed, status_message = select_capture_mode(
                     action,
                     planner_runtime,
                     serial_runtime=serial_runtime,
+                    four_runtime=four_runtime,
                 )
                 preserve_planning_status = True
                 capture_reset_requested = True
@@ -1552,6 +1632,7 @@ def run_app():
                     MODE_UNKNOWN,
                     planner_runtime,
                     serial_runtime=serial_runtime,
+                    four_runtime=four_runtime,
                 )
                 preserve_planning_status = True
                 capture_reset_requested = True
@@ -1562,6 +1643,7 @@ def run_app():
                     planner_runtime,
                     unknown_profile=unknown_profile,
                     serial_runtime=serial_runtime,
+                    four_runtime=four_runtime,
                 )
                 preserve_planning_status = True
                 capture_reset_requested = True
@@ -1608,7 +1690,19 @@ def run_app():
             assembly_plan = None
             # 只有当前START会话才能执行模板匹配、ID编号、稳定计数和组合求解。
             if capture_armed and not capture_reset_requested:
-                if mode == MODE_KNOWN:
+                if mode == MODE_FOUR:
+                    assembly_plan = four_runtime.plan
+                    status_message = select_planning_status(
+                        status_message,
+                        assembly_plan,
+                        four_runtime.stable_count,
+                        four_runtime.stable_frames,
+                        preserve_current=preserve_planning_status,
+                        solving=four_runtime.is_solving,
+                        search_nodes=four_runtime.search_nodes,
+                        snapshot_locked=four_runtime.snapshot_locked,
+                    )
+                elif mode == MODE_KNOWN:
                     templates, template_error = match_known_pieces_safely(
                         pieces,
                         templates,
@@ -1621,39 +1715,40 @@ def run_app():
                         templates,
                         status_message,
                     )
-                else:
+                elif mode == MODE_UNKNOWN:
                     assign_unknown_ids(
                         pieces,
                         row_tolerance_px=max(20, camera_height * 0.08),
                     )
 
-                assembly_plan = planner_runtime.update(
-                    mode,
-                    pieces,
-                    templates,
-                    work_region_mm,
-                    runtime_settings["split_y_mm"],
-                    known_match_threshold=float(DEFAULT_CONFIG["known_match_threshold"]),
-                    unknown_profile=unknown_profile,
-                    paper_orientation=runtime_settings["paper_orientation"],
-                )
-                status_message = select_planning_status(
-                    status_message,
-                    assembly_plan,
-                    planner_runtime.stable_count,
-                    planner_runtime.stable_frames,
-                    preserve_current=preserve_planning_status,
-                    solving=planner_runtime.is_solving,
-                    search_nodes=planner_runtime.search_nodes,
-                    edge_candidates=planner_runtime.edge_candidates,
-                    max_frontier_width=planner_runtime.max_frontier_width,
-                    first_solution_node=planner_runtime.first_solution_node,
-                    snapshot_locked=planner_runtime.snapshot_locked,
-                )
+                if mode in (MODE_KNOWN, MODE_UNKNOWN):
+                    assembly_plan = planner_runtime.update(
+                        mode,
+                        pieces,
+                        templates,
+                        work_region_mm,
+                        runtime_settings["split_y_mm"],
+                        known_match_threshold=float(DEFAULT_CONFIG["known_match_threshold"]),
+                        unknown_profile=unknown_profile,
+                        paper_orientation=runtime_settings["paper_orientation"],
+                    )
+                    status_message = select_planning_status(
+                        status_message,
+                        assembly_plan,
+                        planner_runtime.stable_count,
+                        planner_runtime.stable_frames,
+                        preserve_current=preserve_planning_status,
+                        solving=planner_runtime.is_solving,
+                        search_nodes=planner_runtime.search_nodes,
+                        edge_candidates=planner_runtime.edge_candidates,
+                        max_frontier_width=planner_runtime.max_frontier_width,
+                        first_solution_node=planner_runtime.first_solution_node,
+                        snapshot_locked=planner_runtime.snapshot_locked,
+                    )
                 queue_successful_plan_result(
                     serial_runtime,
                     assembly_plan,
-                    mode,
+                    protocol_mode_for_capture(mode),
                     runtime_settings["paper_orientation"],
                 )
                 status_message = select_result_serial_status(
@@ -1668,7 +1763,7 @@ def run_app():
             display_pieces = (
                 ()
                 if (not capture_armed or capture_reset_requested)
-                else select_display_pieces(pieces, planner_runtime)
+                else select_display_pieces(pieces, active_capture_runtime)
             )
 
             # CAL退出后立即使用已保存ROI画框；当前帧结果最迟在下一帧同步该参数。

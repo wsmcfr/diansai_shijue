@@ -183,6 +183,45 @@ def test_protocol_mode_mapping_preserves_existing_modes(mode):
     assert protocol_mode_for_capture(mode) == mode
 
 
+def test_mode_and_start_reset_both_legacy_and_four_runtimes():
+    """任何模式切换或START都必须同时释放旧求解器和FOUR专用快照。"""
+    from maixcam2_app_A_quad.main import MODE_FOUR, select_capture_mode, start_capture
+
+    legacy_runtime = RecordingRuntime()
+    four_runtime = RecordingRuntime()
+
+    select_capture_mode(
+        MODE_FOUR,
+        legacy_runtime,
+        four_runtime=four_runtime,
+    )
+    start_capture(
+        MODE_FOUR,
+        legacy_runtime,
+        four_runtime=four_runtime,
+    )
+
+    assert legacy_runtime.reset_count == 2
+    assert four_runtime.reset_count == 2
+
+
+def test_select_capture_runtime_isolates_four_from_existing_modes():
+    """KNOWN/UNKNOWN必须继续选择旧运行器，只有FOUR选择专用运行器。"""
+    from maixcam2_app_A_quad.main import (
+        MODE_FOUR,
+        MODE_KNOWN,
+        MODE_UNKNOWN,
+        select_capture_runtime,
+    )
+
+    legacy_runtime = object()
+    four_runtime = object()
+
+    assert select_capture_runtime(MODE_KNOWN, legacy_runtime, four_runtime) is legacy_runtime
+    assert select_capture_runtime(MODE_UNKNOWN, legacy_runtime, four_runtime) is legacy_runtime
+    assert select_capture_runtime(MODE_FOUR, legacy_runtime, four_runtime) is four_runtime
+
+
 def test_unarmed_known_save_returns_press_start_without_entering_save(monkeypatch):
     """未START时KNOWN SAVE必须在调用登记与写模板入口前直接拒绝。"""
     from maixcam2_app_A_quad import main

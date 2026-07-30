@@ -146,3 +146,92 @@ def test_runtime_unstable_frame_restarts_count_and_reset_returns_idle():
     assert runtime.stable_count == 0
     assert runtime.snapshot_locked is False
     assert runtime.locked_pieces == ()
+
+
+class _LockedVisionRuntime:
+    """为组合运行器测试提供一次锁定快照，并记录是否被错误重复识别。"""
+
+    def __init__(self, pieces):
+        """保存固定四片并初始化调用和复位计数。"""
+        from types import SimpleNamespace
+
+        self.calls = 0
+        self.reset_count = 0
+        self.snapshot_locked = True
+        self.stable_count = 3
+        self.stable_frames = 3
+        self.locked_pieces = tuple(pieces)
+        self.last_detection = SimpleNamespace(
+            pieces=self.locked_pieces,
+            locked=True,
+            reason="ok",
+            valid_contour_count=len(self.locked_pieces),
+            split_applied=False,
+            pre_split_count=len(self.locked_pieces),
+        )
+
+    def update(self, *_args, **_kwargs):
+        """返回同一个锁定结果；正常求解期间该方法最多应调用一次。"""
+        self.calls += 1
+        return self.last_detection
+
+    def reset(self):
+        """记录组合运行器是否向视觉层传播手动复位。"""
+        self.reset_count += 1
+
+
+def test_combined_four_runtime_starts_one_solver_and_keeps_locked_snapshot():
+    """锁定后只能创建一个专用求解任务，后续帧只推进该任务而不重复视觉。"""
+    from maixcam2_app_A_quad.four_piece_solver import FourPieceRuntime
+    from tests_ab.test_a_four_piece_solver import _four_grid_pieces
+
+    vision_runtime = _LockedVisionRuntime(_four_grid_pieces())
+    runtime = FourPieceRuntime(vision_runtime=vision_runtime)
+    common = (
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        np.float32(((0, 0), (19, 0), (19, 19), (0, 19))),
+        "portrait",
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+    )
+
+    assert runtime.update(*common) is None
+    calls = 1
+    while runtime.plan is None and calls < 200:
+        runtime.update(*common, time_budget_ms=1000.0, work_unit_limit=64)
+        calls += 1
+
+    assert runtime.plan is not None
+    assert runtime.plan.success is True
+    assert runtime.solve_start_count == 1
+    assert vision_runtime.calls == 1
+    assert runtime.locked_pieces is vision_runtime.locked_pieces
+
+
+def test_combined_four_runtime_failure_does_not_restart_detection_or_solver():
+    """专用求解失败后必须保留同一失败结果，直到用户手动START触发reset。"""
+    from maixcam2_app_A_quad.four_piece_solver import FourPieceRuntime
+    from tests_ab.test_a_four_piece_solver import _four_grid_pieces
+
+    vision_runtime = _LockedVisionRuntime(_four_grid_pieces(width=80.0, height=40.0))
+    runtime = FourPieceRuntime(vision_runtime=vision_runtime)
+    common = (
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        np.float32(((0, 0), (19, 0), (19, 19), (0, 19))),
+        "portrait",
+        (0.0, 0.0, 210.0, 297.0),
+        148.5,
+    )
+
+    runtime.update(*common)
+    while runtime.plan is None:
+        runtime.update(*common, time_budget_ms=1000.0, work_unit_limit=128)
+    failed_plan = runtime.plan
+    assert failed_plan.success is False
+
+    assert runtime.update(*common) is failed_plan
+    assert vision_runtime.calls == 1
+    assert runtime.solve_start_count == 1
+    runtime.reset()
+    assert runtime.plan is None
+    assert vision_runtime.reset_count == 1

@@ -871,3 +871,33 @@ def test_run_app_wires_nonblocking_serial_poll_reset_submit_and_close():
         and node.func.attr == "close"
         for node in calls
     )
+
+
+def test_run_app_wires_dedicated_four_runtime_and_protocol_mode_mapping():
+    """设备入口必须创建FOUR运行器、逐帧推进并在发送前映射为UNKNOWN协议模式。"""
+    from maixcam2_app_A_quad import main
+
+    syntax_tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8"))
+    run_function = next(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_app"
+    )
+    calls = [node for node in ast.walk(run_function) if isinstance(node, ast.Call)]
+
+    assert any(
+        isinstance(node.func, ast.Name) and node.func.id == "FourPieceRuntime"
+        for node in calls
+    )
+    assert any(
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "four_runtime"
+        and node.func.attr == "update"
+        for node in calls
+    )
+    assert any(
+        isinstance(node.func, ast.Name)
+        and node.func.id == "protocol_mode_for_capture"
+        for node in calls
+    )
