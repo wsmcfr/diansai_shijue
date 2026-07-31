@@ -106,6 +106,33 @@ def make_large_distractor_with_small_a4_like_block():
     return frame, small_block.astype(np.float32)
 
 
+def make_missing_edge_support_scene():
+    """生成凸包像A4、但四条凸包边大部分没有实际灰度边缘的凹形暗区。
+
+    多个尖角把凸包撑成A4比例矩形，深凹边界则让候选四边跨过亮背景。该轮廓面积、
+    相对主轮廓比例和平均暗度仍足以进入宽松路径，专门验证四边边缘支持门能够拒绝
+    “几何凸包像纸、图像中却没有纸边”的假候选。
+    """
+    frame = np.full((480, 640, 3), 220, dtype=np.uint8)
+    concave_outline = np.int32(
+        [
+            [100, 100],
+            [200, 205],
+            [300, 100],
+            [400, 205],
+            [500, 100],
+            [395, 240],
+            [500, 380],
+            [300, 275],
+            [100, 380],
+            [205, 240],
+        ]
+    )
+    cv2.fillPoly(frame, [concave_outline], (22, 22, 22))
+    expected_hull = np.float32([[100, 100], [500, 100], [500, 380], [100, 380]])
+    return frame, expected_hull
+
+
 def _active_quad_for_test(paper_quad, inset_mm=0.0):
     """直接由物理坐标生成测试期望有效四边形，避免依赖被测生产函数。"""
     active_mm = np.float32(

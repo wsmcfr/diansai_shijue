@@ -8,6 +8,7 @@ import pytest
 
 from tests_ab.synthetic_paper import DEFAULT_PAPER_QUAD, make_paper_scene
 from tests_ab.synthetic_paper import make_large_distractor_with_small_a4_like_block
+from tests_ab.synthetic_paper import make_missing_edge_support_scene
 from tests_ab.synthetic_paper import make_scene_with_piece_count
 from tests_ab.synthetic_paper import make_uneven_brightness_paper_scene
 
@@ -188,6 +189,18 @@ def test_a_locator_rejects_small_quad_beside_larger_nonpaper_contour():
     assert best["area_to_largest"] < 0.10
     if result.paper_quad is not None:
         assert not np.allclose(result.paper_quad, small_block, atol=3.0)
+
+
+def test_a_locator_rejects_relaxed_quad_without_real_edge_support():
+    """凸包形成A4四角但候选四边没有真实图像边缘时必须拒绝。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    frame, _expected_hull = make_missing_edge_support_scene()
+
+    result = module.locate_black_paper(frame)
+
+    assert result.success is False
+    assert result.paper_quad is None
+    assert result.diagnostics["relaxed_edge_reject_count"] >= 1
 
 
 def test_a_auto_roi_exposes_editable_epsilon_ratio_macro():

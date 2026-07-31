@@ -941,7 +941,221 @@ def _search_strict_paper_candidate(
             best_quad = quad
             best_confidence = confidence
 
+    largest_area_ratio = float(diagnostics["largest_area_ratio"])
+    best_metrics = diagnostics.get("best_candidate")
+    if isinstance(best_metrics, dict):
+        area_to_largest = (
+            0.0
+            if largest_area_ratio <= 1e-9
+            else float(best_metrics["area_ratio"]) / largest_area_ratio
+        )
+        best_metrics["area_to_largest"] = float(
+            np.clip(area_to_largest, 0.0, 1.0)
+        )
+
+    # 即使四角来自严格2%，当候选远小于同帧主暗区时也不能立即锁定。这个门只排除
+    # 明显的相对小框，不提高旧绝对面积下限，因此远距离但画面中没有更大暗区的A4
+    # 仍保持旧行为。
+    if best_quad is not None and isinstance(best_metrics, dict):
+        if best_metrics["area_to_largest"] < float(
+            config["paper_auto_min_area_to_largest"]
+        ):
+            diagnostics["relaxed_area_reject_count"] += 1
+            best_quad = None
+            best_confidence = 0.0
+
     return best_quad, float(best_confidence), diagnostics
+
+
+def _measure_quad_edge_support(gray, quad):
+    """测量候选四边附近真实灰度边缘的支持比例。
+
+    主要流程：按全帧中位灰度生成自适应Canny阈值，把边缘图膨胀为约画面短边1%的
+    容差带，再分别沿四条1像素候选边统计命中率。返回``(四边平均值, 四项单边值)``；
+    单边长度退化时该边返回0。只验证已有候选四边，不做全帧直线搜索，减少龙门架
+    对AUTO的干扰。
+    """
+    gray_array = np.asarray(gray, dtype=np.uint8)
+    ordered_quad = order_a4_quad(quad)
+    median_gray = float(np.median(gray_array))
+    canny_lower = int(np.clip(0.50 * median_gray, 10, 220))
+    canny_upper = int(np.clip(1.25 * median_gray, canny_lower + 1, 250))
+    edge_map = cv2.Canny(gray_array, canny_lower, canny_upper)
+    tolerance_px = max(2, int(round(min(gray_array.shape[:2]) * 0.01)))
+    dilation_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * tolerance_px + 1, 2 * tolerance_px + 1),
+    )
+    supported_edge_map = cv2.dilate(edge_map, dilation_kernel)
+
+    side_supports = []
+    for index in range(4):
+        start = np.rint(ordered_quad[index]).astype(np.int32)
+        end = np.rint(ordered_quad[(index + 1) % 4]).astype(np.int32)
+        line_mask = np.zeros(gray_array.shape, dtype=np.uint8)
+        cv2.line(
+            line_mask,
+            tuple(int(value) for value in start),
+            tuple(int(value) for value in end),
+            255,
+            1,
+            cv2.LINE_8,
+        )
+        line_pixels = int(cv2.countNonZero(line_mask))
+        if line_pixels <= 1:
+            side_supports.append(0.0)
+            continue
+        supported_pixels = int(
+            cv2.countNonZero(cv2.bitwise_and(line_mask, supported_edge_map))
+        )
+        side_supports.append(
+            float(np.clip(supported_pixels / float(line_pixels), 0.0, 1.0))
+        )
+    return float(np.mean(side_supports)), tuple(side_supports)
+
+
+def _quad_fill_ratio(contour_area, quad):
+    """返回暗色轮廓面积占候选四边形面积的比例，退化四边形返回0。"""
+    quad_area = abs(float(cv2.contourArea(np.asarray(quad, dtype=np.float32))))
+    if quad_area <= 1.0:
+        return 0.0
+    return float(np.clip(float(contour_area) / quad_area, 0.0, 1.0))
+
+
+def _search_relaxed_paper_candidate(
+    gray,
+    blurred,
+    otsu_threshold,
+    close_kernel_size,
+    config,
+    recovery_config,
+    epsilon_ratios,
+    diagnostics,
+):
+    """扫描有限阈值并使用联合安全门恢复主A4轮廓。
+
+    主要流程：为每个去重后的阈值生成暗色掩膜，只处理面积最大的有限轮廓；候选
+    必须依次通过绝对面积、相对最大轮廓面积、宽松矩形度、A4比例、内部暗度和四边
+    边缘支持。返回``(四角或None, 置信度, 实际阈值)``，并原位补充诊断字典。
+    """
+    frame_area = float(gray.shape[0] * gray.shape[1])
+    max_area_ratio = float(config["paper_max_area_ratio"])
+    min_confidence = float(config["paper_min_confidence"])
+    best_quad = None
+    best_confidence = 0.0
+    best_threshold = float(otsu_threshold)
+    diagnostic_best_confidence = float(
+        (diagnostics.get("best_candidate") or {}).get("confidence", -1.0)
+    )
+    visited_thresholds = set()
+
+    for offset in recovery_config["threshold_offsets"]:
+        threshold = float(np.clip(float(otsu_threshold) + int(offset), 1.0, 254.0))
+        threshold_key = int(round(threshold))
+        if threshold_key in visited_thresholds:
+            continue
+        visited_thresholds.add(threshold_key)
+        dark_mask = _build_dark_mask(blurred, threshold, close_kernel_size)
+        contours, contour_areas = _find_mask_contours(dark_mask)
+        if not contour_areas:
+            continue
+        largest_contour_area = max(contour_areas)
+        diagnostics["largest_area_ratio"] = max(
+            float(diagnostics["largest_area_ratio"]),
+            largest_contour_area / frame_area,
+        )
+        ordered_candidates = sorted(
+            zip(contours, contour_areas),
+            key=lambda item: item[1],
+            reverse=True,
+        )[: recovery_config["max_contours_per_mask"]]
+
+        for contour, contour_area in ordered_candidates:
+            area_ratio = float(contour_area / frame_area)
+            area_to_largest = float(
+                contour_area / max(largest_contour_area, 1.0)
+            )
+            if (
+                area_ratio < recovery_config["relaxed_min_area_ratio"]
+                or area_ratio > max_area_ratio
+                or area_to_largest < recovery_config["min_area_to_largest"]
+            ):
+                diagnostics["relaxed_area_reject_count"] += 1
+                continue
+
+            hull = cv2.convexHull(contour)
+            quad, vertex_count, selected_epsilon = _candidate_quad_with_vertex_count(
+                hull,
+                epsilon_ratios,
+            )
+            if quad is None:
+                continue
+            _old_confidence, rectangularity, metrics = _score_candidate(
+                contour,
+                hull,
+                quad,
+                gray,
+                area_ratio,
+                config,
+            )
+            edge_support, side_supports = _measure_quad_edge_support(gray, quad)
+            supported_side_count = sum(
+                support >= recovery_config["min_edge_support"]
+                for support in side_supports
+            )
+            recovery_confidence = float(
+                np.clip(
+                    0.30 * metrics["aspect_score"]
+                    + 0.30 * edge_support
+                    + 0.15 * area_to_largest
+                    + 0.15 * metrics["darkness_score"]
+                    + 0.10 * rectangularity,
+                    0.0,
+                    1.0,
+                )
+            )
+            metrics.update(
+                {
+                    "confidence": recovery_confidence,
+                    "strict_vertex_count": int(vertex_count),
+                    "quad_epsilon_ratio": float(selected_epsilon),
+                    "used_threshold": float(threshold),
+                    "area_to_largest": float(area_to_largest),
+                    "quad_fill": _quad_fill_ratio(contour_area, quad),
+                    "edge_support": float(edge_support),
+                    "supported_side_count": int(supported_side_count),
+                }
+            )
+            if recovery_confidence > diagnostic_best_confidence:
+                diagnostics["best_candidate"] = dict(metrics)
+                diagnostic_best_confidence = recovery_confidence
+
+            if rectangularity < recovery_config["relaxed_min_rectangularity"]:
+                diagnostics["relaxed_rectangularity_reject_count"] += 1
+                continue
+            if metrics["aspect_score"] < recovery_config["relaxed_min_aspect_score"]:
+                diagnostics["relaxed_aspect_reject_count"] += 1
+                continue
+            if metrics["darkness_score"] < recovery_config["relaxed_min_darkness"]:
+                diagnostics["relaxed_darkness_reject_count"] += 1
+                continue
+            if (
+                edge_support < recovery_config["min_edge_support"]
+                or supported_side_count < recovery_config["min_supported_sides"]
+            ):
+                diagnostics["relaxed_edge_reject_count"] += 1
+                continue
+            if recovery_confidence < min_confidence:
+                continue
+            diagnostics["eligible_count"] += 1
+            if recovery_confidence > best_confidence:
+                best_quad = quad
+                best_confidence = recovery_confidence
+                best_threshold = threshold
+
+    if best_quad is not None:
+        diagnostics["source"] = "TH_SCAN"
+    return best_quad, float(best_confidence), float(best_threshold)
 
 
 def locate_black_paper(frame_bgr, config=None):
@@ -965,7 +1179,7 @@ def locate_black_paper(frame_bgr, config=None):
     )
     # 即使本阶段尚未使用宽松结果，也必须在处理图像前验证全部现场宏；这样下一阶段
     # 接入多阈值时不会改变非法配置的失败时机。
-    _validate_auto_roi_recovery_config(merged_config)
+    recovery_config = _validate_auto_roi_recovery_config(merged_config)
 
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -980,7 +1194,7 @@ def locate_black_paper(frame_bgr, config=None):
         threshold,
         close_kernel_size,
     )
-    best_quad, best_confidence, diagnostics = _search_strict_paper_candidate(
+    strict_quad, strict_confidence, diagnostics = _search_strict_paper_candidate(
         gray,
         dark_mask,
         threshold,
@@ -989,17 +1203,35 @@ def locate_black_paper(frame_bgr, config=None):
     )
 
     min_confidence = float(merged_config["paper_min_confidence"])
-    if best_quad is None:
+    if strict_quad is not None and strict_confidence >= min_confidence:
+        best_quad = strict_quad
+        best_confidence = strict_confidence
+        result_threshold = float(threshold)
+    else:
+        best_quad, best_confidence, result_threshold = (
+            _search_relaxed_paper_candidate(
+                gray,
+                blurred,
+                threshold,
+                close_kernel_size,
+                merged_config,
+                recovery_config,
+                epsilon_ratios,
+                diagnostics,
+            )
+        )
+
+    if best_quad is None and strict_quad is None:
         return PaperLocation.failed(
             "no_candidate",
             threshold=threshold,
             diagnostics=diagnostics,
         )
-    if best_confidence < min_confidence:
+    if best_quad is None:
         return PaperLocation.failed(
             "low_confidence",
             threshold=threshold,
-            confidence=best_confidence,
+            confidence=strict_confidence,
             diagnostics=diagnostics,
         )
     observed_orientation = infer_paper_orientation(best_quad)
@@ -1013,7 +1245,7 @@ def locate_black_paper(frame_bgr, config=None):
         active_quad=None,
         paper_orientation=paper_orientation,
         confidence=best_confidence,
-        threshold=threshold,
+        threshold=result_threshold,
         reason="ok",
         diagnostics=diagnostics,
     )
