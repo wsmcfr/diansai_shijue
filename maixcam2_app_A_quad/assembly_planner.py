@@ -97,7 +97,7 @@ class AssemblyPlacement:
 
 
 class AssemblyPlan:
-    """保存一次拼装求解的成功状态、目标矩形、单片位姿和诊断分数。"""
+    """保存一次拼装求解的成功状态、可靠性、目标矩形、单片位姿和诊断分数。"""
 
     def __init__(
         self,
@@ -108,12 +108,16 @@ class AssemblyPlan:
         reason="",
         search_nodes=0,
         diagnostics=None,
+        reliable=True,
     ):
         """初始化结构化规划结果，失败结果默认不携带任何机械目标。
 
-        diagnostics保存搜索阶段的拒绝次数，只用于屏幕和测试诊断，不参与电机控制。
+        reliable只对成功结果有意义；False表示这是搜索得到的最佳完整拼法，但没有通过
+        可靠填充/重叠门。diagnostics保存拒绝次数，只用于屏幕和测试诊断，不参与控制。
         """
         self.success = bool(success)
+        # 失败结果无论调用方传入什么都不能被误标成可靠，避免UI或串口放行空目标。
+        self.reliable = bool(reliable) if self.success else False
         self.placements = list(placements or [])
         self.target_rect_mm = (
             None
@@ -135,6 +139,7 @@ class AssemblyPlan:
             reason=reason,
             search_nodes=search_nodes,
             diagnostics=diagnostics,
+            reliable=False,
         )
 
 
@@ -1265,13 +1270,15 @@ def _partial_layout_priority(
     target_size_hint_mm=None,
     long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
     short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
+    enforce_size_bounds=True,
 ):
     """计算部分布局的紧凑搜索优先级，并拒绝不可能装入最大目标框的状态。
 
     主要流程：先用点集直径和凸包面积做方向无关的安全上界剪枝；再计算最小外接
     矩形面积相对碎片总面积的空隙率。KNOWN可额外提供100×60mm尺寸提示，优先
     搜索外框更接近已知目标的状态；提示只改变顺序，不参与合法性判定。长短边范围
-    带普通UNKNOWN默认值，FOUR可传入自己的范围用于安全上界剪枝。
+    带普通UNKNOWN旧默认值；enforce_size_bounds=False时保留紧凑度排序，但不再按题目
+    毫米范围提前剪枝。独立FOUR和KNOWN继续启用尺寸上界。
     返回None表示不可能装入指定最大目标，否则返回可排序浮点元组。
     """
     polygons = [np.asarray(polygon, dtype=np.float64) for polygon in placed_polygons]
@@ -1289,23 +1296,22 @@ def _partial_layout_priority(
             or side_range[0] > side_range[1]
         ):
             raise ValueError("部分布局长短边范围必须是递增的两个正有限数字")
-    maximum_diagonal = math.hypot(
-        long_side_range[1],
-        short_side_range[1],
-    ) + max(0.0, float(tolerance_mm))
-    point_differences = all_points[:, None, :] - all_points[None, :, :]
-    maximum_distance = float(
-        np.sqrt(np.max(np.sum(point_differences * point_differences, axis=2)))
-    )
-    if maximum_distance > maximum_diagonal:
-        return None
+    if bool(enforce_size_bounds):
+        maximum_diagonal = math.hypot(
+            long_side_range[1],
+            short_side_range[1],
+        ) + max(0.0, float(tolerance_mm))
+        point_differences = all_points[:, None, :] - all_points[None, :, :]
+        maximum_distance = float(
+            np.sqrt(np.max(np.sum(point_differences * point_differences, axis=2)))
+        )
+        if maximum_distance > maximum_diagonal:
+            return None
 
-    hull = cv2.convexHull(all_points.astype(np.float32).reshape(-1, 1, 2))
-    maximum_area = (
-        long_side_range[1] * short_side_range[1]
-    )
-    if abs(float(cv2.contourArea(hull))) > maximum_area * 1.05:
-        return None
+        hull = cv2.convexHull(all_points.astype(np.float32).reshape(-1, 1, 2))
+        maximum_area = long_side_range[1] * short_side_range[1]
+        if abs(float(cv2.contourArea(hull))) > maximum_area * 1.05:
+            return None
 
     rectangle = cv2.minAreaRect(all_points.astype(np.float32).reshape(-1, 1, 2))
     rectangle_sides = sorted(
@@ -1442,6 +1448,7 @@ def _canonicalize_complete_layout(
     long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
     short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
     max_overlap_ratio=UNKNOWN_MAX_OVERLAP_RATIO,
+    enforce_size_bounds=True,
 ):
     """把完整组合旋正到长边X轴，并用栅格验证目标矩形尺寸、重叠和缝隙。
 
@@ -1451,8 +1458,8 @@ def _canonicalize_complete_layout(
 
     关键参数：min_fill_ratio和max_overlap_ratio必须位于0～1；长短边范围均为
     ``(最小值, 最大值)``。require_all_outer_edges只允许容错层启用；metrics若为字典
-    会写入本次候选的浮点诊断，不参与机械结果。验收参数带UNKNOWN旧默认值，FOUR
-    可显式覆盖而不改变普通UNKNOWN调用行为。
+    会写入本次候选的浮点诊断，不参与机械结果。enforce_size_bounds=False时跳过长短边
+    范围硬门，但仍计算实际宽高；KNOWN和独立FOUR保留默认True。
     返回值：``(结果, 原因)``；成功时结果为按索引多边形、宽、高和几何分数，
     原因为None；失败原因区分尺寸、填充、重叠或逐片外边拒绝。
     """
@@ -1511,7 +1518,7 @@ def _canonicalize_complete_layout(
                 "piece_count": int(len(canonical)),
             }
         )
-    if not (
+    if bool(enforce_size_bounds) and not (
         long_side_range[0] <= width_mm <= long_side_range[1]
         and short_side_range[0] <= height_mm <= short_side_range[1]
     ):
@@ -1565,12 +1572,14 @@ def _build_unknown_success_plan(
     score,
     search_nodes,
     diagnostics,
+    reliable=True,
+    reason="ok",
 ):
-    """把已通过硬验收的规范布局转换成下半区机械规划。
+    """把完整的规范布局转换成下半区机械规划。
 
     主要流程：在红线下方计算居中的目标矩形，再逐片换算目标轮廓、中心和最短旋转角。
-    canonical_result来自`_canonicalize_complete_layout()`，因此本函数不再重复尺寸、填充
-    和重叠判断。返回独立AssemblyPlan；下半工作区放不下时返回None。
+    canonical_result来自`_canonicalize_complete_layout()`；reliable和reason由调用方明确
+    区分可靠结果与最佳回退。本函数不重复几何验收；下半工作区放不下时返回None。
     """
     canonical_by_index, target_width, target_height, _geometry_score = canonical_result
     target_rect = _target_rect_in_lower_region(
@@ -1603,10 +1612,53 @@ def _build_unknown_success_plan(
         placements=placements,
         target_rect_mm=target_rect,
         score=score,
-        reason="ok",
+        reason=reason,
         search_nodes=search_nodes,
         diagnostics=diagnostics,
+        reliable=reliable,
     )
+
+
+def _store_unknown_best_effort_plan(progress, plan, rank):
+    """按统一几何排序保存UNKNOWN跨阶段最佳完整候选。
+
+    主要流程：校验候选确实为成功但不可靠的计划，把排序键转为有限浮点元组，再与
+    progress中GRAPH、FOUR_FAST或FALLBACK留下的旧候选比较。排序依次偏好低重叠、
+    高填充、更多目标外边和更低接缝分数。返回True表示本次候选成为新的全局最佳。
+    """
+    if not isinstance(progress, dict):
+        return False
+    if not isinstance(plan, AssemblyPlan) or not plan.success or plan.reliable:
+        return False
+    try:
+        normalized_rank = tuple(float(value) for value in rank)
+    except (TypeError, ValueError):
+        return False
+    if not normalized_rank or not all(math.isfinite(value) for value in normalized_rank):
+        return False
+    previous_rank = progress.get("best_effort_rank")
+    if previous_rank is not None and tuple(previous_rank) <= normalized_rank:
+        return False
+    progress["best_effort_rank"] = normalized_rank
+    progress["best_effort_plan"] = plan
+    return True
+
+
+def _has_best_effort_rectangle_support(metrics, piece_count):
+    """判断宽松候选是否仍有足够碎片支撑目标矩形外框。
+
+    最佳回退不能把“所有碎片随便摆完”误当成矩形。题目保证每片最终至少有一条外边，
+    但远距离轮廓会漏掉部分外边，因此这里只要求至少两片被确认；单片模式要求该片本身
+    接触外框。关键参数metrics来自规范化验收，piece_count为正整数；返回布尔值。
+    """
+    try:
+        count = int(piece_count)
+        outer_piece_count = int(metrics.get("outer_piece_count", 0))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if count <= 0:
+        return False
+    return outer_piece_count >= min(2, count)
 
 
 def _build_graph_edge_candidates(
@@ -1880,6 +1932,7 @@ def _solve_unknown_graph_fast_path_steps(
     candidate_limit=UNKNOWN_GRAPH_MAX_EDGE_CANDIDATES,
     matching_set_limit=UNKNOWN_GRAPH_MAX_MATCHING_SETS,
     progress=None,
+    enforce_size_bounds=False,
 ):
     """逐候选执行有界连接图WHITE快解，并在每组完整布局后让出一次。
 
@@ -1888,7 +1941,7 @@ def _solve_unknown_graph_fast_path_steps(
     WHITE的86%容错候选中返回评分最低且每片都有目标外边的一组。所有假设均失败时
     返回None，由调用方进入下一阶段。每检查一组连通关系就yield一次，结束时通过
     StopIteration.value返回`(plan, diagnostics)`。progress可选共享字典用于在yield前保存
-    已验证规划，避免单个硬验收越过截止线时由外层超时收尾误丢结果。
+    已验证规划和最佳完整回退；普通UNKNOWN关闭尺寸门，调用方仍可显式恢复旧门。
     """
     diagnostics = {
         "graph_edge_candidates": 0,
@@ -1944,12 +1997,16 @@ def _solve_unknown_graph_fast_path_steps(
         if placed_by_index is None:
             return None
         diagnostics["graph_layouts_checked"] += 1
+        relation_error = sum(
+            relation["relative_error"] for relation in relations
+        )
         strict_metrics = {}
         canonical_result, rejection_reason = _canonicalize_complete_layout(
             placed_by_index,
             pixels_per_mm=pixels_per_mm,
             min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
             metrics=strict_metrics,
+            enforce_size_bounds=enforce_size_bounds,
         )
         accepted_relaxed = False
         candidate_metrics = strict_metrics
@@ -1963,21 +2020,31 @@ def _solve_unknown_graph_fast_path_steps(
                 min_fill_ratio=UNKNOWN_RELAXED_MIN_FILL_RATIO,
                 require_all_outer_edges=True,
                 metrics=relaxed_metrics,
+                enforce_size_bounds=enforce_size_bounds,
             )
             if canonical_result is None:
                 if relaxed_reason == "fill_reject":
                     diagnostics["graph_relaxed_fill_reject"] += 1
                 elif relaxed_reason == "outer_edge_reject":
                     diagnostics["graph_outer_edge_reject"] += 1
+                _consider_best_effort(
+                    placed_by_index,
+                    relaxed_metrics,
+                    relation_error,
+                    closure_error,
+                )
                 return None
             accepted_relaxed = True
             candidate_metrics = relaxed_metrics
             diagnostics["graph_relaxed_candidates"] += 1
         elif canonical_result is None:
+            _consider_best_effort(
+                placed_by_index,
+                strict_metrics,
+                relation_error,
+                closure_error,
+            )
             return None
-        relation_error = sum(
-            relation["relative_error"] for relation in relations
-        )
         geometry_score = float(canonical_result[3])
         score = geometry_score + relation_error * 10.0 + closure_error * 0.1
         if accepted_relaxed:
@@ -2017,6 +2084,75 @@ def _solve_unknown_graph_fast_path_steps(
             diagnostics.update(success_diagnostics)
             return plan
         return None
+
+    def _consider_best_effort(
+        placed_by_index,
+        preliminary_metrics,
+        relation_error,
+        closure_error,
+    ):
+        """把GRAPH未过可靠门的完整布局按统一规则保存为不可靠候选。
+
+        preliminary_metrics来自刚完成的可靠验收；先用它和当前全局排序键比较，只有
+        确实可能更优时才用0填充门重建规范多边形，避免为90组候选重复执行无意义栅格化。
+        返回值无业务含义，候选通过共享progress向超时收尾和后续阶段传递。
+        """
+        if bool(enforce_size_bounds):
+            # 该开关用于兼容旧硬门调用；KNOWN和独立FOUR不得产生UNKNOWN回退结果。
+            return
+        fill_ratio = float(preliminary_metrics.get("fill_ratio", 0.0))
+        overlap_ratio = float(preliminary_metrics.get("overlap_ratio", 1.0))
+        outer_piece_count = int(preliminary_metrics.get("outer_piece_count", 0))
+        if not _has_best_effort_rectangle_support(
+            preliminary_metrics,
+            len(solver_pieces),
+        ):
+            return
+        rank = (
+            overlap_ratio,
+            1.0 - fill_ratio,
+            len(solver_pieces) - outer_piece_count,
+            float(relation_error) + float(closure_error) * 0.01,
+        )
+        previous_rank = progress.get("best_effort_rank")
+        if previous_rank is not None and tuple(previous_rank) <= rank:
+            return
+        best_metrics = {}
+        best_result, _reason = _canonicalize_complete_layout(
+            placed_by_index,
+            pixels_per_mm=pixels_per_mm,
+            min_fill_ratio=0.0,
+            max_overlap_ratio=1.0,
+            metrics=best_metrics,
+            enforce_size_bounds=False,
+        )
+        if best_result is None:
+            return
+        geometry_score = float(best_result[3])
+        score = geometry_score + float(relation_error) * 10.0 + float(closure_error) * 0.1
+        best_diagnostics = dict(diagnostics)
+        best_diagnostics.update(
+            {
+                "best_effort": 1,
+                "fill_permille": int(round(float(best_metrics["fill_ratio"]) * 1000.0)),
+                "overlap_permille": int(
+                    round(float(best_metrics["overlap_ratio"]) * 1000.0)
+                ),
+                "outer_piece_count": int(best_metrics["outer_piece_count"]),
+            }
+        )
+        plan = _build_unknown_success_plan(
+            solver_pieces,
+            best_result,
+            work_region_mm,
+            split_y_mm,
+            score,
+            search_nodes=0,
+            diagnostics=best_diagnostics,
+            reliable=False,
+            reason="best_effort",
+        )
+        _store_unknown_best_effort_plan(progress, plan, rank)
 
     for relations in matching_sets:
         plan = evaluate_relations(relations)
@@ -2087,6 +2223,7 @@ def _solve_unknown_graph_fast_path(
     matching_set_limit=UNKNOWN_GRAPH_MAX_MATCHING_SETS,
     incremental=False,
     progress=None,
+    enforce_size_bounds=False,
 ):
     """创建GRAPH增量核心；默认同步消费以保持既有调用兼容。
 
@@ -2101,6 +2238,7 @@ def _solve_unknown_graph_fast_path(
         candidate_limit=candidate_limit,
         matching_set_limit=matching_set_limit,
         progress=progress,
+        enforce_size_bounds=enforce_size_bounds,
     )
     if bool(incremental):
         return steps
@@ -2121,6 +2259,7 @@ def _solve_unknown_four_fast_path_steps(
     long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
     short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
     max_overlap_ratio=UNKNOWN_MAX_OVERLAP_RATIO,
+    enforce_size_bounds=True,
 ):
     """逐候选执行UNKNOWN WHITE四片分层Beam快解。
 
@@ -2133,7 +2272,8 @@ def _solve_unknown_four_fast_path_steps(
     显式传入自己的现场宏。中间层达到上限时直接返回无解，完整层达到上限时仍验收
     已生成的候选，只有这些候选无解才返回None并由调用方继续FALLBACK。每个候选或
     完整验收后yield；StopIteration.value返回`(plan, diagnostics)`。progress可选共享
-    字典用于在yield前保存已通过硬门的规划，机械目标仍由公共构造函数生成。
+    字典用于在yield前保存已通过硬门的规划；enforce_size_bounds=False仅供普通UNKNOWN
+    流水线使用，独立FOUR保持默认True及自己的现场尺寸范围。
     """
     diagnostics = {
         "four_fast_path": 0,
@@ -2264,6 +2404,74 @@ def _solve_unknown_four_fast_path_steps(
         diagnostics["four_active_limit_reached"] = 1
         return True
 
+    def consider_best_effort(state, preliminary_metrics):
+        """保存FOUR_FAST完整层中未过可靠门的最佳普通UNKNOWN候选。
+
+        关键参数state包含四片完整位姿及接缝统计，preliminary_metrics来自刚结束的可靠
+        验收。独立FOUR启用尺寸门时本函数立即返回；普通UNKNOWN才会重建0填充门结果，
+        以统一排序写入共享progress。返回值无业务含义。
+        """
+        if bool(enforce_size_bounds):
+            return
+        fill_ratio = float(preliminary_metrics.get("fill_ratio", 0.0))
+        overlap_ratio = float(preliminary_metrics.get("overlap_ratio", 1.0))
+        outer_piece_count = int(preliminary_metrics.get("outer_piece_count", 0))
+        if not _has_best_effort_rectangle_support(
+            preliminary_metrics,
+            len(solver_pieces),
+        ):
+            return
+        seam_rank = (
+            float(state["segmented_count"])
+            + float(state["full_error"])
+            - float(state["matched_length"]) * 0.001
+        )
+        rank = (
+            overlap_ratio,
+            1.0 - fill_ratio,
+            len(solver_pieces) - outer_piece_count,
+            seam_rank,
+        )
+        previous_rank = progress.get("best_effort_rank")
+        if previous_rank is not None and tuple(previous_rank) <= rank:
+            return
+        best_metrics = {}
+        best_result, _reason = _canonicalize_complete_layout(
+            state["placed"],
+            pixels_per_mm=selected_pixels_per_mm,
+            min_fill_ratio=0.0,
+            max_overlap_ratio=1.0,
+            metrics=best_metrics,
+            enforce_size_bounds=False,
+        )
+        if best_result is None:
+            return
+        score = float(best_result[3]) + seam_rank
+        best_diagnostics = dict(diagnostics)
+        best_diagnostics.update(
+            {
+                "best_effort": 1,
+                "fill_permille": int(round(float(best_metrics["fill_ratio"]) * 1000.0)),
+                "overlap_permille": int(
+                    round(float(best_metrics["overlap_ratio"]) * 1000.0)
+                ),
+                "outer_piece_count": int(best_metrics["outer_piece_count"]),
+                "four_used_segmented": int(state["segmented_count"]),
+            }
+        )
+        plan = _build_unknown_success_plan(
+            solver_pieces,
+            best_result,
+            work_region_mm,
+            split_y_mm,
+            score,
+            search_nodes=diagnostics["four_work_units"],
+            diagnostics=best_diagnostics,
+            reliable=False,
+            reason="best_effort",
+        )
+        _store_unknown_best_effort_plan(progress, plan, rank)
+
     if active_budget_reached():
         return None, diagnostics
 
@@ -2351,6 +2559,7 @@ def _solve_unknown_four_fast_path_steps(
                                 tolerance_mm=length_tolerance,
                                 long_side_range_mm=selected_long_range,
                                 short_side_range_mm=selected_short_range,
+                                enforce_size_bounds=enforce_size_bounds,
                             )
                             if partial_priority is None:
                                 diagnostics["four_partial_reject"] += 1
@@ -2443,6 +2652,7 @@ def _solve_unknown_four_fast_path_steps(
                 long_side_range_mm=selected_long_range,
                 short_side_range_mm=selected_short_range,
                 max_overlap_ratio=selected_max_overlap,
+                enforce_size_bounds=enforce_size_bounds,
             )
             accepted_relaxed = False
             candidate_metrics = strict_metrics
@@ -2452,6 +2662,7 @@ def _solve_unknown_four_fast_path_steps(
                 elif rejection_reason == "fill_reject":
                     diagnostics["four_fill_reject"] += 1
                 if rejection_reason != "fill_reject":
+                    consider_best_effort(state, strict_metrics)
                     yield None
                     continue
                 relaxed_metrics = {}
@@ -2464,10 +2675,12 @@ def _solve_unknown_four_fast_path_steps(
                     long_side_range_mm=selected_long_range,
                     short_side_range_mm=selected_short_range,
                     max_overlap_ratio=selected_max_overlap,
+                    enforce_size_bounds=enforce_size_bounds,
                 )
                 if canonical_result is None:
                     if relaxed_reason == "outer_edge_reject":
                         diagnostics["four_outer_edge_reject"] += 1
+                    consider_best_effort(state, relaxed_metrics)
                     yield None
                     continue
                 accepted_relaxed = True
@@ -2559,6 +2772,7 @@ def _solve_unknown_four_fast_path(
     long_side_range_mm=UNKNOWN_LONG_SIDE_RANGE_MM,
     short_side_range_mm=UNKNOWN_SHORT_SIDE_RANGE_MM,
     max_overlap_ratio=UNKNOWN_MAX_OVERLAP_RATIO,
+    enforce_size_bounds=True,
 ):
     """创建FOUR_FAST增量核心；默认同步消费以保持既有调用兼容。
 
@@ -2580,6 +2794,7 @@ def _solve_unknown_four_fast_path(
         long_side_range_mm=long_side_range_mm,
         short_side_range_mm=short_side_range_mm,
         max_overlap_ratio=max_overlap_ratio,
+        enforce_size_bounds=enforce_size_bounds,
     )
     if bool(incremental):
         return steps
@@ -2646,7 +2861,8 @@ def _solve_unknown_layout_steps(
 
     关键参数：texture_refinement_nodes限制找到首个带纹理解后继续比较的节点数；
     search_width限制每层排序后保留的状态数；stop_at_first_solution用于WHITE显式模式，
-    使反光纹理不再触发额外择优；progress用于公开节点、边图和前沿诊断。
+    使反光纹理不再触发额外择优；target_size_hint_mm非None代表KNOWN登记，此时继续执行
+    原尺寸硬门且禁止最佳回退。普通UNKNOWN关闭尺寸门，并通过progress保存最佳完整候选。
     """
     pieces = list(pieces)
     if not 1 <= len(pieces) <= 4:
@@ -2712,6 +2928,10 @@ def _solve_unknown_layout_steps(
         for feature in solver_piece["edge_features"]
     )
     first_polygon = solver_pieces[0]["local_vertices"].copy()
+    # KNOWN登记会传入100x60mm提示；普通UNKNOWN不传提示，因此可在不扩展公开API的
+    # 前提下准确区分两条行为，确保KNOWN SAVE继续使用原尺寸安全门。
+    enforce_size_bounds = target_size_hint_mm is not None
+    allow_best_effort = not enforce_size_bounds
     best_candidate = None
     best_score = float("inf")
     best_is_relaxed = False
@@ -2767,6 +2987,81 @@ def _solve_unknown_layout_steps(
             rejection_counts,
         )
 
+    def consider_best_effort(placed_by_index, preliminary_metrics):
+        """把未通过可靠门的完整普通UNKNOWN布局保存为全局最佳回退。
+
+        主要流程：先用已有验收指标构造低重叠、高填充、外边完整、接缝连续的排序键；
+        仅当它可能优于GRAPH、FOUR_FAST或先前FALLBACK候选时，才以0填充门重建规范布局
+        并生成可执行计划。KNOWN登记不会进入本函数。返回值无业务含义。
+        """
+        if not allow_best_effort:
+            return
+        fill_ratio = float(preliminary_metrics.get("fill_ratio", 0.0))
+        overlap_ratio = float(preliminary_metrics.get("overlap_ratio", 1.0))
+        outer_piece_count = int(preliminary_metrics.get("outer_piece_count", 0))
+        if not _has_best_effort_rectangle_support(
+            preliminary_metrics,
+            len(solver_pieces),
+        ):
+            return
+        # 只有规范布局形成后才能计算目标接缝分数，因此预筛选最后一项先用0；最终
+        # `_store_unknown_best_effort_plan`会使用包含真实接缝分数的完整排序键。
+        preliminary_rank = (
+            overlap_ratio,
+            1.0 - fill_ratio,
+            len(solver_pieces) - outer_piece_count,
+            0.0,
+        )
+        previous_rank = progress.get("best_effort_rank")
+        if previous_rank is not None and tuple(previous_rank)[:3] < preliminary_rank[:3]:
+            return
+        best_metrics = {}
+        canonical_result, _reason = _canonicalize_complete_layout(
+            placed_by_index,
+            pixels_per_mm=pixels_per_mm,
+            min_fill_ratio=0.0,
+            max_overlap_ratio=1.0,
+            metrics=best_metrics,
+            enforce_size_bounds=False,
+        )
+        if canonical_result is None:
+            return
+        canonical_by_index, _width_mm, _height_mm, geometry_score = canonical_result
+        texture_score = _complete_layout_texture_score(
+            canonical_by_index,
+            solver_pieces,
+        )
+        rank = (
+            float(best_metrics["overlap_ratio"]),
+            1.0 - float(best_metrics["fill_ratio"]),
+            len(solver_pieces) - int(best_metrics["outer_piece_count"]),
+            float(texture_score),
+        )
+        best_diagnostics = dict(rejection_counts)
+        best_diagnostics.update(
+            {
+                "best_effort": 1,
+                "fill_permille": int(round(float(best_metrics["fill_ratio"]) * 1000.0)),
+                "overlap_permille": int(
+                    round(float(best_metrics["overlap_ratio"]) * 1000.0)
+                ),
+                "outer_piece_count": int(best_metrics["outer_piece_count"]),
+            }
+        )
+        score = float(geometry_score) + float(texture_score) * 20.0
+        plan = _build_unknown_success_plan(
+            solver_pieces,
+            canonical_result,
+            work_region_mm,
+            split_y_mm,
+            score,
+            search_nodes,
+            best_diagnostics,
+            reliable=False,
+            reason="best_effort",
+        )
+        _store_unknown_best_effort_plan(progress, plan, rank)
+
     def evaluate_complete(placed_by_index):
         """先严格、后WHITE容错验收完整组合，并保存同层内分数最低的候选。"""
         nonlocal best_candidate, best_score, best_is_relaxed, best_metrics
@@ -2778,12 +3073,14 @@ def _solve_unknown_layout_steps(
             pixels_per_mm=pixels_per_mm,
             min_fill_ratio=UNKNOWN_STRICT_MIN_FILL_RATIO,
             metrics=strict_metrics,
+            enforce_size_bounds=enforce_size_bounds,
         )
         accepted_relaxed = False
         if canonical_result is None:
             rejection_counts[rejection_reason] += 1
-            # 尺寸和重叠硬门在两层完全相同，只有严格填充不足才值得进入WHITE容错层。
+            # WHITE只有严格填充不足才进入86%可靠容错；其余拒绝直接参与最佳回退。
             if not (stop_at_first_solution and rejection_reason == "fill_reject"):
+                consider_best_effort(placed_by_index, strict_metrics)
                 return
             relaxed_metrics = {}
             canonical_result, relaxed_reason = _canonicalize_complete_layout(
@@ -2792,12 +3089,14 @@ def _solve_unknown_layout_steps(
                 min_fill_ratio=UNKNOWN_RELAXED_MIN_FILL_RATIO,
                 require_all_outer_edges=True,
                 metrics=relaxed_metrics,
+                enforce_size_bounds=enforce_size_bounds,
             )
             if canonical_result is None:
                 if relaxed_reason == "fill_reject":
                     rejection_counts["relaxed_fill_reject"] += 1
                 elif relaxed_reason == "outer_edge_reject":
                     rejection_counts["outer_edge_reject"] += 1
+                consider_best_effort(placed_by_index, relaxed_metrics)
                 return
             accepted_relaxed = True
             rejection_counts["relaxed_candidates"] += 1
@@ -2904,6 +3203,7 @@ def _solve_unknown_layout_steps(
                             list(updated.values()),
                             tolerance_mm=length_tolerance,
                             target_size_hint_mm=target_size_hint_mm,
+                            enforce_size_bounds=enforce_size_bounds,
                         )
                         if partial_priority is None:
                             yield None
@@ -2969,6 +3269,14 @@ def _solve_unknown_layout_steps(
 
     yield from search({0: first_polygon}, tuple(range(1, len(solver_pieces))))
     if best_candidate is None:
+        best_effort_plan = progress.get("best_effort_plan")
+        if (
+            allow_best_effort
+            and isinstance(best_effort_plan, AssemblyPlan)
+            and best_effort_plan.success
+            and not best_effort_plan.reliable
+        ):
+            return best_effort_plan
         if reached_limit:
             reason = "search_limit"
         elif rejection_counts["complete_candidates"] > 0:
@@ -3046,6 +3354,7 @@ def _solve_unknown_white_pipeline_steps(
         pixels_per_mm=pixels_per_mm,
         incremental=True,
         progress=progress,
+        enforce_size_bounds=False,
     )
     graph_plan, graph_diagnostics = yield from _resume_solver_stage(graph_stage)
     stage_events.append(
@@ -3075,6 +3384,7 @@ def _solve_unknown_white_pipeline_steps(
             pixels_per_mm=pixels_per_mm,
             incremental=True,
             progress=progress,
+            enforce_size_bounds=False,
         )
         four_plan, four_diagnostics = yield from _resume_solver_stage(four_stage)
         # 子生成器返回时，外层advance已经累计了此前所有FOURFAST工作单元；在复制
@@ -3157,6 +3467,9 @@ class UnknownSolveJob:
             "search_nodes": 0,
             "first_solution_node": None,
             "best_plan": None,
+            # 可靠计划与最佳回退必须分开保存；结束和超时统一按可靠计划优先选择。
+            "best_effort_plan": None,
+            "best_effort_rank": None,
             "current_stage": "fallback",
             "result_source": "fallback",
             # 这两个字段由外层任务计时、FOURFAST生成器读取。三片和CARD不会进入
@@ -3320,11 +3633,11 @@ class UnknownSolveJob:
         return elapsed_seconds
 
     def _finish_timeout(self, current_time):
-        """关闭生成器，并优先返回搜索期间已经验证通过的最优规划。
+        """关闭生成器，并按可靠结果、最佳回退、纯超时的顺序返回。
 
         关键参数current_time必须来自同一单调时钟；诊断保留活动耗时、总墙钟、边候选、
-        最大前沿和首解节点。若progress中已有best_plan，则克隆为成功结果并标记截止返回；
-        否则返回不含机械目标的solver_timeout。重复advance会直接返回同一结果。
+        最大前沿和首解节点。可靠best_plan优先；否则克隆best_effort_plan并保留不可靠标志；
+        完整候选一个都没有时才返回solver_timeout。重复advance会直接返回同一结果。
         """
         if self.done:
             return self.result
@@ -3343,19 +3656,30 @@ class UnknownSolveJob:
             # elapsed_ms是v1.4.0诊断字段，继续映射到总墙钟以兼容旧测试和现场日志。
             "elapsed_ms": wall_elapsed_ms,
         })
-        best_plan = self._progress.get("best_plan")
-        if isinstance(best_plan, AssemblyPlan) and best_plan.success:
-            diagnostics = dict(best_plan.diagnostics)
+        reliable_plan = self._progress.get("best_plan")
+        best_effort_plan = self._progress.get("best_effort_plan")
+        selected_plan = None
+        if isinstance(reliable_plan, AssemblyPlan) and reliable_plan.success:
+            selected_plan = reliable_plan
+        elif (
+            isinstance(best_effort_plan, AssemblyPlan)
+            and best_effort_plan.success
+            and not best_effort_plan.reliable
+        ):
+            selected_plan = best_effort_plan
+        if selected_plan is not None:
+            diagnostics = dict(selected_plan.diagnostics)
             diagnostics.update(timeout_diagnostics)
             diagnostics["returned_best_at_timeout"] = 1
             self.result = AssemblyPlan(
                 True,
-                placements=best_plan.placements,
-                target_rect_mm=best_plan.target_rect_mm,
-                score=best_plan.score,
-                reason=best_plan.reason,
+                placements=selected_plan.placements,
+                target_rect_mm=selected_plan.target_rect_mm,
+                score=selected_plan.score,
+                reason=selected_plan.reason,
                 search_nodes=self.search_nodes,
                 diagnostics=diagnostics,
+                reliable=selected_plan.reliable,
             )
         else:
             self.result = AssemblyPlan.failed(

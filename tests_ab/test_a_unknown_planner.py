@@ -194,6 +194,48 @@ def _device_short_edge_pieces():
     )
 
 
+def _latest_three_piece_device_snapshot():
+    """返回本次实机日志中会被旧尺寸门拒绝的三片锁定快照。
+
+    这组三片可以形成约79x60mm、填充率超过92%的紧密矩形。题目毫米范围不再作为
+    UNKNOWN硬门后，它必须直接形成可靠规划，不能继续落入fill_reject兜底。
+    """
+    raw_vertices = (
+        (
+            (165.7, 112.2),
+            (194.3, 90.5),
+            (194.8, 88.2),
+            (160.2, 44.1),
+            (164.3, 111.3),
+        ),
+        (
+            (151.4, 76.9),
+            (92.0, 45.9),
+            (89.6, 46.4),
+            (96.1, 102.0),
+        ),
+        (
+            (81.1, 100.8),
+            (60.3, 43.2),
+            (38.3, 43.3),
+            (39.7, 100.9),
+        ),
+    )
+    pieces = []
+    for index, vertices in enumerate(raw_vertices, start=1):
+        vertices_array = np.asarray(vertices, dtype=np.float64)
+        pieces.append(
+            {
+                "id": f"U{index}",
+                "vertices_mm": vertices_array.astype(float).tolist(),
+                "center_mm": _centroid(vertices_array),
+                "region": "upper",
+                "complete": True,
+            }
+        )
+    return pieces
+
+
 def _field_four_pieces_from_device_log():
     """返回本次四片超时日志中的原始毫米轮廓。
 
@@ -446,8 +488,30 @@ def test_white_relaxed_fill_recovers_noisy_corner_device_shape():
     assert plan.search_nodes < 150
 
 
-def test_card_keeps_strict_fill_for_noisy_corner_device_shape():
-    """CARD不得借用WHITE的86%容错门，避免低填充错误拼法绕过花纹比较。"""
+def test_unknown_ignores_size_gate_for_latest_three_piece_device_snapshot():
+    """高填充矩形不能再因为实测长边小于88mm而被UNKNOWN拒绝。"""
+    from maixcam2_app_A_quad.assembly_planner import solve_unknown_layout
+
+    plan = solve_unknown_layout(
+        _latest_three_piece_device_snapshot(),
+        work_region_mm=(0.0, 0.0, 297.0, 210.0),
+        split_y_mm=105.0,
+        stop_at_first_solution=True,
+        active_timeout_seconds=60.0,
+        wall_timeout_seconds=60.0,
+        paper_orientation="landscape",
+    )
+
+    assert plan.success is True, (plan.reason, plan.search_nodes, plan.diagnostics)
+    assert plan.reliable is True
+    assert plan.reason == "ok"
+    assert len(plan.placements) == 3
+    assert max(plan.target_rect_mm[2:]) < 88.0
+    assert plan.diagnostics["fill_permille"] >= 920
+
+
+def test_card_returns_best_effort_after_strict_search_has_no_reliable_layout():
+    """CARD严格搜索自然结束后必须返回最佳完整候选并保留不可靠标志。"""
     from maixcam2_app_A_quad.assembly_planner import solve_unknown_layout
 
     plan = solve_unknown_layout(
@@ -459,8 +523,12 @@ def test_card_keeps_strict_fill_for_noisy_corner_device_shape():
         wall_timeout_seconds=60.0,
     )
 
-    assert plan.success is False
-    assert plan.reason == "fill_reject"
+    assert plan.success is True, (plan.reason, plan.search_nodes, plan.diagnostics)
+    assert plan.reliable is False
+    assert plan.reason == "best_effort"
+    assert len(plan.placements) == 3
+    assert plan.diagnostics["best_effort"] == 1
+    assert 0 < plan.diagnostics["fill_permille"] < 920
 
 
 def test_relaxed_fill_rejects_piece_without_target_outer_edge():
@@ -1286,6 +1354,57 @@ def test_unknown_job_hard_deadline_returns_existing_best_plan():
     assert len(result.placements) == 3
     assert result.diagnostics["returned_best_at_timeout"] == 1
     assert result.diagnostics["wall_elapsed_ms"] == 20100
+
+
+def test_unknown_job_timeout_returns_existing_best_effort_plan():
+    """无可靠解超时时必须返回已检查到的最佳完整候选并保持警告属性。"""
+    from maixcam2_app_A_quad.assembly_planner import (
+        AssemblyPlan,
+        UnknownSolveJob,
+        solve_unknown_layout,
+    )
+
+    reliable_plan = solve_unknown_layout(
+        _irregular_three_pieces_like_field_mask(),
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        timeout_seconds=60.0,
+    )
+    assert reliable_plan.success is True
+    best_effort_plan = AssemblyPlan(
+        True,
+        placements=reliable_plan.placements,
+        target_rect_mm=reliable_plan.target_rect_mm,
+        score=reliable_plan.score + 10.0,
+        reason="best_effort",
+        reliable=False,
+        diagnostics={"best_effort": 1, "fill_permille": 810},
+    )
+    current_time = [200.0]
+
+    def fake_clock():
+        """返回测试控制的总墙钟，触发任务硬截止线。"""
+        return current_time[0]
+
+    job = UnknownSolveJob(
+        _irregular_three_pieces_like_field_mask(),
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        active_timeout_seconds=5.0,
+        wall_timeout_seconds=20.0,
+        clock=fake_clock,
+    )
+    job._progress["best_effort_plan"] = best_effort_plan
+    current_time[0] = 220.1
+
+    result = job.advance(time_budget_ms=12.0, work_unit_limit=1)
+
+    assert result.success is True
+    assert result.reliable is False
+    assert result.reason == "best_effort"
+    assert len(result.placements) == 3
+    assert result.diagnostics["best_effort"] == 1
+    assert result.diagnostics["returned_best_at_timeout"] == 1
 
 
 def test_white_fast_plan_finishing_after_deadline_is_preserved(monkeypatch):
