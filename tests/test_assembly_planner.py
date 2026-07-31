@@ -178,8 +178,8 @@ def test_unknown_solver_reports_edge_mismatch_when_no_seam_candidate_exists():
     assert plan.reason == "edge_mismatch"
 
 
-def test_unknown_solver_reports_size_reject_for_complete_but_too_small_layout():
-    """能沿整边组合但目标尺寸小于题目下限时应明确报告尺寸拒绝。"""
+def test_unknown_solver_accepts_complete_small_two_piece_rectangle():
+    """普通UNKNOWN不再用毫米尺寸拒绝完整、低重叠的两片矩形。"""
     pieces = [
         _solver_piece(
             "U1",
@@ -197,12 +197,15 @@ def test_unknown_solver_reports_size_reject_for_complete_but_too_small_layout():
 
     plan = solve_unknown_layout(pieces, WORK_REGION_MM, SPLIT_Y_MM)
 
-    assert plan.success is False
-    assert plan.reason == "size_reject"
+    assert plan.success is True
+    assert plan.reliable is True
+    assert plan.reason == "ok"
+    assert plan.target_rect_mm[2:] == (50.0, 30.0)
+    assert plan.diagnostics["size_reject"] == 0
 
 
-def test_unknown_single_piece_reports_geometry_rejection_instead_of_edge_mismatch():
-    """单片无需寻找接缝，尺寸不合格时必须报告几何原因而不是边不匹配。"""
+def test_unknown_single_piece_accepts_its_own_complete_rectangle():
+    """单片UNKNOWN无需寻找接缝，也不得因历史毫米尺寸范围被拒绝。"""
     piece = _solver_piece(
         "U1",
         ((0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)),
@@ -212,8 +215,11 @@ def test_unknown_single_piece_reports_geometry_rejection_instead_of_edge_mismatc
 
     plan = solve_unknown_layout([piece], WORK_REGION_MM, SPLIT_Y_MM)
 
-    assert plan.success is False
-    assert plan.reason == "size_reject"
+    assert plan.success is True
+    assert plan.reliable is True
+    assert plan.reason == "ok"
+    assert plan.target_rect_mm[2:] == (40.0, 30.0)
+    assert plan.diagnostics["size_reject"] == 0
 
 
 def test_known_save_registers_lower_layout_and_builds_exact_target_templates():

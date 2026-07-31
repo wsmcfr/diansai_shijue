@@ -1223,6 +1223,41 @@ def test_complex_unknown_four_piece_pc_solve_is_under_100ms():
     assert min(elapsed_samples) < 0.100, elapsed_samples
 
 
+def test_reliable_plan_stops_building_best_effort_snapshots(monkeypatch):
+    """已有可靠计划后不得继续物化永远不会被采用的不可靠机械计划。"""
+    from maixcam2_app_A_quad import assembly_planner
+
+    original_builder = assembly_planner._build_unknown_success_plan
+    reliable_plan_built = False
+
+    def recording_builder(*args, **kwargs):
+        """记录可靠计划出现时刻，并拒绝其后的不可靠计划构建。"""
+        nonlocal reliable_plan_built
+        is_reliable = bool(kwargs.get("reliable", True))
+        if not is_reliable and reliable_plan_built:
+            raise AssertionError("已有可靠计划后仍构建最佳回退")
+        plan = original_builder(*args, **kwargs)
+        if is_reliable and plan is not None:
+            reliable_plan_built = True
+        return plan
+
+    monkeypatch.setattr(
+        assembly_planner,
+        "_build_unknown_success_plan",
+        recording_builder,
+    )
+    plan = assembly_planner.solve_unknown_layout(
+        _patterned_irregular_four_pieces(),
+        work_region_mm=(0.0, 33.5, 210.0, 230.0),
+        split_y_mm=148.5,
+        texture_refinement_nodes=80,
+    )
+
+    assert plan.success is True
+    assert plan.reliable is True
+    assert reliable_plan_built is True
+
+
 def test_unknown_solve_job_has_five_second_total_wall_clock_timeout():
     """任务从创建起超过5秒必须结构化超时，不能在主循环中无限跨帧等待。"""
     from maixcam2_app_A_quad.assembly_planner import UnknownSolveJob

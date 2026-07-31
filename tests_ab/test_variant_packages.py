@@ -14,8 +14,8 @@ VARIANT_RELEASES = (
     (
         "maixcam2_app_A_quad",
         "diansai_quad",
-        "2.1.0",
-        "diansai_quad-v2.1.0.zip",
+        "2.2.0",
+        "diansai_quad-v2.2.0.zip",
         {
             "__init__.py",
             "A版实机调试手册.md",
@@ -172,6 +172,27 @@ def test_package_script_exposes_two_explicit_release_specs():
         "maixcam2_app_A_quad",
         "maixcam2_app_B_warp",
     }
+    assert (
+        module_globals["RELEASE_SPECS"]["maixcam2_app_A_quad"]["archive"]
+        == "diansai_quad-v2.2.0.zip"
+    )
+
+
+def test_a_field_guide_documents_best_effort_warning_and_uart_flag():
+    """正式包内手册必须解释警告结果仍发送，避免现场把它误认成可靠解。"""
+    guide_text = (
+        PROJECT_ROOT / "maixcam2_app_A_quad" / "A版实机调试手册.md"
+    ).read_text(encoding="utf-8")
+    protocol_text = (
+        PROJECT_ROOT
+        / "maixcam2_app_A_quad"
+        / "MaixCAM2与STM32F4串口协议说明.md"
+    ).read_text(encoding="utf-8")
+
+    assert "PLAN BEST !" in guide_text
+    assert "可能不准确" in guide_text
+    assert "RESULT_FLAG_BEST_EFFORT" in protocol_text
+    assert "bit1..bit7" in protocol_text
 
 
 def test_package_script_release_file_order_matches_each_manifest():

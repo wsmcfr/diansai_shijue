@@ -2996,6 +2996,12 @@ def _solve_unknown_layout_steps(
         """
         if not allow_best_effort:
             return
+        # 可靠计划在最终选择和超时收尾中始终优先于最佳回退。CARD为花纹择优会在首个
+        # 可靠解后继续检查候选，但此时再执行轮廓配准并物化不可靠机械计划只会增加耗时，
+        # 且这些计划永远不可能被返回；因此保留后续可靠候选比较，单独停止回退构建。
+        reliable_plan = progress.get("best_plan")
+        if isinstance(reliable_plan, AssemblyPlan) and reliable_plan.success:
+            return
         fill_ratio = float(preliminary_metrics.get("fill_ratio", 0.0))
         overlap_ratio = float(preliminary_metrics.get("overlap_ratio", 1.0))
         outer_piece_count = int(preliminary_metrics.get("outer_piece_count", 0))
