@@ -44,6 +44,28 @@ def _make_detection(piece_count, edge_count=0):
     )
 
 
+def _make_a_session(frame_size=(640, 480), paper_quad=None):
+    """构造A版调参会话，并可注入历史蓝框验证手动模式初始化优先级。"""
+    modules = _variant_modules("maixcam2_app_A_quad")
+    saved = modules.settings.build_default_runtime_settings(
+        modules.config.DEFAULT_CONFIG,
+        frame_size=frame_size,
+    )
+    if paper_quad is not None:
+        saved["paper_quad"] = np.asarray(paper_quad, dtype=float).tolist()
+    return modules, modules.calibration.CalibrationSession(saved, frame_size)
+
+
+def _session_work_region(session):
+    """返回会话中的黄色毫米工作区，便于直接检查它是否恢复为完整A4。"""
+    return (
+        session.settings["work_x_mm"],
+        session.settings["work_y_mm"],
+        session.settings["work_width_mm"],
+        session.settings["work_height_mm"],
+    )
+
+
 @pytest.mark.parametrize("package_name", VARIANTS)
 def test_calibration_layout_keeps_variant_specific_fixed_controls(package_name):
     """验证A版使用六槽发送A4，B版继续保持原五槽且所有槽互不重叠。"""
@@ -115,6 +137,78 @@ def test_calibration_session_maps_simple_and_advanced_bottom_actions(package_nam
     if package_name.endswith("A_quad"):
         expected_advanced += ("disabled",)
     assert session.bottom_actions() == expected_advanced
+
+
+def test_a_roi_session_starts_in_auto_and_cycles_manual_paper_items():
+    """A版ROI会话应默认AUTO，并独立循环MODE、蓝框几何和像素步进项目。"""
+    _modules, session = _make_a_session()
+
+    assert session.roi_mode == "AUTO"
+    assert session.current_roi_item == "MODE"
+    assert [session.cycle_roi_item() for _ in range(6)] == [
+        "X",
+        "Y",
+        "W",
+        "H",
+        "STEP",
+        "MODE",
+    ]
+    assert session.manual_roi_step_px == 5
+
+
+def test_a_switching_to_manual_builds_centered_a4_when_quad_is_missing():
+    """无AUTO和历史蓝框时，MANUAL应生成居中竖版A4框并重置完整黄色区。"""
+    _modules, session = _make_a_session(frame_size=(1280, 960))
+
+    assert session.set_roi_mode("MANUAL") is True
+
+    quad = np.asarray(session.settings["paper_quad"], dtype=float)
+    mean_width = (
+        np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])
+    ) / 2.0
+    mean_height = (
+        np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])
+    ) / 2.0
+    assert quad.shape == (4, 2)
+    np.testing.assert_allclose(quad.mean(axis=0), (640.0, 480.0), atol=0.01)
+    assert mean_width / mean_height == pytest.approx(210.0 / 297.0, rel=1e-4)
+    assert _session_work_region(session) == pytest.approx((0.0, 0.0, 210.0, 297.0))
+    assert session.settings["split_y_mm"] == pytest.approx(148.5)
+    assert session.status_text == "ROI MANUAL"
+
+
+def test_a_switching_to_manual_preserves_existing_quad_and_resets_full_work_area():
+    """已有AUTO或历史蓝框时，MANUAL只把黄色区恢复完整A4，不得重建蓝框。"""
+    old_quad = np.float32([[120, 80], [500, 60], [530, 410], [90, 430]])
+    _modules, session = _make_a_session(paper_quad=old_quad)
+    session.settings.update(
+        {
+            "work_x_mm": 10.0,
+            "work_y_mm": 20.0,
+            "work_width_mm": 180.0,
+            "work_height_mm": 240.0,
+            "split_y_mm": 140.0,
+        }
+    )
+
+    assert session.set_roi_mode("MANUAL") is True
+
+    np.testing.assert_allclose(session.settings["paper_quad"], old_quad, atol=0.01)
+    assert _session_work_region(session) == pytest.approx((0.0, 0.0, 210.0, 297.0))
+    assert session.settings["split_y_mm"] == pytest.approx(148.5)
+
+
+def test_a_switching_back_to_auto_keeps_manual_quad_available_for_retry():
+    """MANUAL切回AUTO只改变会话模式，AUTO重试前不得清空当前蓝框。"""
+    old_quad = np.float32([[120, 80], [500, 60], [530, 410], [90, 430]])
+    _modules, session = _make_a_session(paper_quad=old_quad)
+    session.set_roi_mode("MANUAL")
+
+    assert session.set_roi_mode("AUTO") is True
+
+    assert session.roi_mode == "AUTO"
+    np.testing.assert_allclose(session.settings["paper_quad"], old_quad, atol=0.01)
+    assert session.status_text == "ROI AUTO"
 
 
 def test_a_send_a4_button_is_enabled_only_after_paper_quad_exists(monkeypatch):

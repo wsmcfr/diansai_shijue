@@ -13,6 +13,7 @@ try:
         build_work_quad,
         default_split_y_mm,
         default_work_region_mm,
+        paper_size_mm,
     )
     from maixcam2_app_A_quad.settings_store import (
         CLOSE_KERNEL_VALUES,
@@ -30,6 +31,7 @@ except ModuleNotFoundError as error:
         build_work_quad,
         default_split_y_mm,
         default_work_region_mm,
+        paper_size_mm,
     )
     from settings_store import (
         CLOSE_KERNEL_VALUES,
@@ -64,6 +66,15 @@ WORK_SETTING_KEYS = {
     "H": "work_height_mm",
     "SPLIT": "split_y_mm",
 }
+
+# 蓝框手动标定状态只属于当前CAL会话，不写入设置JSON。AUTO负责单次检测，MANUAL
+# 才允许改变paper_quad；参数列表与黄色毫米工作区分开，避免同一个按钮循环十余项。
+ROI_MODE_AUTO = "AUTO"
+ROI_MODE_MANUAL = "MANUAL"
+ROI_MODES = (ROI_MODE_AUTO, ROI_MODE_MANUAL)
+PAPER_ROI_ITEMS = ("MODE", "X", "Y", "W", "H", "STEP")
+MANUAL_ROI_STEPS_PX = (1, 5, 10)
+MANUAL_INITIAL_FRAME_FRACTION = 0.80
 
 # RESULT页面使用稳定BGR颜色区分轮廓去留原因。
 COLOR_VALID = (0, 210, 0)
@@ -318,6 +329,11 @@ class CalibrationSession:
         self._work_item_index = 0
         self._segment_item_index = 0
         self._step_index = CALIBRATION_STEPS.index(5)
+        # 蓝框模式、当前蓝框参数和像素步进均为会话态。只有LOCK ROI保存的
+        # paper_quad会持久化，重新进入CAL时仍从AUTO开始，防止误触直接移动蓝框。
+        self.roi_mode = ROI_MODE_AUTO
+        self._paper_roi_item_index = 0
+        self._manual_roi_step_index = MANUAL_ROI_STEPS_PX.index(5)
         self.status_text = "ROI NOT SET" if self.settings["paper_quad"] is None else "ROI READY"
         self.paper_confidence = None
         # 跟踪器属于未保存会话；退出CAL后自动丢弃，避免跨标定批次沿用旧稳定帧。
@@ -332,6 +348,16 @@ class CalibrationSession:
     def step(self):
         """返回当前像素、灰度或面积比例调节使用的整数步长。"""
         return CALIBRATION_STEPS[self._step_index]
+
+    @property
+    def current_roi_item(self):
+        """返回ROI页当前选中的蓝框会话参数，不与黄色毫米工作区共用索引。"""
+        return PAPER_ROI_ITEMS[self._paper_roi_item_index]
+
+    @property
+    def manual_roi_step_px(self):
+        """返回蓝框手动调节的相机分析像素步进，默认值为5px。"""
+        return MANUAL_ROI_STEPS_PX[self._manual_roi_step_index]
 
     @property
     def current_item(self):
@@ -397,6 +423,89 @@ class CalibrationSession:
         """按X、Y、W、H、SPLIT、PAPER顺序循环机械参数并返回新名称。"""
         self._work_item_index = (self._work_item_index + 1) % len(WORK_ITEMS)
         return self.current_item
+
+    def cycle_roi_item(self):
+        """循环ROI页的MODE、蓝框几何和STEP参数并返回新名称。
+
+        该索引与黄色工作区、ADV分割参数完全独立，因此切换页面不会丢失各页面
+        最近选择的项目，也不会把像素值误当成毫米值进行调整。
+        """
+        self._paper_roi_item_index = (
+            self._paper_roi_item_index + 1
+        ) % len(PAPER_ROI_ITEMS)
+        return self.current_roi_item
+
+    def _build_centered_paper_quad(self):
+        """按当前PAPER方向生成画面中央的A4比例初始蓝框。
+
+        主要流程：使用画面宽高的80%作为最大可用范围，按210:297或297:210
+        等比缩放，再按左上、右上、右下、左下顺序返回四角。关键参数来自会话
+        frame_size和paper_orientation。返回值为四个浮点角点，不直接修改设置。
+        """
+        frame_width, frame_height = self.frame_size
+        paper_width_mm, paper_height_mm = paper_size_mm(
+            self.settings["paper_orientation"]
+        )
+        scale = min(
+            frame_width * MANUAL_INITIAL_FRAME_FRACTION / paper_width_mm,
+            frame_height * MANUAL_INITIAL_FRAME_FRACTION / paper_height_mm,
+        )
+        paper_width_px = paper_width_mm * scale
+        paper_height_px = paper_height_mm * scale
+        left = (frame_width - paper_width_px) / 2.0
+        top = (frame_height - paper_height_px) / 2.0
+        right = left + paper_width_px
+        bottom = top + paper_height_px
+        return [
+            [left, top],
+            [right, top],
+            [right, bottom],
+            [left, bottom],
+        ]
+
+    def _reset_full_work_region(self, updated):
+        """在设置副本中把黄色区、分界线和旧INSET恢复为完整A4。
+
+        关键参数updated为待校验的设置字典。函数原地更新该副本且无返回值；调用方
+        随后必须整体校验并替换会话设置，避免只写入一半字段形成非法中间状态。
+        """
+        work_region = default_work_region_mm(updated["paper_orientation"])
+        updated.update(
+            {
+                "inset_mm": 0.0,
+                "work_x_mm": work_region[0],
+                "work_y_mm": work_region[1],
+                "work_width_mm": work_region[2],
+                "work_height_mm": work_region[3],
+                "split_y_mm": default_split_y_mm(updated["paper_orientation"]),
+            }
+        )
+
+    def set_roi_mode(self, mode):
+        """切换AUTO/MANUAL蓝框模式，并准备手动模式所需的初始框。
+
+        关键参数mode只接受AUTO或MANUAL。切到MANUAL时优先保留会话已有蓝框；
+        没有AUTO或历史蓝框才生成居中A4框，同时让黄色区恢复为完整纸面。切回AUTO
+        只改变会话模式，不清空当前蓝框，便于AUTO失败后继续使用。成功返回True，
+        非法模式抛出ValueError；本函数从不写入持久存储。
+        """
+        normalized_mode = str(mode).strip().upper()
+        if normalized_mode not in ROI_MODES:
+            raise ValueError("ROI模式必须是AUTO或MANUAL")
+
+        if normalized_mode == ROI_MODE_MANUAL:
+            updated = dict(self.settings)
+            if updated.get("paper_quad") is None:
+                updated["paper_quad"] = self._build_centered_paper_quad()
+            self._reset_full_work_region(updated)
+            self.settings = validate_runtime_settings(updated, self.frame_size)
+            # 手工标定后AUTO置信度不再代表当前蓝框精度，必须清空避免误导现场判断。
+            self.paper_confidence = None
+
+        self.roi_mode = normalized_mode
+        self.measurement_tracker.reset()
+        self.status_text = f"ROI {normalized_mode}"
+        return True
 
     def _switch_paper_orientation(self):
         """切换V/H方向并重置对应默认机械区和水平分界线。
