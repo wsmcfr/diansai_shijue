@@ -1054,7 +1054,7 @@ def test_successful_plan_queues_all_placements_once_through_serial_runtime():
         )
         for index in range(1, 4)
     ]
-    plan = SimpleNamespace(success=True, placements=placements)
+    plan = SimpleNamespace(success=True, reliable=True, placements=placements)
 
     class RecordingSerialRuntime:
         """记录结果帧接口收到的模式、纸张方向和完整碎片列表。"""
@@ -1063,9 +1063,15 @@ def test_successful_plan_queues_all_placements_once_through_serial_runtime():
             """初始化为空调用记录。"""
             self.calls = []
 
-        def queue_puzzle_result_once(self, mode, orientation, actual_placements):
-            """保存调用参数并模拟本采集上下文首次排队成功。"""
-            self.calls.append((mode, orientation, actual_placements))
+        def queue_puzzle_result_once(
+            self,
+            mode,
+            orientation,
+            actual_placements,
+            best_effort=False,
+        ):
+            """保存调用参数与风险标志，并模拟本采集上下文首次排队成功。"""
+            self.calls.append((mode, orientation, actual_placements, best_effort))
             return True
 
     serial_runtime = RecordingSerialRuntime()
@@ -1078,7 +1084,17 @@ def test_successful_plan_queues_all_placements_once_through_serial_runtime():
     )
 
     assert queued is True
-    assert serial_runtime.calls == [("unknown", "portrait", placements)]
+    assert serial_runtime.calls == [("unknown", "portrait", placements, False)]
+
+    plan.reliable = False
+    best_effort_runtime = RecordingSerialRuntime()
+    assert queue_successful_plan_result(
+        best_effort_runtime,
+        plan,
+        "unknown",
+        "portrait",
+    ) is True
+    assert best_effort_runtime.calls == [("unknown", "portrait", placements, True)]
 
 
 @pytest.mark.parametrize(

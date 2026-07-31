@@ -16,6 +16,7 @@ from maixcam2_app_A_quad.serial_protocol import (
     MSG_PAPER_FRAME,
     MSG_PUZZLE_RESULT,
     PROTOCOL_VERSION,
+    RESULT_FLAG_BEST_EFFORT,
     FrameStreamParser,
     VisionSerialRuntime,
     create_maix_uart4,
@@ -109,7 +110,7 @@ def test_crc16_matches_ccitt_false_standard_vector():
 
 def test_frame_encoding_uses_little_endian_header_length_and_crc():
     """通用帧头、序号、长度和CRC必须完全符合协议文档的字节顺序。"""
-    assert PROTOCOL_VERSION == 2
+    assert PROTOCOL_VERSION == 3
     frame = encode_frame(
         MSG_PAPER_FRAME,
         b"\x01\x02",
@@ -117,7 +118,7 @@ def test_frame_encoding_uses_little_endian_header_length_and_crc():
         flags=FLAG_ACK_REQUIRED,
     )
 
-    assert frame[:9] == b"\xAA\x55\x02\x10\x01\x34\x12\x02\x00"
+    assert frame[:9] == b"\xAA\x55\x03\x10\x01\x34\x12\x02\x00"
     assert int.from_bytes(frame[-2:], "little") == crc16_ccitt_false(frame[2:-2])
 
 
@@ -138,7 +139,7 @@ def test_heartbeat_payload_carries_session_id_before_uptime_and_state():
         "last_error": 4,
     }
 
-    # 完整黄金帧同时锁定协议版本2、10字节长度和CRC，供F4文档逐字节核对。
+    # 完整黄金帧同时锁定协议版本3、10字节长度和CRC，供F4文档逐字节核对。
     frame = encode_frame(
         MSG_HEARTBEAT,
         encode_heartbeat_payload(0x12345678, 1000, 3, 0),
@@ -146,8 +147,8 @@ def test_heartbeat_payload_carries_session_id_before_uptime_and_state():
         flags=FLAG_ACK_REQUIRED,
     )
     assert frame == bytes.fromhex(
-        "AA 55 02 01 01 01 00 0A 00 "
-        "78 56 34 12 E8 03 00 00 03 00 64 66"
+        "AA 55 03 01 01 01 00 0A 00 "
+        "78 56 34 12 E8 03 00 00 03 00 86 76"
     )
 
 
@@ -250,6 +251,33 @@ def test_puzzle_payload_rounds_millimetres_and_signed_angle_to_tenths():
     assert piece["source_center_mm"] == (12.3, 56.8)
     assert piece["target_center_mm"] == (100.1, 200.0)
     assert piece["rotation_deg"] == -36.6
+
+
+def test_puzzle_payload_marks_best_effort_and_rejects_unknown_result_flags():
+    """结果头bit0必须标记可能不准确，F4解析模型不得接受任何未知高位。"""
+    reliable_payload = encode_puzzle_result_payload(
+        "unknown",
+        "portrait",
+        _make_placements(2),
+    )
+    best_effort_payload = encode_puzzle_result_payload(
+        "unknown",
+        "portrait",
+        _make_placements(2),
+        best_effort=True,
+    )
+
+    assert reliable_payload[3] == 0
+    assert best_effort_payload[3] == RESULT_FLAG_BEST_EFFORT
+    assert decode_puzzle_result_payload(reliable_payload)["reliable"] is True
+    decoded_best = decode_puzzle_result_payload(best_effort_payload)
+    assert decoded_best["best_effort"] is True
+    assert decoded_best["reliable"] is False
+
+    malformed = bytearray(best_effort_payload)
+    malformed[3] |= 0x80
+    with pytest.raises(ValueError, match="未知标志"):
+        decode_puzzle_result_payload(malformed)
 
 
 @pytest.mark.parametrize("piece_count", (0, 5))
@@ -454,6 +482,30 @@ def test_puzzle_result_is_queued_only_once_per_capture_context():
     runtime.reset_result_context()
     assert runtime.pending_count == 0
     assert runtime.queue_puzzle_result_once("unknown", "portrait", placements) is True
+
+
+def test_runtime_queues_best_effort_flag_without_changing_retry_semantics():
+    """不可靠结果仍走原单次可靠队列，但载荷必须把风险标志发送给F4。"""
+    clock = _FakeClock()
+    fake_uart = _FakeUart()
+    runtime = VisionSerialRuntime(lambda: fake_uart, clock_ms=clock)
+
+    assert runtime.queue_puzzle_result_once(
+        "unknown",
+        "landscape",
+        _make_placements(3),
+        best_effort=True,
+    ) is True
+    runtime.poll()
+    result_frame = next(
+        frame for frame in _decode_writes(fake_uart)
+        if frame.message_type == MSG_PUZZLE_RESULT
+    )
+    decoded = decode_puzzle_result_payload(result_frame.payload)
+
+    assert result_frame.flags == FLAG_ACK_REQUIRED
+    assert decoded["best_effort"] is True
+    assert runtime.pending_count == 1  # 心跳单独跟踪，可靠结果仍只占一个业务队列项。
 
 
 def test_runtime_rejects_invalid_plan_without_raising_or_consuming_context():

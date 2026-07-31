@@ -1194,6 +1194,38 @@ def test_planning_status_marks_solver_and_result_as_locked_snapshot():
     assert timeout_status == "LOCKED PLAN SOLVER_TIMEOUT"
 
 
+def test_planning_status_marks_best_effort_result_as_maybe_inaccurate():
+    """最佳完整回退必须使用独立警告文案，不能伪装成可靠PLAN OK。"""
+    from maixcam2_app_A_quad.assembly_planner import AssemblyPlan
+    from maixcam2_app_A_quad.main import select_planning_status
+
+    reliable_plan = AssemblyPlan(True, placements=[object(), object(), object()])
+    best_effort_plan = AssemblyPlan(
+        True,
+        placements=[object(), object(), object()],
+        reason="best_effort",
+        reliable=False,
+    )
+
+    reliable_status = select_planning_status(
+        "READY",
+        reliable_plan,
+        stable_count=3,
+        stable_frames=3,
+        snapshot_locked=True,
+    )
+    best_effort_status = select_planning_status(
+        "READY",
+        best_effort_plan,
+        stable_count=3,
+        stable_frames=3,
+        snapshot_locked=True,
+    )
+
+    assert reliable_status == "LOCKED PLAN OK N=3"
+    assert best_effort_status == "LOCKED PLAN BEST ! N=3"
+
+
 def test_planning_status_keeps_save_failure_until_next_user_action():
     """SAVE失败不能在下一帧被STABLE覆盖，否则现场来不及读取具体原因。"""
     from maixcam2_app_A_quad.main import select_planning_status

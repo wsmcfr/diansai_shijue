@@ -501,9 +501,9 @@ def queue_successful_plan_result(
     """把一次完整成功规划交给通信运行器的单次结果队列。
 
     主要流程：先拒绝None、失败结果和空placements，再把同一列表整体交给协议层；
-    协议层负责1～4片校验、定点编码和同一START上下文去重。关键参数中的mode和
-    paper_orientation必须与本次求解使用的运行设置一致。返回True表示首次排队，
-    False表示没有可发送规划或协议层判定本上下文已经发送过。
+    协议层负责1～4片校验、定点编码和同一START上下文去重。计划reliable=False时
+    同步设置结果载荷bit0，F4仍收到全部位姿但能提示可能不准确。关键参数中的mode和
+    paper_orientation必须与本次求解设置一致。返回True表示首次排队，否则返回False。
     """
     if assembly_plan is None or not bool(getattr(assembly_plan, "success", False)):
         return False
@@ -513,7 +513,15 @@ def queue_successful_plan_result(
     queue_result = getattr(serial_runtime, "queue_puzzle_result_once", None)
     if not callable(queue_result):
         raise ValueError("serial_runtime必须提供queue_puzzle_result_once方法")
-    return bool(queue_result(mode, paper_orientation, placements))
+    best_effort = not bool(getattr(assembly_plan, "reliable", True))
+    return bool(
+        queue_result(
+            mode,
+            paper_orientation,
+            placements,
+            best_effort=best_effort,
+        )
+    )
 
 
 def append_uart_status(status_text, link_text):
@@ -997,7 +1005,7 @@ def select_planning_status(
     """按动作优先级选择正常界面状态文字。
 
     SAVE或模式切换发生的当前帧可设置preserve_current，阻止后续规划更新覆盖关键
-    操作结果；普通帧依次显示增量求解进度、稳定计数、成功目标数量或具体失败原因。
+    操作结果；普通帧依次显示增量求解进度、稳定计数、可靠/警告目标数量或失败原因。
     solving为True时同时显示搜索节点N、边候选E、最大前沿F和首解标记S；S=1表示
     已有可在截止时返回的合法规划，S=0表示尚未找到。snapshot_locked为True时给求解
     和终态加`LOCKED`前缀，明确当前红点不会再随实时识别变化。返回字符串。
@@ -1023,6 +1031,8 @@ def select_planning_status(
             return f"STABLE {int(stable_count)}/{int(stable_frames)}"
         return str(current_status)
     if assembly_plan.success:
+        if not bool(getattr(assembly_plan, "reliable", True)):
+            return f"{locked_prefix}PLAN BEST ! N={len(assembly_plan.placements)}"
         return f"{locked_prefix}PLAN OK N={len(assembly_plan.placements)}"
     return f"{locked_prefix}PLAN {assembly_plan.reason.upper()}"
 

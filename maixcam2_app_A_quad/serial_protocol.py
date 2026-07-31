@@ -8,8 +8,8 @@ import time as _python_time
 
 # 通用帧常量集中定义，F4端必须使用完全相同的数值和小端字节序。
 FRAME_SOF = b"\xAA\x55"
-# 版本2引入10字节会话心跳；与旧版6字节心跳不兼容，F4必须按版本拒绝混用。
-PROTOCOL_VERSION = 2
+# 版本3把结果载荷第4字节定义为可靠性标志；F4必须按版本拒绝旧保留字段语义。
+PROTOCOL_VERSION = 3
 MAX_PAYLOAD_LENGTH = 64
 MAX_RX_BUFFER_LENGTH = 256
 
@@ -22,6 +22,10 @@ MSG_ACK = 0x80
 # FLAGS位定义；重发时沿用原TYPE和SEQ，只增加FLAG_RETRY供F4诊断。
 FLAG_ACK_REQUIRED = 0x01
 FLAG_RETRY = 0x02
+
+# PUZZLE_RESULT载荷内部标志与通用帧FLAGS无关；bit0表示结果可能不准确。
+RESULT_FLAG_BEST_EFFORT = 0x01
+RESULT_FLAG_KNOWN_MASK = RESULT_FLAG_BEST_EFFORT
 
 # 协议层只传数字方向和模式；公开编码函数同时接受业务层使用的字符串。
 ORIENTATION_PORTRAIT = 0
@@ -264,12 +268,18 @@ def decode_paper_payload(payload):
     }
 
 
-def encode_puzzle_result_payload(mode, paper_orientation, placements):
+def encode_puzzle_result_payload(
+    mode,
+    paper_orientation,
+    placements,
+    best_effort=False,
+):
     """把一次成功规划的全部碎片编码到同一个结果载荷。
 
     关键参数placements中的每项需提供piece_id、source_center_mm、target_center_mm和
     rotation_delta_deg。记录先按piece_id排序，再生成从1开始的传输序号；碎片数必须
-    为1至4。返回4+11*N字节载荷，任何非有限或溢出坐标都会在发送前抛出ValueError。
+    为1至4。best_effort=True时设置结果头bit0，提醒F4该拼法可能不准确。返回
+    4+11*N字节载荷，任何非有限或溢出坐标都会在发送前抛出ValueError。
     """
     normalized_placements = sorted(
         list(placements),
@@ -278,6 +288,7 @@ def encode_puzzle_result_payload(mode, paper_orientation, placements):
     piece_count = len(normalized_placements)
     if not 1 <= piece_count <= 4:
         raise ValueError("拼图结果碎片数必须位于1到4之间")
+    result_flags = RESULT_FLAG_BEST_EFFORT if bool(best_effort) else 0
 
     payload = bytearray(
         struct.pack(
@@ -285,7 +296,7 @@ def encode_puzzle_result_payload(mode, paper_orientation, placements):
             _mode_code(mode),
             _orientation_code(paper_orientation),
             piece_count,
-            0,
+            result_flags,
         )
     )
     for piece_index, placement in enumerate(normalized_placements, start=1):
@@ -314,17 +325,17 @@ def encode_puzzle_result_payload(mode, paper_orientation, placements):
 def decode_puzzle_result_payload(payload):
     """解析PUZZLE_RESULT载荷并恢复为毫米和角度字典。
 
-    本函数用于PC回归和协议示例，不参与MaixCAM2发送热路径。载荷长度、保留字节、
+    本函数用于PC回归和协议示例，不参与MaixCAM2发送热路径。载荷长度、结果未知标志、
     模式、方向和碎片数量不一致时抛出ValueError，防止F4示例接受畸形机械命令。
     """
     raw = bytes(payload)
     if len(raw) < 4:
         raise ValueError("拼图结果载荷过短")
-    mode, orientation, piece_count, reserved = struct.unpack_from("<BBBB", raw, 0)
+    mode, orientation, piece_count, result_flags = struct.unpack_from("<BBBB", raw, 0)
     if not 1 <= piece_count <= 4:
         raise ValueError("拼图结果碎片数必须位于1到4之间")
-    if reserved != 0:
-        raise ValueError("拼图结果保留字段必须为0")
+    if result_flags & ~RESULT_FLAG_KNOWN_MASK:
+        raise ValueError("拼图结果包含未知标志位")
     expected_length = 4 + piece_count * 11
     if len(raw) != expected_length:
         raise ValueError("拼图结果载荷长度与碎片数不一致")
@@ -347,6 +358,9 @@ def decode_puzzle_result_payload(payload):
         "mode": _mode_name(mode),
         "orientation": _orientation_name(orientation),
         "piece_count": piece_count,
+        "result_flags": result_flags,
+        "best_effort": bool(result_flags & RESULT_FLAG_BEST_EFFORT),
+        "reliable": not bool(result_flags & RESULT_FLAG_BEST_EFFORT),
         "pieces": tuple(pieces),
     }
 
@@ -692,17 +706,28 @@ class VisionSerialRuntime:
         payload = encode_paper_payload(paper_orientation)
         return self._queue_reliable(MSG_PAPER_FRAME, payload, "A4 QUEUED")
 
-    def queue_puzzle_result_once(self, mode, paper_orientation, placements):
+    def queue_puzzle_result_once(
+        self,
+        mode,
+        paper_orientation,
+        placements,
+        best_effort=False,
+    ):
         """在当前采集上下文中最多排队一次完整拼图结果。
 
-        返回True表示本次新建了结果，False表示同一START已经排过结果或输入无法编码。
-        NaN、字段缺失和定点溢出会转换为RESULT ERROR，且不会消耗本次结果上下文，
-        防止异常穿透相机主循环，同时允许调用方修正数据后再次排队。
+        best_effort=True时把“可能不准确”写入结果载荷bit0，但仍使用相同ACK、重发和
+        单次上下文规则。返回True表示新建结果，False表示已经排过或输入无法编码。
+        NaN、字段缺失和定点溢出会转换为RESULT ERROR，且不会消耗本次结果上下文。
         """
         if self._result_queued:
             return False
         try:
-            payload = encode_puzzle_result_payload(mode, paper_orientation, placements)
+            payload = encode_puzzle_result_payload(
+                mode,
+                paper_orientation,
+                placements,
+                best_effort=best_effort,
+            )
         except Exception:
             # 协议边界必须吸收任何规划对象结构异常；机械端不会收到半帧或错误目标。
             self._last_event_text = "RESULT ERROR"
