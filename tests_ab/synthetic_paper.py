@@ -71,6 +71,41 @@ def make_scene_with_piece_count(paper_quad, piece_count, add_dark_rod=False):
     return make_paper_scene(paper_quad, white_pieces, dark_objects)
 
 
+def make_uneven_brightness_paper_scene():
+    """生成单次Otsu只能看见半张纸、提高阈值后才能恢复完整A4的场景。
+
+    主要流程：先绘制灰度25的完整黑纸，再把纸面右半覆盖为灰度100，同时把背景
+    设为灰度150。当前单次Otsu会优先分离最暗的左半纸面；右半纸面与背景仍保留
+    50级灰度边缘，可供后续多阈值与边缘支持路径恢复。返回值为三通道BGR帧和
+    期望的完整A4四角。
+    """
+    paper_quad = np.float32(
+        [[115, 85], [535, 72], [550, 390], [100, 405]]
+    )
+    frame = np.full((480, 640, 3), 150, dtype=np.uint8)
+    cv2.fillConvexPoly(frame, paper_quad.astype(np.int32), (25, 25, 25))
+    bright_half = np.int32(
+        [[270, 80], [535, 72], [550, 390], [260, 400]]
+    )
+    cv2.fillConvexPoly(frame, bright_half, (100, 100, 100))
+    return frame, paper_quad
+
+
+def make_large_distractor_with_small_a4_like_block():
+    """生成大型非纸暗区和约1.2%画面的A4比例小框。
+
+    大三角形用于代表龙门架、阴影或其它主暗区，它不能被四角拟合为A4；右上小框
+    的短长边比例接近210:297，旧算法会因缺少相对面积门而把它误锁为纸张。返回值
+    包含测试帧和小框四角，便于失败时确认算法没有返回该干扰物。
+    """
+    frame = np.full((480, 640, 3), 220, dtype=np.uint8)
+    large_triangle = np.int32([[40, 420], [320, 55], [420, 430]])
+    small_block = np.int32([[525, 45], [600, 45], [600, 98], [525, 98]])
+    cv2.fillConvexPoly(frame, large_triangle, (22, 22, 22))
+    cv2.fillConvexPoly(frame, small_block, (18, 18, 18))
+    return frame, small_block.astype(np.float32)
+
+
 def _active_quad_for_test(paper_quad, inset_mm=0.0):
     """直接由物理坐标生成测试期望有效四边形，避免依赖被测生产函数。"""
     active_mm = np.float32(

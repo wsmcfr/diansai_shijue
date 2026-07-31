@@ -7,7 +7,9 @@ import numpy as np
 import pytest
 
 from tests_ab.synthetic_paper import DEFAULT_PAPER_QUAD, make_paper_scene
+from tests_ab.synthetic_paper import make_large_distractor_with_small_a4_like_block
 from tests_ab.synthetic_paper import make_scene_with_piece_count
+from tests_ab.synthetic_paper import make_uneven_brightness_paper_scene
 
 
 LOCATOR_MODULES = (
@@ -157,6 +159,37 @@ def test_a_locator_clean_paper_keeps_strict_first_epsilon():
     assert best["quad_epsilon_ratio"] == pytest.approx(0.020)
 
 
+def test_a_locator_recovers_uneven_brightness_paper_with_threshold_scan():
+    """严格轮廓只覆盖半张纸时，多阈值路径必须恢复完整A4。
+
+    该测试要求返回来源明确为TH_SCAN，防止实现通过无条件降低旧严格门槛让测试
+    偶然通过；角点容差只覆盖模糊与轮廓近似，不允许返回左半张纸的局部矩形。
+    """
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    frame, expected_quad = make_uneven_brightness_paper_scene()
+
+    result = module.locate_black_paper(frame)
+
+    assert result.success is True
+    assert result.diagnostics["source"] == "TH_SCAN"
+    np.testing.assert_allclose(result.paper_quad, expected_quad, atol=12.0)
+
+
+def test_a_locator_rejects_small_quad_beside_larger_nonpaper_contour():
+    """A4比例小框远小于本帧主暗区时必须失败而不是误锁。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    frame, small_block = make_large_distractor_with_small_a4_like_block()
+
+    result = module.locate_black_paper(frame)
+
+    assert result.success is False
+    assert result.paper_quad is None
+    best = result.diagnostics["best_candidate"]
+    assert best["area_to_largest"] < 0.10
+    if result.paper_quad is not None:
+        assert not np.allclose(result.paper_quad, small_block, atol=3.0)
+
+
 def test_a_auto_roi_exposes_editable_epsilon_ratio_macro():
     """现场可调epsilon序列必须集中导出，并由AUTO默认配置直接引用。"""
     config = importlib.import_module("maixcam2_app_A_quad.config")
@@ -173,6 +206,27 @@ def test_a_auto_roi_exposes_editable_epsilon_ratio_macro():
         config.DEFAULT_CONFIG["paper_quad_epsilon_ratios"]
         is config.PAPER_QUAD_EPSILON_RATIOS
     )
+
+
+def test_a_auto_roi_exposes_robust_recovery_macros():
+    """多阈值、安全门和旧ROI兜底参数必须集中在config.py供现场修改。"""
+    config = importlib.import_module("maixcam2_app_A_quad.config")
+
+    expected_values = {
+        "paper_auto_threshold_offsets": (-24, -12, 0, 12, 24),
+        "paper_auto_relaxed_min_area_ratio": 0.08,
+        "paper_auto_min_area_to_largest": 0.55,
+        "paper_auto_relaxed_min_rectangularity": 0.35,
+        "paper_auto_relaxed_min_aspect_score": 0.70,
+        "paper_auto_relaxed_min_darkness": 0.42,
+        "paper_auto_min_edge_support": 0.55,
+        "paper_auto_min_supported_sides": 3,
+        "paper_auto_max_contours_per_mask": 4,
+        "paper_auto_prior_min_iou": 0.55,
+        "paper_auto_prior_max_shift_ratio": 0.04,
+    }
+    for key, expected in expected_values.items():
+        assert config.DEFAULT_CONFIG[key] == expected
 
 
 @pytest.mark.parametrize(
