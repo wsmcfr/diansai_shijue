@@ -167,10 +167,12 @@ class PaperLocation:
         confidence=0.0,
         threshold=0.0,
         reason="",
+        diagnostics=None,
     ):
         """初始化定位结果。
 
-        关键参数：confidence 位于0～1；threshold 为本次Otsu阈值；reason 用于屏幕状态。
+        关键参数：confidence 位于0～1；threshold 为本次Otsu阈值；reason 用于屏幕状态；
+        diagnostics保存本次各候选门的统计，只供电脑端调试，不参与定位结果判断。
         返回值：构造函数无返回值，输入会规范化后保存为公开属性。
         """
         self.success = bool(success)
@@ -184,10 +186,12 @@ class PaperLocation:
         self.confidence = float(max(0.0, min(1.0, confidence)))
         self.threshold = float(threshold)
         self.reason = str(reason)
+        # 复制顶层字典，避免调用方后续替换统计字段时改变已经返回的定位结果。
+        self.diagnostics = dict(diagnostics or {})
 
     @classmethod
-    def failed(cls, reason, threshold=0.0, confidence=0.0):
-        """构造不携带任何四角的失败结果，供检测和UI回退分支统一使用。"""
+    def failed(cls, reason, threshold=0.0, confidence=0.0, diagnostics=None):
+        """构造不携带四角的失败结果，并保留可选的候选门诊断统计。"""
         return cls(
             False,
             paper_quad=None,
@@ -195,6 +199,7 @@ class PaperLocation:
             confidence=confidence,
             threshold=threshold,
             reason=reason,
+            diagnostics=diagnostics,
         )
 
 
@@ -555,18 +560,30 @@ def image_points_to_paper_mm(
     return mapped.astype(np.float32)
 
 
-def _candidate_quad(hull):
-    """从单个暗色凸包拟合四边形，无法形成稳定四角时返回 None。"""
+def _candidate_quad_with_vertex_count(hull):
+    """从暗色凸包拟合四边形，并返回近似顶点数供失败诊断。
+
+    主要流程：按凸包周长2%执行多边形近似，只有恰好四个顶点且四边形有效时返回
+    排序后的角点。返回值为``(quad, vertex_count)``；失败时quad为None，顶点数仍用于
+    判断暗色轮廓是与龙门架粘连，还是尚未形成稳定纸张四角。
+    """
     perimeter = float(cv2.arcLength(hull, True))
     if perimeter <= 1.0:
-        return None
+        return None, 0
     approximation = cv2.approxPolyDP(hull, 0.02 * perimeter, True)
-    if len(approximation) != 4:
-        return None
+    vertex_count = int(len(approximation))
+    if vertex_count != 4:
+        return None, vertex_count
     try:
-        return order_a4_quad(approximation.reshape(4, 2))
+        return order_a4_quad(approximation.reshape(4, 2)), vertex_count
     except ValueError:
-        return None
+        return None, vertex_count
+
+
+def _candidate_quad(hull):
+    """兼容旧调用：只返回暗色凸包拟合出的四边形或None。"""
+    quad, _vertex_count = _candidate_quad_with_vertex_count(hull)
+    return quad
 
 
 def _score_candidate(contour, hull, quad, gray, area_ratio, config):
@@ -574,7 +591,8 @@ def _score_candidate(contour, hull, quad, gray, area_ratio, config):
 
     权重设计：A4长宽比最能排除龙门架细杆，权重0.42；矩形度0.18；凸性0.10；
     可见面积0.10；纸内暗度0.20。内部白色碎片只降低暗度项，不改变外轮廓。
-    返回值：``(总分, 矩形度)``，供调用方同时执行硬门槛和候选排序。
+    返回值：``(总分, 矩形度, 指标字典)``。指标字典只用于AUTO单次日志，不改变
+    原有加权公式、硬门槛或候选排序。
     """
     edge_lengths = [
         float(np.linalg.norm(quad[(index + 1) % 4] - quad[index]))
@@ -616,7 +634,17 @@ def _score_candidate(contour, hull, quad, gray, area_ratio, config):
         + 0.10 * area_score
         + 0.20 * darkness_score
     )
-    return float(np.clip(confidence, 0.0, 1.0)), rectangularity
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    metrics = {
+        "area_ratio": float(area_ratio),
+        "observed_aspect": float(observed_aspect),
+        "aspect_score": float(aspect_score),
+        "rectangularity": float(rectangularity),
+        "convexity": float(convexity),
+        "darkness_score": float(darkness_score),
+        "confidence": confidence,
+    }
+    return confidence, rectangularity, metrics
 
 
 def locate_black_paper(frame_bgr, config=None):
@@ -660,17 +688,43 @@ def locate_black_paper(frame_bgr, config=None):
     best_quad = None
     best_confidence = 0.0
 
+    # 诊断统计覆盖每一道硬门，但只在单次AUTO结束后由main.py打印一行，不在轮廓循环
+    # 中直接输出，避免现场控制台被逐候选日志淹没。
+    diagnostics = {
+        "contour_count": int(len(contours)),
+        "area_small_count": 0,
+        "area_large_count": 0,
+        "not_quad_count": 0,
+        "rectangularity_reject_count": 0,
+        "eligible_count": 0,
+        "largest_area_ratio": 0.0,
+        "approx_vertex_counts": {},
+        "best_candidate": None,
+    }
+    diagnostic_best_confidence = -1.0
+
     for contour in contours:
         contour_area = float(cv2.contourArea(contour))
         area_ratio = contour_area / frame_area
-        if not min_area_ratio <= area_ratio <= max_area_ratio:
+        diagnostics["largest_area_ratio"] = max(
+            float(diagnostics["largest_area_ratio"]),
+            float(area_ratio),
+        )
+        if area_ratio < min_area_ratio:
+            diagnostics["area_small_count"] += 1
+            continue
+        if area_ratio > max_area_ratio:
+            diagnostics["area_large_count"] += 1
             continue
 
         hull = cv2.convexHull(contour)
-        quad = _candidate_quad(hull)
+        quad, vertex_count = _candidate_quad_with_vertex_count(hull)
         if quad is None:
+            diagnostics["not_quad_count"] += 1
+            vertex_counts = diagnostics["approx_vertex_counts"]
+            vertex_counts[vertex_count] = int(vertex_counts.get(vertex_count, 0)) + 1
             continue
-        confidence, rectangularity = _score_candidate(
+        confidence, rectangularity, metrics = _score_candidate(
             contour,
             hull,
             quad,
@@ -678,20 +732,32 @@ def locate_black_paper(frame_bgr, config=None):
             area_ratio,
             merged_config,
         )
+        # 即使候选随后因矩形度被拒绝，也保留分数最高的一组指标，便于现场区分
+        # “已经得到四角但矩形度不足”和“从未得到四角”。
+        if confidence > diagnostic_best_confidence:
+            diagnostics["best_candidate"] = dict(metrics)
+            diagnostic_best_confidence = float(confidence)
         if rectangularity < float(merged_config["paper_min_rectangularity"]):
+            diagnostics["rectangularity_reject_count"] += 1
             continue
+        diagnostics["eligible_count"] += 1
         if confidence > best_confidence:
             best_quad = quad
             best_confidence = confidence
 
     min_confidence = float(merged_config["paper_min_confidence"])
     if best_quad is None:
-        return PaperLocation.failed("no_candidate", threshold=threshold)
+        return PaperLocation.failed(
+            "no_candidate",
+            threshold=threshold,
+            diagnostics=diagnostics,
+        )
     if best_confidence < min_confidence:
         return PaperLocation.failed(
             "low_confidence",
             threshold=threshold,
             confidence=best_confidence,
+            diagnostics=diagnostics,
         )
     observed_orientation = infer_paper_orientation(best_quad)
     paper_orientation = _machine_orientation_from_camera(
@@ -706,4 +772,5 @@ def locate_black_paper(frame_bgr, config=None):
         confidence=best_confidence,
         threshold=threshold,
         reason="ok",
+        diagnostics=diagnostics,
     )

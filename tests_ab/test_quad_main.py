@@ -148,6 +148,58 @@ def test_auto_roi_debug_switch_disables_output(capsys):
     assert "[ROI]" not in capsys.readouterr().out
 
 
+def test_auto_roi_failure_log_reports_each_rejection_gate(capsys):
+    """AUTO失败日志必须用一行说明各硬门统计和最佳候选评分。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.paper_locator import PaperLocation
+
+    location = PaperLocation.failed(
+        "no_candidate",
+        threshold=68.0,
+        diagnostics={
+            "contour_count": 8,
+            "area_small_count": 2,
+            "area_large_count": 1,
+            "not_quad_count": 3,
+            "rectangularity_reject_count": 2,
+            "eligible_count": 0,
+            "largest_area_ratio": 0.632,
+            "approx_vertex_counts": {3: 2, 5: 1},
+            "best_candidate": {
+                "area_ratio": 0.342,
+                "observed_aspect": 0.421,
+                "aspect_score": 0.655,
+                "rectangularity": 0.612,
+                "convexity": 0.840,
+                "darkness_score": 0.765,
+                "confidence": 0.624,
+            },
+        },
+    )
+
+    main.log_auto_roi_diagnostics(location, debug_enabled=True)
+
+    output = capsys.readouterr().out.strip()
+    assert len(output.splitlines()) == 1
+    assert "result=FAIL reason=no_candidate" in output
+    assert "gates=AREA_SMALL,AREA_LARGE,NOT_QUAD,RECT_LOW" in output
+    assert "contours=8" in output
+    assert "area_small=2" in output
+    assert "area_large=1" in output
+    assert "not_quad=3" in output
+    assert "rect_low=2" in output
+    assert "eligible=0" in output
+    assert "largest_area=63.2%" in output
+    assert "quad_vertices=3x2,5x1" in output
+    assert "best_area=34.2%" in output
+    assert "aspect=0.421" in output
+    assert "aspect_score=0.655" in output
+    assert "rect=0.612" in output
+    assert "convex=0.840" in output
+    assert "dark=0.765" in output
+    assert "best_conf=62.4%" in output
+
+
 def test_quad_analysis_detects_four_pieces_and_adds_paper_mm_centers():
     """验证A版单帧数据流保留相机中心并额外输出完整A4毫米中心。"""
     from maixcam2_app_A_quad.main import analyze_quad_frame

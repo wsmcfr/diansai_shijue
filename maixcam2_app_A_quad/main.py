@@ -160,22 +160,118 @@ FOUR_DEBUG_VIEW_LABELS = {
 }
 
 
+def format_auto_roi_diagnostic_fields(location):
+    """把AUTO ROI结构化诊断转换为稳定的单行字段。
+
+    主要流程：先根据各拒绝计数生成``gates``标签，再依次输出计数、最大轮廓面积、
+    非四角顶点分布和最佳四角候选的评分分量。关键参数location可来自真实定位器或
+    测试替身；缺少diagnostics、字段为空或单个值非法时安全省略对应字段。
+    返回值：不含首尾空格的ASCII诊断字符串；没有诊断数据时返回空字符串。
+    """
+    diagnostics = getattr(location, "diagnostics", None)
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return ""
+
+    def safe_int(key, default=0):
+        """读取非负整数统计，非法值回退default，避免调试日志中断AUTO流程。"""
+        try:
+            return max(0, int(diagnostics.get(key, default)))
+        except (TypeError, ValueError):
+            return int(default)
+
+    # gates保留所有实际出现的拒绝门，而不是猜测单一根因；同一帧多个外轮廓可能
+    # 分别在面积、四角和矩形度阶段失败，同时显示才能避免现场误判。
+    gate_specs = (
+        ("area_small_count", "AREA_SMALL"),
+        ("area_large_count", "AREA_LARGE"),
+        ("not_quad_count", "NOT_QUAD"),
+        ("rectangularity_reject_count", "RECT_LOW"),
+    )
+    gates = [label for key, label in gate_specs if safe_int(key) > 0]
+    if str(getattr(location, "reason", "")) == "low_confidence":
+        gates.append("CONF_LOW")
+    if not gates:
+        gates.append("NO_DARK_CONTOUR" if safe_int("contour_count") == 0 else "PASS")
+
+    fields = [f"gates={','.join(gates)}"]
+    count_fields = (
+        ("contour_count", "contours"),
+        ("area_small_count", "area_small"),
+        ("area_large_count", "area_large"),
+        ("not_quad_count", "not_quad"),
+        ("rectangularity_reject_count", "rect_low"),
+        ("eligible_count", "eligible"),
+    )
+    fields.extend(f"{label}={safe_int(key)}" for key, label in count_fields)
+
+    try:
+        largest_area_ratio = float(diagnostics.get("largest_area_ratio", 0.0))
+        if np.isfinite(largest_area_ratio):
+            fields.append(f"largest_area={largest_area_ratio * 100.0:.1f}%")
+    except (TypeError, ValueError):
+        pass
+
+    vertex_counts = diagnostics.get("approx_vertex_counts")
+    if isinstance(vertex_counts, dict) and vertex_counts:
+        normalized_vertices = []
+        for raw_vertices, raw_count in vertex_counts.items():
+            try:
+                vertices = max(0, int(raw_vertices))
+                count = max(0, int(raw_count))
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                normalized_vertices.append((vertices, count))
+        if normalized_vertices:
+            normalized_vertices.sort()
+            vertex_text = ",".join(
+                f"{vertices}x{count}" for vertices, count in normalized_vertices
+            )
+            fields.append(f"quad_vertices={vertex_text}")
+
+    best_candidate = diagnostics.get("best_candidate")
+    if isinstance(best_candidate, dict):
+        metric_specs = (
+            ("area_ratio", "best_area", 100.0, ".1f", "%"),
+            ("observed_aspect", "aspect", 1.0, ".3f", ""),
+            ("aspect_score", "aspect_score", 1.0, ".3f", ""),
+            ("rectangularity", "rect", 1.0, ".3f", ""),
+            ("convexity", "convex", 1.0, ".3f", ""),
+            ("darkness_score", "dark", 1.0, ".3f", ""),
+            ("confidence", "best_conf", 100.0, ".1f", "%"),
+        )
+        for key, label, multiplier, number_format, suffix in metric_specs:
+            try:
+                value = float(best_candidate[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                fields.append(
+                    f"{label}={format(value * multiplier, number_format)}{suffix}"
+                )
+    return " ".join(fields)
+
+
 def log_auto_roi_diagnostics(location, debug_enabled=None):
-    """按共用调试开关输出一次AUTO ROI结果、方向、置信度和四边长度。
+    """按共用调试开关输出一次AUTO ROI结果和候选门诊断。
 
     主要流程：debug_enabled为None时读取assembly_planner.py文件顶部开关；关闭时立即
     返回，不转换四角也不构造字符串。成功结果计算四条循环边的像素长度，横纸显示H、
-    竖纸显示V；失败结果打印定位原因和本次阈值。返回值始终为None。
+    竖纸显示V；成功与失败都会追加面积、四角、矩形度和最佳候选评分字段。
+    返回值始终为None，每次AUTO最多打印一行。
     """
     enabled = UNKNOWN_SOLVER_DEBUG if debug_enabled is None else bool(debug_enabled)
     if not enabled:
         return
+    diagnostic_fields = format_auto_roi_diagnostic_fields(location)
+    diagnostic_suffix = "" if not diagnostic_fields else f" {diagnostic_fields}"
     if not getattr(location, "success", False) or location.paper_quad is None:
         print(
             "[ROI] AUTO result=FAIL "
             f"reason={getattr(location, 'reason', 'unknown')} "
             f"confidence={float(getattr(location, 'confidence', 0.0)) * 100.0:.0f}% "
             f"threshold={float(getattr(location, 'threshold', 0.0)):.1f}"
+            f"{diagnostic_suffix}"
         )
         return
 
@@ -192,6 +288,7 @@ def log_auto_roi_diagnostics(location, debug_enabled=None):
         f"confidence={float(getattr(location, 'confidence', 0.0)) * 100.0:.0f}% "
         f"threshold={float(getattr(location, 'threshold', 0.0)):.1f} "
         f"edges_px=[{edge_text}]"
+        f"{diagnostic_suffix}"
     )
 
 

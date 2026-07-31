@@ -58,6 +58,48 @@ def test_locator_rejects_long_dark_rectangle(module_name):
     assert result.confidence < 0.65
 
 
+def test_a_locator_reports_oversized_dark_contour_diagnostics():
+    """A版AUTO失败时必须指出黑色轮廓因超过画面50%而被拒绝。
+
+    该场景模拟相机过近或黑纸与大面积阴影连接：黑色矩形约占整帧79%，因此不能
+    作为A4候选，但诊断数据必须保留面积过大计数和本帧最大轮廓面积，供现场日志
+    直接区分“看到了大黑块”和“完全没有暗色轮廓”。
+    """
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    oversized_quad = np.int32([[30, 30], [610, 30], [610, 450], [30, 450]])
+    scene = make_paper_scene(oversized_quad)
+
+    result = module.locate_black_paper(scene)
+
+    assert result.success is False
+    assert result.reason == "no_candidate"
+    assert result.diagnostics["contour_count"] >= 1
+    assert result.diagnostics["area_large_count"] == 1
+    assert result.diagnostics["eligible_count"] == 0
+    assert result.diagnostics["largest_area_ratio"] == pytest.approx(
+        (580.0 * 420.0) / (640.0 * 480.0),
+        abs=0.02,
+    )
+
+
+def test_a_locator_low_confidence_keeps_best_candidate_metrics():
+    """A版低置信度结果必须保留最佳四角候选的各评分分量。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    long_bar = np.int32([[250, 25], [295, 25], [295, 440], [250, 440]])
+
+    result = module.locate_black_paper(make_paper_scene(long_bar))
+
+    assert result.success is False
+    assert result.reason == "low_confidence"
+    assert result.diagnostics["eligible_count"] == 1
+    best = result.diagnostics["best_candidate"]
+    assert best["area_ratio"] > 0.01
+    assert best["observed_aspect"] < 0.20
+    assert best["aspect_score"] < 0.10
+    assert best["rectangularity"] >= 0.70
+    assert best["confidence"] == pytest.approx(result.confidence)
+
+
 def test_locator_variants_return_equivalent_results():
     """验证A/B共享定位算法对同一帧给出等价角点、阈值和置信度。"""
     scene = make_scene_with_piece_count(DEFAULT_PAPER_QUAD, 4, add_dark_rod=True)
