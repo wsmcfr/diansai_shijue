@@ -8,6 +8,11 @@ PERSISTENT_SETTINGS_PATH = "/root/maixcam2_puzzle_A/vision_settings.json"
 PERSISTENT_TEMPLATE_PATH = "/root/maixcam2_puzzle_A/known_templates.json"
 
 
+# AUTO ROI四角拟合比例：第一个2%是干净纸张严格路径，只有无法得到四角时才依次
+# 使用后续容错比例。现场若需调整只能保持正数、严格递增，且最大值不得超过10%。
+PAPER_QUAD_EPSILON_RATIOS = (0.020, 0.025, 0.030, 0.035, 0.040, 0.050)
+
+
 # 默认视觉配置：所有会影响识别结果的参数集中在这里，避免算法中散落魔法数字。
 DEFAULT_CONFIG = {
     # 识别采集使用1280x960提高纸面像素密度；屏幕和触摸继续使用640x480。
@@ -44,6 +49,7 @@ DEFAULT_CONFIG = {
     "paper_min_rectangularity": 0.70,
     "paper_min_confidence": 0.65,
     "paper_close_kernel": 9,
+    "paper_quad_epsilon_ratios": PAPER_QUAD_EPSILON_RATIOS,
     # 固定相机安装方向同时决定AUTO H/V转换、毫米原点和上下区。当前结构中源碎片区
     # 在原始CAL画面左侧、目标区在右侧；若实机相反改为side_lower_left。顶置相机用top。
     "camera_mount_direction": "side_lower_right",

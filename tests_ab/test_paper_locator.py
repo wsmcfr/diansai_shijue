@@ -100,6 +100,103 @@ def test_a_locator_low_confidence_keeps_best_candidate_metrics():
     assert best["confidence"] == pytest.approx(result.confidence)
 
 
+@pytest.mark.parametrize(
+    ("noisy_outline", "strict_vertex_count"),
+    (
+        (
+            np.int32([[120, 100], [320, 66], [520, 100], [520, 380], [120, 380]]),
+            5,
+        ),
+        (
+            np.int32(
+                [
+                    [120, 100],
+                    [320, 66],
+                    [520, 100],
+                    [550, 240],
+                    [520, 380],
+                    [120, 380],
+                ]
+            ),
+            6,
+        ),
+    ),
+)
+def test_a_locator_adaptive_epsilon_recovers_five_and_six_vertex_paper(
+    noisy_outline,
+    strict_vertex_count,
+):
+    """严格2%得到5/6角时，A版必须在首个有效的3%恢复基础A4四角。
+
+    两个凸起分别模拟纸边反光、弯曲或暗色结构粘连形成的额外凸点。基础矩形仍为
+    400x280像素，符合A4短长边比例；容错只负责消除凸点，后续旧评分门继续验收。
+    """
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    expected_quad = np.float32(
+        [[120, 100], [520, 100], [520, 380], [120, 380]]
+    )
+
+    result = module.locate_black_paper(make_paper_scene(noisy_outline))
+
+    assert result.success is True
+    np.testing.assert_allclose(result.paper_quad, expected_quad, atol=3.0)
+    best = result.diagnostics["best_candidate"]
+    assert best["strict_vertex_count"] == strict_vertex_count
+    assert best["quad_epsilon_ratio"] == pytest.approx(0.030)
+
+
+def test_a_locator_clean_paper_keeps_strict_first_epsilon():
+    """干净A4必须在首个2%候选立即成功，不能无条件走宽松近似。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+
+    result = module.locate_black_paper(make_paper_scene(DEFAULT_PAPER_QUAD))
+
+    assert result.success is True
+    best = result.diagnostics["best_candidate"]
+    assert best["strict_vertex_count"] == 4
+    assert best["quad_epsilon_ratio"] == pytest.approx(0.020)
+
+
+def test_a_auto_roi_exposes_editable_epsilon_ratio_macro():
+    """现场可调epsilon序列必须集中导出，并由AUTO默认配置直接引用。"""
+    config = importlib.import_module("maixcam2_app_A_quad.config")
+
+    assert config.PAPER_QUAD_EPSILON_RATIOS == (
+        0.020,
+        0.025,
+        0.030,
+        0.035,
+        0.040,
+        0.050,
+    )
+    assert (
+        config.DEFAULT_CONFIG["paper_quad_epsilon_ratios"]
+        is config.PAPER_QUAD_EPSILON_RATIOS
+    )
+
+
+@pytest.mark.parametrize(
+    "epsilon_ratios",
+    (
+        (),
+        (0.0, 0.02),
+        (0.02, 0.02),
+        (0.03, 0.02),
+        (0.02, 0.11),
+        (0.02, float("nan")),
+    ),
+)
+def test_a_locator_rejects_invalid_paper_quad_epsilon_ratios(epsilon_ratios):
+    """AUTO必须拒绝空、非正、非递增、过大或非有限的四角epsilon序列。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+
+    with pytest.raises(ValueError, match="paper_quad_epsilon_ratios"):
+        module.locate_black_paper(
+            make_paper_scene(DEFAULT_PAPER_QUAD),
+            {"paper_quad_epsilon_ratios": epsilon_ratios},
+        )
+
+
 def test_locator_variants_return_equivalent_results():
     """验证A/B共享定位算法对同一帧给出等价角点、阈值和置信度。"""
     scene = make_scene_with_piece_count(DEFAULT_PAPER_QUAD, 4, add_dark_rod=True)

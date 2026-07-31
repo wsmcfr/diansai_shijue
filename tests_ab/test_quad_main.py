@@ -173,6 +173,8 @@ def test_auto_roi_failure_log_reports_each_rejection_gate(capsys):
                 "convexity": 0.840,
                 "darkness_score": 0.765,
                 "confidence": 0.624,
+                "strict_vertex_count": 6,
+                "quad_epsilon_ratio": 0.025,
             },
         },
     )
@@ -198,6 +200,8 @@ def test_auto_roi_failure_log_reports_each_rejection_gate(capsys):
     assert "convex=0.840" in output
     assert "dark=0.765" in output
     assert "best_conf=62.4%" in output
+    assert "strict_vertices=6" in output
+    assert "quad_eps=0.025" in output
 
 
 def test_quad_analysis_detects_four_pieces_and_adds_paper_mm_centers():

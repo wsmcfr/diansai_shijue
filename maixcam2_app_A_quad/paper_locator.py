@@ -560,29 +560,73 @@ def image_points_to_paper_mm(
     return mapped.astype(np.float32)
 
 
-def _candidate_quad_with_vertex_count(hull):
-    """从暗色凸包拟合四边形，并返回近似顶点数供失败诊断。
+def _validate_paper_quad_epsilon_ratios(raw_ratios):
+    """校验并返回AUTO ROI由严格到宽松的四角拟合比例。
 
-    主要流程：按凸包周长2%执行多边形近似，只有恰好四个顶点且四边形有效时返回
-    排序后的角点。返回值为``(quad, vertex_count)``；失败时quad为None，顶点数仍用于
-    判断暗色轮廓是与龙门架粘连，还是尚未形成稳定纸张四角。
+    关键参数raw_ratios必须是非空可迭代对象；每项转换为浮点数后必须有限、位于
+    ``(0, 0.10]``且严格递增。返回值为浮点元组。这样现场修改宏时不会因重复、倒序
+    或过大的epsilon静默把任意暗色物体强行简化成四边形。
+    """
+    try:
+        ratios = tuple(float(value) for value in raw_ratios)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "paper_quad_epsilon_ratios必须是有限正数序列"
+        ) from error
+    if not ratios:
+        raise ValueError("paper_quad_epsilon_ratios不能为空")
+    previous = 0.0
+    for ratio in ratios:
+        if not np.isfinite(ratio) or ratio <= 0.0 or ratio > 0.10:
+            raise ValueError(
+                "paper_quad_epsilon_ratios每项必须位于0到0.10之间"
+            )
+        if ratio <= previous:
+            raise ValueError("paper_quad_epsilon_ratios必须严格递增")
+        previous = ratio
+    return ratios
+
+
+def _candidate_quad_with_vertex_count(hull, epsilon_ratios):
+    """按严格到宽松的多个epsilon拟合四边形，并返回本次诊断信息。
+
+    主要流程：第一个比例是严格路径；只有它不是有效四角时才继续后续比例。遇到第一
+    个有效四角立即返回，避免干净纸张无条件使用宽松近似。返回值为
+    ``(quad, strict_vertex_count, selected_epsilon)``；完全失败时quad和epsilon为None，
+    strict_vertex_count仍用于判断原始轮廓是5角、6角还是其它形状。
     """
     perimeter = float(cv2.arcLength(hull, True))
     if perimeter <= 1.0:
-        return None, 0
-    approximation = cv2.approxPolyDP(hull, 0.02 * perimeter, True)
-    vertex_count = int(len(approximation))
-    if vertex_count != 4:
-        return None, vertex_count
-    try:
-        return order_a4_quad(approximation.reshape(4, 2)), vertex_count
-    except ValueError:
-        return None, vertex_count
+        return None, 0, None
+    strict_vertex_count = 0
+    for index, epsilon_ratio in enumerate(epsilon_ratios):
+        approximation = cv2.approxPolyDP(
+            hull,
+            float(epsilon_ratio) * perimeter,
+            True,
+        )
+        vertex_count = int(len(approximation))
+        if index == 0:
+            strict_vertex_count = vertex_count
+        if vertex_count != 4:
+            continue
+        try:
+            quad = order_a4_quad(approximation.reshape(4, 2))
+        except ValueError:
+            continue
+        return quad, strict_vertex_count, float(epsilon_ratio)
+    return None, strict_vertex_count, None
 
 
 def _candidate_quad(hull):
     """兼容旧调用：只返回暗色凸包拟合出的四边形或None。"""
-    quad, _vertex_count = _candidate_quad_with_vertex_count(hull)
+    epsilon_ratios = _validate_paper_quad_epsilon_ratios(
+        DEFAULT_CONFIG["paper_quad_epsilon_ratios"]
+    )
+    quad, _vertex_count, _epsilon_ratio = _candidate_quad_with_vertex_count(
+        hull,
+        epsilon_ratios,
+    )
     return quad
 
 
@@ -662,6 +706,9 @@ def locate_black_paper(frame_bgr, config=None):
     close_kernel_size = int(merged_config["paper_close_kernel"])
     if close_kernel_size <= 0 or close_kernel_size % 2 == 0:
         raise ValueError("paper_close_kernel 必须是正奇数")
+    epsilon_ratios = _validate_paper_quad_epsilon_ratios(
+        merged_config["paper_quad_epsilon_ratios"]
+    )
 
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -718,7 +765,10 @@ def locate_black_paper(frame_bgr, config=None):
             continue
 
         hull = cv2.convexHull(contour)
-        quad, vertex_count = _candidate_quad_with_vertex_count(hull)
+        quad, vertex_count, selected_epsilon = _candidate_quad_with_vertex_count(
+            hull,
+            epsilon_ratios,
+        )
         if quad is None:
             diagnostics["not_quad_count"] += 1
             vertex_counts = diagnostics["approx_vertex_counts"]
@@ -732,6 +782,10 @@ def locate_black_paper(frame_bgr, config=None):
             area_ratio,
             merged_config,
         )
+        # 记录严格路径看到的顶点数和最终采用的epsilon；二者只进入调试日志，不参与
+        # 评分。现场可据此确认容错是否确实把5/6角恢复成了四角。
+        metrics["strict_vertex_count"] = int(vertex_count)
+        metrics["quad_epsilon_ratio"] = float(selected_epsilon)
         # 即使候选随后因矩形度被拒绝，也保留分数最高的一组指标，便于现场区分
         # “已经得到四角但矩形度不足”和“从未得到四角”。
         if confidence > diagnostic_best_confidence:

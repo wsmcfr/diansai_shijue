@@ -444,7 +444,7 @@ v2.0.1继续使用v1.9.2的三层WHITE求解器，不修改三片和四片算法
 
 | 日志事件 | 关键字段 | 如何判断 |
 |---|---|---|
-| `[ROI] AUTO` | `result`、`orientation`、`confidence`、`threshold`、`edges_px` | H/V必须符合实物；四边长度用于发现错误候选和严重透视 |
+| `[ROI] AUTO` | `result`、`gates`、`confidence`、`threshold`、`quad_vertices`、`strict_vertices`、`quad_eps`、`edges_px` | `quad_eps=0.020`表示严格四角；0.025～0.050表示5/6角经自适应简化后仍通过全部旧门；失败时按gates定位面积、四角、矩形度或置信度 |
 | `[SOLVER] SNAPSHOT` | `mode`、`profile`、`count`、两个填充门 | 确认本次锁定材料模式和片数正确 |
 | `[SOLVER] PIECE` | `center_mm`、`vertices_mm`、`edges_mm` | 核对毫米映射、错误角点、过短边和粘连轮廓 |
 | `[SOLVER] CLEAN` | `vertices=A→B`、`removed`、`min_edge`、`cleaned_min` | 只说明WHITE图快路径清理了几个伪角；B不得小于3，当前清理阈值为8mm，以文件顶部宏为准 |
@@ -452,6 +452,18 @@ v2.0.1继续使用v1.9.2的三层WHITE求解器，不修改三片和四片算法
 | `[SOLVER] FOUR_FAST` | `pairs`、`triples`、`complete`、`parents`、`units`、`limit`、`time_limit`、`active_ms`、`segmented`、`triangles`、`raster` | `limit=1`表示2400候选工作量触顶；`time_limit=1`表示1.5秒子预算到期，随后应看到FALLBACK，不是整个任务超时；`active_ms`只记录FOURFAST活动计算。四片成功时`result=OK`；`segmented>0`说明使用T形接缝；`raster`应远小于`triangles` |
 | `[SOLVER] FALLBACK` | `nodes`、`frontier`、`first`、各类`reject` | 判断兜底是尺寸、填充、重叠还是边连接失败 |
 | `[SOLVER] RESULT` | `source`、`success`、`reason`、`fill`、`overlap`、`outer`、`elapsed_ms` | 最终采用GRAPH还是兜底，以及实际验收裕量和耗时 |
+
+AUTO ROI的四角epsilon宏位于`config.py`文件顶部：
+
+```python
+PAPER_QUAD_EPSILON_RATIOS = (0.020, 0.025, 0.030, 0.035, 0.040, 0.050)
+```
+
+程序始终先尝试2%；只有严格结果不是四角时才依次尝试后续比例，并在第一个有效
+四角立即停止。得到四角后仍执行原有面积、A4比例、0.70矩形度和0.65置信度验收，
+因此这不是无条件把任意5/6角物体改成A4。现场调整必须保持正数、严格递增且不超过
+0.10；通常不要扩大0.050上限。`strict_vertices=5/6 quad_eps=0.030 result=OK`表示
+额外角已被正确消除；若仍为`result=FAIL`，继续根据`quad_vertices`和`gates`处理。
 
 排查时把同一次锁定从`SNAPSHOT`到`RESULT`的完整日志保存到电脑。`PIECE`毫米尺寸正确但`GRAPH fill_reject`集中在86%～92%之间，才是调整容错门的典型场景；毫米尺寸本身错误时，先重做AUTO ROI和五点RECT。
 

@@ -249,6 +249,17 @@ def format_auto_roi_diagnostic_fields(location):
                 fields.append(
                     f"{label}={format(value * multiplier, number_format)}{suffix}"
                 )
+        try:
+            strict_vertex_count = max(0, int(best_candidate["strict_vertex_count"]))
+            fields.append(f"strict_vertices={strict_vertex_count}")
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            quad_epsilon_ratio = float(best_candidate["quad_epsilon_ratio"])
+            if np.isfinite(quad_epsilon_ratio):
+                fields.append(f"quad_eps={quad_epsilon_ratio:.3f}")
+        except (KeyError, TypeError, ValueError):
+            pass
     return " ".join(fields)
 
 

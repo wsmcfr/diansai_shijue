@@ -16,7 +16,7 @@
 - Modify: `tests_ab/test_paper_locator.py`
 - Modify: `tests_ab/test_quad_main.py`
 
-1. 增加5角和6角合成黑纸，断言恢复为基础A4四角且采用2.5%。
+1. 增加5角和6角合成黑纸，断言按递增序列恢复为基础A4四角并记录首个有效比例。
 2. 断言干净A4继续采用2%。
 3. 断言空、非递增、非正数和过大的epsilon序列被拒绝。
 4. 断言AUTO日志输出`strict_vertices`和`quad_eps`。
