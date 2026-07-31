@@ -186,6 +186,12 @@ def format_auto_roi_diagnostic_fields(location):
         ("area_large_count", "AREA_LARGE"),
         ("not_quad_count", "NOT_QUAD"),
         ("rectangularity_reject_count", "RECT_LOW"),
+        ("relaxed_area_reject_count", "RELAX_AREA"),
+        ("relaxed_rectangularity_reject_count", "RELAX_RECT"),
+        ("relaxed_aspect_reject_count", "RELAX_ASPECT"),
+        ("relaxed_darkness_reject_count", "RELAX_DARK"),
+        ("relaxed_edge_reject_count", "EDGE_LOW"),
+        ("prior_mismatch_reject_count", "PRIOR_MISMATCH"),
     )
     gates = [label for key, label in gate_specs if safe_int(key) > 0]
     if str(getattr(location, "reason", "")) == "low_confidence":
@@ -193,7 +199,11 @@ def format_auto_roi_diagnostic_fields(location):
     if not gates:
         gates.append("NO_DARK_CONTOUR" if safe_int("contour_count") == 0 else "PASS")
 
-    fields = [f"gates={','.join(gates)}"]
+    fields = []
+    source = str(diagnostics.get("source", "")).strip().upper()
+    if source:
+        fields.append(f"source={source}")
+    fields.append(f"gates={','.join(gates)}")
     count_fields = (
         ("contour_count", "contours"),
         ("area_small_count", "area_small"),
@@ -201,6 +211,12 @@ def format_auto_roi_diagnostic_fields(location):
         ("not_quad_count", "not_quad"),
         ("rectangularity_reject_count", "rect_low"),
         ("eligible_count", "eligible"),
+        ("relaxed_area_reject_count", "relax_area"),
+        ("relaxed_rectangularity_reject_count", "relax_rect"),
+        ("relaxed_aspect_reject_count", "relax_aspect"),
+        ("relaxed_darkness_reject_count", "relax_dark"),
+        ("relaxed_edge_reject_count", "edge_low"),
+        ("prior_mismatch_reject_count", "prior_mismatch"),
     )
     fields.extend(f"{label}={safe_int(key)}" for key, label in count_fields)
 
@@ -258,6 +274,28 @@ def format_auto_roi_diagnostic_fields(location):
             quad_epsilon_ratio = float(best_candidate["quad_epsilon_ratio"])
             if np.isfinite(quad_epsilon_ratio):
                 fields.append(f"quad_eps={quad_epsilon_ratio:.3f}")
+        except (KeyError, TypeError, ValueError):
+            pass
+        robust_metric_specs = (
+            ("used_threshold", "used_threshold", ".1f"),
+            ("area_to_largest", "area_to_largest", ".3f"),
+            ("quad_fill", "quad_fill", ".3f"),
+            ("edge_support", "edge_support", ".3f"),
+            ("prior_iou", "prior_iou", ".3f"),
+        )
+        for key, label, number_format in robust_metric_specs:
+            try:
+                value = float(best_candidate[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                fields.append(f"{label}={format(value, number_format)}")
+        try:
+            supported_side_count = max(
+                0,
+                min(4, int(best_candidate["supported_side_count"])),
+            )
+            fields.append(f"edge_sides={supported_side_count}")
         except (KeyError, TypeError, ValueError):
             pass
     return " ".join(fields)
@@ -1083,7 +1121,12 @@ def handle_calibration_action(
     if logical_action == "auto_roi":
         if frame_bgr is None:
             raise ValueError("AUTO ROI需要当前相机帧")
-        location = locate_black_paper(frame_bgr)
+        # 相机和纸张位置固定时，把会话中的上次蓝框作为最后兜底搜索先验。定位器仍会
+        # 用当前帧边缘、暗度、A4比例和IoU重新验收，不能直接返回历史坐标。
+        location = locate_black_paper(
+            frame_bgr,
+            prior_quad=session.settings.get("paper_quad"),
+        )
         log_auto_roi_diagnostics(location)
         session.apply_auto_roi(location)
         return runtime_settings, session.status_text

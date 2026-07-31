@@ -967,16 +967,13 @@ def _search_strict_paper_candidate(
     return best_quad, float(best_confidence), diagnostics
 
 
-def _measure_quad_edge_support(gray, quad):
-    """测量候选四边附近真实灰度边缘的支持比例。
+def _build_supported_edge_map(gray):
+    """生成带少量位置容差的灰度边缘图。
 
-    主要流程：按全帧中位灰度生成自适应Canny阈值，把边缘图膨胀为约画面短边1%的
-    容差带，再分别沿四条1像素候选边统计命中率。返回``(四边平均值, 四项单边值)``；
-    单边长度退化时该边返回0。只验证已有候选四边，不做全帧直线搜索，减少龙门架
-    对AUTO的干扰。
+    主要流程：按全帧中位灰度生成自适应Canny阈值，再把边缘膨胀为约画面短边1%的
+    容差带。返回uint8二值图，供候选四边验收和旧ROI局部修正共用，避免重复计算。
     """
     gray_array = np.asarray(gray, dtype=np.uint8)
-    ordered_quad = order_a4_quad(quad)
     median_gray = float(np.median(gray_array))
     canny_lower = int(np.clip(0.50 * median_gray, 10, 220))
     canny_upper = int(np.clip(1.25 * median_gray, canny_lower + 1, 250))
@@ -986,30 +983,54 @@ def _measure_quad_edge_support(gray, quad):
         cv2.MORPH_ELLIPSE,
         (2 * tolerance_px + 1, 2 * tolerance_px + 1),
     )
-    supported_edge_map = cv2.dilate(edge_map, dilation_kernel)
+    return cv2.dilate(edge_map, dilation_kernel)
+
+
+def _measure_line_support(supported_edge_map, start, end):
+    """返回一条像素线在膨胀边缘图中的命中比例。
+
+    关键参数start/end是二维像素坐标；退化线返回0。该函数只分配单通道线掩膜，
+    不重复运行Canny，便于旧ROI在多个法向偏移上快速比较。
+    """
+    start_point = np.rint(start).astype(np.int32)
+    end_point = np.rint(end).astype(np.int32)
+    line_mask = np.zeros(supported_edge_map.shape, dtype=np.uint8)
+    cv2.line(
+        line_mask,
+        tuple(int(value) for value in start_point),
+        tuple(int(value) for value in end_point),
+        255,
+        1,
+        cv2.LINE_8,
+    )
+    line_pixels = int(cv2.countNonZero(line_mask))
+    if line_pixels <= 1:
+        return 0.0
+    supported_pixels = int(
+        cv2.countNonZero(cv2.bitwise_and(line_mask, supported_edge_map))
+    )
+    return float(np.clip(supported_pixels / float(line_pixels), 0.0, 1.0))
+
+
+def _measure_quad_edge_support(gray, quad, supported_edge_map=None):
+    """测量候选四边附近真实灰度边缘的支持比例。
+
+    可选supported_edge_map允许多候选共用一次Canny结果；未传时由gray现场生成。
+    返回值为``(四边平均值, 四项单边值)``；只验证已有候选四边，不做全帧直线搜索，
+    减少龙门架对AUTO的干扰。
+    """
+    ordered_quad = order_a4_quad(quad)
+    if supported_edge_map is None:
+        supported_edge_map = _build_supported_edge_map(gray)
 
     side_supports = []
     for index in range(4):
-        start = np.rint(ordered_quad[index]).astype(np.int32)
-        end = np.rint(ordered_quad[(index + 1) % 4]).astype(np.int32)
-        line_mask = np.zeros(gray_array.shape, dtype=np.uint8)
-        cv2.line(
-            line_mask,
-            tuple(int(value) for value in start),
-            tuple(int(value) for value in end),
-            255,
-            1,
-            cv2.LINE_8,
-        )
-        line_pixels = int(cv2.countNonZero(line_mask))
-        if line_pixels <= 1:
-            side_supports.append(0.0)
-            continue
-        supported_pixels = int(
-            cv2.countNonZero(cv2.bitwise_and(line_mask, supported_edge_map))
-        )
         side_supports.append(
-            float(np.clip(supported_pixels / float(line_pixels), 0.0, 1.0))
+            _measure_line_support(
+                supported_edge_map,
+                ordered_quad[index],
+                ordered_quad[(index + 1) % 4],
+            )
         )
     return float(np.mean(side_supports)), tuple(side_supports)
 
@@ -1048,6 +1069,9 @@ def _search_relaxed_paper_candidate(
         (diagnostics.get("best_candidate") or {}).get("confidence", -1.0)
     )
     visited_thresholds = set()
+    # 边缘图只与原始灰度帧有关，与扫描阈值无关；单次计算后供全部候选复用，避免
+    # 最坏20个候选重复运行Canny拖慢MaixCAM2触摸响应。
+    supported_edge_map = _build_supported_edge_map(gray)
 
     for offset in recovery_config["threshold_offsets"]:
         threshold = float(np.clip(float(otsu_threshold) + int(offset), 1.0, 254.0))
@@ -1098,7 +1122,11 @@ def _search_relaxed_paper_candidate(
                 area_ratio,
                 config,
             )
-            edge_support, side_supports = _measure_quad_edge_support(gray, quad)
+            edge_support, side_supports = _measure_quad_edge_support(
+                gray,
+                quad,
+                supported_edge_map=supported_edge_map,
+            )
             supported_side_count = sum(
                 support >= recovery_config["min_edge_support"]
                 for support in side_supports
@@ -1158,12 +1186,214 @@ def _search_relaxed_paper_candidate(
     return best_quad, float(best_confidence), float(best_threshold)
 
 
-def locate_black_paper(frame_bgr, config=None):
+def _convex_quad_iou(left_quad, right_quad):
+    """计算两个有效凸四边形的交并比，退化或无交集时返回0。"""
+    try:
+        left = order_a4_quad(left_quad).astype(np.float32)
+        right = order_a4_quad(right_quad).astype(np.float32)
+    except (TypeError, ValueError):
+        return 0.0
+    left_area = abs(float(cv2.contourArea(left)))
+    right_area = abs(float(cv2.contourArea(right)))
+    if left_area <= 1.0 or right_area <= 1.0:
+        return 0.0
+    try:
+        intersection_area, _ = cv2.intersectConvexConvex(left, right)
+    except cv2.error:
+        return 0.0
+    union_area = left_area + right_area - float(intersection_area)
+    if union_area <= 1.0:
+        return 0.0
+    return float(np.clip(float(intersection_area) / union_area, 0.0, 1.0))
+
+
+def _intersect_infinite_lines(first_start, first_end, second_start, second_end):
+    """求两条无限直线交点，近平行或坐标非法时返回None。"""
+    point = np.asarray(first_start, dtype=np.float64)
+    direction = np.asarray(first_end, dtype=np.float64) - point
+    other_point = np.asarray(second_start, dtype=np.float64)
+    other_direction = np.asarray(second_end, dtype=np.float64) - other_point
+    # NumPy 2已弃用二维向量np.cross；显式计算标量叉积也能避免MaixPy版本差异。
+    cross_value = float(
+        direction[0] * other_direction[1]
+        - direction[1] * other_direction[0]
+    )
+    if abs(cross_value) <= 1e-6:
+        return None
+    relative = other_point - point
+    relative_cross = float(
+        relative[0] * other_direction[1]
+        - relative[1] * other_direction[0]
+    )
+    factor = relative_cross / cross_value
+    intersection = point + factor * direction
+    if not np.all(np.isfinite(intersection)):
+        return None
+    return intersection.astype(np.float32)
+
+
+def _refine_prior_quad(gray, prior_quad, max_shift_ratio):
+    """在旧ROI四边法向的小范围内寻找当前帧最强边缘并重建四角。
+
+    主要流程：每条旧边保持方向不变，只沿法向扫描有限整数偏移；同分时优先最小
+    位移，避免被附近碎片边缘拉走。随后由相邻修正线求交得到四角。返回有效凸四边形
+    或None；该函数只提出候选，最终仍由IoU、比例、暗度和边缘门验收。
+    """
+    try:
+        ordered_prior = order_a4_quad(prior_quad)
+    except (TypeError, ValueError):
+        return None
+    supported_edge_map = _build_supported_edge_map(gray)
+    max_shift_px = max(
+        2,
+        int(round(min(gray.shape[:2]) * float(max_shift_ratio))),
+    )
+    refined_lines = []
+    for index in range(4):
+        start = ordered_prior[index].astype(np.float64)
+        end = ordered_prior[(index + 1) % 4].astype(np.float64)
+        direction = end - start
+        length = float(np.linalg.norm(direction))
+        if length <= 1.0:
+            return None
+        normal = np.asarray((-direction[1], direction[0]), dtype=np.float64) / length
+        best_line = None
+        best_key = (-1.0, float("-inf"))
+        for offset in range(-max_shift_px, max_shift_px + 1):
+            shift = normal * float(offset)
+            shifted_start = start + shift
+            shifted_end = end + shift
+            support = _measure_line_support(
+                supported_edge_map,
+                shifted_start,
+                shifted_end,
+            )
+            candidate_key = (support, -abs(offset))
+            if candidate_key > best_key:
+                best_key = candidate_key
+                best_line = (shifted_start, shifted_end)
+        if best_line is None:
+            return None
+        refined_lines.append(best_line)
+
+    intersections = []
+    adjacent_line_pairs = ((3, 0), (0, 1), (1, 2), (2, 3))
+    for previous_index, next_index in adjacent_line_pairs:
+        previous_line = refined_lines[previous_index]
+        next_line = refined_lines[next_index]
+        intersection = _intersect_infinite_lines(
+            previous_line[0],
+            previous_line[1],
+            next_line[0],
+            next_line[1],
+        )
+        if intersection is None:
+            return None
+        intersections.append(intersection)
+    try:
+        return order_a4_quad(np.asarray(intersections, dtype=np.float32))
+    except ValueError:
+        return None
+
+
+def _search_prior_edge_candidate(
+    gray,
+    prior_quad,
+    threshold,
+    config,
+    recovery_config,
+    diagnostics,
+):
+    """使用当前图像证据验收旧ROI附近的局部边缘修正候选。
+
+    返回``(四角或None, 置信度)``。旧ROI只限定搜索范围并参与IoU评分；没有足够
+    当前边缘、A4比例或暗度时增加拒绝计数并返回None，不能直接复用历史蓝框。
+    """
+    refined_quad = _refine_prior_quad(
+        gray,
+        prior_quad,
+        recovery_config["prior_max_shift_ratio"],
+    )
+    if refined_quad is None:
+        diagnostics["prior_mismatch_reject_count"] += 1
+        return None, 0.0
+
+    contour = np.rint(refined_quad).astype(np.float32).reshape(-1, 1, 2)
+    hull = cv2.convexHull(contour)
+    area_ratio = abs(float(cv2.contourArea(contour))) / float(gray.size)
+    _old_confidence, rectangularity, metrics = _score_candidate(
+        contour,
+        hull,
+        refined_quad,
+        gray,
+        area_ratio,
+        config,
+    )
+    edge_support, side_supports = _measure_quad_edge_support(gray, refined_quad)
+    supported_side_count = sum(
+        support >= recovery_config["min_edge_support"]
+        for support in side_supports
+    )
+    prior_iou = _convex_quad_iou(prior_quad, refined_quad)
+    confidence = float(
+        np.clip(
+            0.30 * metrics["aspect_score"]
+            + 0.30 * edge_support
+            + 0.20 * metrics["darkness_score"]
+            + 0.20 * prior_iou,
+            0.0,
+            1.0,
+        )
+    )
+    metrics.update(
+        {
+            "confidence": confidence,
+            "strict_vertex_count": 4,
+            "quad_epsilon_ratio": 0.0,
+            "used_threshold": float(threshold),
+            "area_to_largest": 1.0,
+            "quad_fill": 1.0,
+            "edge_support": float(edge_support),
+            "supported_side_count": int(supported_side_count),
+            "prior_iou": float(prior_iou),
+        }
+    )
+    diagnostics["best_candidate"] = dict(metrics)
+
+    prior_valid = prior_iou >= recovery_config["prior_min_iou"]
+    aspect_valid = (
+        metrics["aspect_score"] >= recovery_config["relaxed_min_aspect_score"]
+    )
+    darkness_valid = (
+        metrics["darkness_score"] >= recovery_config["relaxed_min_darkness"]
+    )
+    edge_valid = (
+        edge_support >= recovery_config["min_edge_support"]
+        and supported_side_count >= recovery_config["min_supported_sides"]
+    )
+    confidence_valid = confidence >= float(config["paper_min_confidence"])
+    if not edge_valid:
+        diagnostics["relaxed_edge_reject_count"] += 1
+    if not aspect_valid:
+        diagnostics["relaxed_aspect_reject_count"] += 1
+    if not darkness_valid:
+        diagnostics["relaxed_darkness_reject_count"] += 1
+    if not (prior_valid and aspect_valid and darkness_valid and edge_valid and confidence_valid):
+        diagnostics["prior_mismatch_reject_count"] += 1
+        return None, 0.0
+
+    diagnostics["source"] = "PRIOR_EDGE"
+    diagnostics["eligible_count"] += 1
+    return refined_quad, confidence
+
+
+def locate_black_paper(frame_bgr, config=None, prior_quad=None):
     """在整帧中定位最符合黑色A4纸的四边形候选。
 
     主要流程：校验配置，使用反向Otsu取得基准阈值，再调用严格候选路径执行旧面积、
     四角、矩形度和置信度验收。后续多阈值恢复会在严格失败后接入，不改变严格成功
-    行为。关键参数config可覆盖DEFAULT_CONFIG中的``paper_*``参数。
+    行为。关键参数config可覆盖DEFAULT_CONFIG中的``paper_*``参数；prior_quad为相机
+    固定场景下上次已保存的完整A4蓝框，只在严格和多阈值都失败后用于局部边缘修正。
     返回值：成功时返回 PaperLocation 四角与置信度；失败时返回不含四角的失败对象。
     """
     _validate_frame(frame_bgr)
@@ -1220,6 +1450,18 @@ def locate_black_paper(frame_bgr, config=None):
                 diagnostics,
             )
         )
+
+    if best_quad is None and prior_quad is not None:
+        best_quad, best_confidence = _search_prior_edge_candidate(
+            gray,
+            prior_quad,
+            threshold,
+            merged_config,
+            recovery_config,
+            diagnostics,
+        )
+        if best_quad is not None:
+            result_threshold = float(threshold)
 
     if best_quad is None and strict_quad is None:
         return PaperLocation.failed(

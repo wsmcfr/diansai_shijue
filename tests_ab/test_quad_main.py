@@ -204,6 +204,82 @@ def test_auto_roi_failure_log_reports_each_rejection_gate(capsys):
     assert "quad_eps=0.025" in output
 
 
+def test_auto_roi_log_reports_robust_recovery_fields(capsys):
+    """AUTO日志必须显示宽松来源、实际阈值、主轮廓比例、边缘和旧ROI证据。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.paper_locator import PaperLocation
+
+    location = PaperLocation(
+        True,
+        paper_quad=np.float32(((20, 30), (620, 45), (600, 440), (30, 430))),
+        paper_orientation="landscape",
+        confidence=0.81,
+        threshold=153.0,
+        diagnostics={
+            "source": "PRIOR_EDGE",
+            "contour_count": 8,
+            "best_candidate": {
+                "area_ratio": 0.234,
+                "observed_aspect": 0.706,
+                "aspect_score": 0.998,
+                "rectangularity": 0.431,
+                "convexity": 0.501,
+                "darkness_score": 0.492,
+                "confidence": 0.810,
+                "strict_vertex_count": 6,
+                "quad_epsilon_ratio": 0.040,
+                "used_threshold": 153.0,
+                "area_to_largest": 0.963,
+                "quad_fill": 0.881,
+                "edge_support": 0.724,
+                "supported_side_count": 4,
+                "prior_iou": 0.914,
+            },
+        },
+    )
+
+    main.log_auto_roi_diagnostics(location, debug_enabled=True)
+
+    output = capsys.readouterr().out.strip()
+    assert "source=PRIOR_EDGE" in output
+    assert "used_threshold=153.0" in output
+    assert "area_to_largest=0.963" in output
+    assert "quad_fill=0.881" in output
+    assert "edge_support=0.724" in output
+    assert "edge_sides=4" in output
+    assert "prior_iou=0.914" in output
+
+
+def test_auto_roi_failure_log_reports_relaxed_rejection_gates(capsys):
+    """宽松和旧ROI拒绝计数必须映射为稳定的一行gates标签。"""
+    from maixcam2_app_A_quad import main
+    from maixcam2_app_A_quad.paper_locator import PaperLocation
+
+    location = PaperLocation.failed(
+        "no_candidate",
+        threshold=129.0,
+        diagnostics={
+            "contour_count": 3,
+            "relaxed_area_reject_count": 1,
+            "relaxed_rectangularity_reject_count": 2,
+            "relaxed_aspect_reject_count": 1,
+            "relaxed_darkness_reject_count": 1,
+            "relaxed_edge_reject_count": 3,
+            "prior_mismatch_reject_count": 1,
+        },
+    )
+
+    main.log_auto_roi_diagnostics(location, debug_enabled=True)
+
+    output = capsys.readouterr().out.strip()
+    assert "RELAX_AREA" in output
+    assert "RELAX_RECT" in output
+    assert "RELAX_ASPECT" in output
+    assert "RELAX_DARK" in output
+    assert "EDGE_LOW" in output
+    assert "PRIOR_MISMATCH" in output
+
+
 def test_quad_analysis_detects_four_pieces_and_adds_paper_mm_centers():
     """验证A版单帧数据流保留相机中心并额外输出完整A4毫米中心。"""
     from maixcam2_app_A_quad.main import analyze_quad_frame

@@ -203,6 +203,41 @@ def test_a_locator_rejects_relaxed_quad_without_real_edge_support():
     assert result.diagnostics["relaxed_edge_reject_count"] >= 1
 
 
+def test_a_locator_uses_prior_edges_after_threshold_scan_fails():
+    """多阈值被限制为Otsu时，正确旧ROI必须通过当前图像边缘恢复。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    frame, expected_quad = make_uneven_brightness_paper_scene()
+    prior_quad = expected_quad + np.float32([[3, 2], [-2, 3], [-3, -2], [2, -3]])
+
+    result = module.locate_black_paper(
+        frame,
+        {"paper_auto_threshold_offsets": (0,)},
+        prior_quad=prior_quad,
+    )
+
+    assert result.success is True
+    assert result.diagnostics["source"] == "PRIOR_EDGE"
+    assert result.diagnostics["best_candidate"]["prior_iou"] >= 0.90
+    np.testing.assert_allclose(result.paper_quad, expected_quad, atol=12.0)
+
+
+def test_a_locator_rejects_prior_without_matching_current_edges():
+    """旧ROI明显偏离当前纸面时必须失败，不能只因存在历史蓝框返回成功。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    frame, expected_quad = make_uneven_brightness_paper_scene()
+    wrong_prior = expected_quad + np.float32([[-80, -55], [-80, -55], [-80, -55], [-80, -55]])
+
+    result = module.locate_black_paper(
+        frame,
+        {"paper_auto_threshold_offsets": (0,)},
+        prior_quad=wrong_prior,
+    )
+
+    assert result.success is False
+    assert result.paper_quad is None
+    assert result.diagnostics["prior_mismatch_reject_count"] >= 1
+
+
 def test_a_auto_roi_exposes_editable_epsilon_ratio_macro():
     """现场可调epsilon序列必须集中导出，并由AUTO默认配置直接引用。"""
     config = importlib.import_module("maixcam2_app_A_quad.config")
