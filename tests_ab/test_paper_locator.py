@@ -191,6 +191,40 @@ def test_a_locator_rejects_small_quad_beside_larger_nonpaper_contour():
         assert not np.allclose(result.paper_quad, small_block, atol=3.0)
 
 
+def test_a_strict_dominance_gate_uses_selected_candidate_metrics():
+    """严格安全门必须检查实际入选A4，不能误用高分但矩形度不足的诊断候选。
+
+    大灰纸满足旧矩形度和置信度门；左上凹形暗区因颜色更黑取得更高诊断分，但矩形度
+    低于0.70。正确行为应让大纸直接由STRICT返回，不能把诊断暗区的相对面积套在
+    大纸上并触发不必要的TH_SCAN。
+    """
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+    frame = np.full((480, 640, 3), 220, dtype=np.uint8)
+    expected_quad = np.float32([[320, 180], [610, 180], [610, 400], [320, 400]])
+    cv2.fillConvexPoly(frame, expected_quad.astype(np.int32), (140, 140, 140))
+    concave_distractor = np.int32(
+        [
+            [20, 10],
+            [82, 45],
+            [145, 10],
+            [208, 45],
+            [270, 10],
+            [235, 98],
+            [270, 187],
+            [145, 152],
+            [20, 187],
+            [55, 98],
+        ]
+    )
+    cv2.fillPoly(frame, [concave_distractor], (18, 18, 18))
+
+    result = module.locate_black_paper(frame)
+
+    assert result.success is True
+    assert result.diagnostics["source"] == "STRICT"
+    np.testing.assert_allclose(result.paper_quad, expected_quad, atol=4.0)
+
+
 def test_a_locator_rejects_relaxed_quad_without_real_edge_support():
     """凸包形成A4四角但候选四边没有真实图像边缘时必须拒绝。"""
     module = importlib.import_module("maixcam2_app_A_quad.paper_locator")

@@ -893,6 +893,7 @@ def _search_strict_paper_candidate(
     max_area_ratio = float(config["paper_max_area_ratio"])
     best_quad = None
     best_confidence = 0.0
+    best_selected_metrics = None
     diagnostic_best_confidence = -1.0
 
     for contour, contour_area in zip(contours, contour_areas):
@@ -940,24 +941,38 @@ def _search_strict_paper_candidate(
         if confidence > best_confidence:
             best_quad = quad
             best_confidence = confidence
+            # 单独保存真正通过矩形度门的候选。最高诊断分可能属于随后被拒绝的凹形
+            # 暗区，不能拿它的面积比例替代实际入选A4执行主轮廓安全门。
+            best_selected_metrics = dict(metrics)
 
     largest_area_ratio = float(diagnostics["largest_area_ratio"])
-    best_metrics = diagnostics.get("best_candidate")
-    if isinstance(best_metrics, dict):
+    diagnostic_metrics = diagnostics.get("best_candidate")
+    if isinstance(diagnostic_metrics, dict):
         area_to_largest = (
             0.0
             if largest_area_ratio <= 1e-9
-            else float(best_metrics["area_ratio"]) / largest_area_ratio
+            else float(diagnostic_metrics["area_ratio"]) / largest_area_ratio
         )
-        best_metrics["area_to_largest"] = float(
+        diagnostic_metrics["area_to_largest"] = float(
             np.clip(area_to_largest, 0.0, 1.0)
         )
 
     # 即使四角来自严格2%，当候选远小于同帧主暗区时也不能立即锁定。这个门只排除
     # 明显的相对小框，不提高旧绝对面积下限，因此远距离但画面中没有更大暗区的A4
     # 仍保持旧行为。
-    if best_quad is not None and isinstance(best_metrics, dict):
-        if best_metrics["area_to_largest"] < float(
+    if best_quad is not None and isinstance(best_selected_metrics, dict):
+        selected_area_to_largest = (
+            0.0
+            if largest_area_ratio <= 1e-9
+            else float(best_selected_metrics["area_ratio"]) / largest_area_ratio
+        )
+        best_selected_metrics["area_to_largest"] = float(
+            np.clip(selected_area_to_largest, 0.0, 1.0)
+        )
+        # 成功或低置信度日志都应描述实际通过矩形度门的候选，而不是另一个仅供排障
+        # 的高分拒绝候选。
+        diagnostics["best_candidate"] = dict(best_selected_metrics)
+        if best_selected_metrics["area_to_largest"] < float(
             config["paper_auto_min_area_to_largest"]
         ):
             diagnostics["relaxed_area_reject_count"] += 1
