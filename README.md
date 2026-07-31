@@ -1,16 +1,16 @@
 # MaixCAM2 拼图碎片识别
 
-本项目用于在 MaixCAM2 上识别黑色 A4 纸上的白色拼图碎片。A版v2.0.1保留跨帧`GRAPH → FOUR_FAST → FALLBACK`流水线，并使用UART4协议版本2发送会话心跳、完整A4毫米边界和1～4片拼装结果。1～3片仍保持原`GRAPH → FALLBACK`路径，四片FOURFAST保留1.5秒独立CPU活动预算；当前现场宏为90%严格门、84%受约束容错门和8mm伪短边清理。龙门架通信与运动控制仍由下位机接入。
+本项目用于在 MaixCAM2 上识别黑色 A4 纸上的白色拼图碎片。A版v2.2.0使用跨帧`GRAPH → FOUR_FAST → FALLBACK`流水线，并通过UART4协议版本3发送会话心跳、完整A4毫米边界和1～4片拼装结果。普通UNKNOWN不再用目标矩形毫米尺寸作硬门；未得到可靠解时会显示并发送`PLAN BEST !`，结果flags bit0提醒F4该拼法可能不准确。当前现场宏为92%严格门、85%受约束容错门和10mm伪短边清理。龙门架通信与运动控制仍由下位机接入。
 
 当前保留原稳定版，并新增两个独立自动黑纸ROI版本：A版使用四边形掩膜，B版使用透视展开。完整安装、按钮和现场调参说明见 [A/B操作手册](docs/maixcam2-auto-roi-ab-guide.md)。
 
 | 版本 | 目录 | 发布ZIP |
 |---|---|---|
 | 稳定版 | `maixcam2_app/` | `maix-diansai_1-v1.0.0.zip` |
-| A 四边形掩膜与规划、UART4协议 | `maixcam2_app_A_quad/` | `diansai_quad-v2.0.1.zip` |
+| A 四边形掩膜与规划、UART4协议 | `maixcam2_app_A_quad/` | `diansai_quad-v2.2.0.zip` |
 | B 透视展开 | `maixcam2_app_B_warp/` | `diansai_warp-v1.1.0.zip` |
 
-> A版`v2.0.1`使用设置V5保存纸张方向。竖放映射210×297mm，横放映射297×210mm，黄色视觉区域默认等于完整蓝色A4区域；230×230mm机械行程由F4按实际零点独立限位。正常界面只显示标定A4纸面；选择模式/材料后必须点击`START`，连续3帧后锁定一次轮廓，成功或失败都保持到再次点击`START`。WHITE依次执行整边`GRAPH_AUTO`、四片`FOUR_FAST`和原FALLBACK，CARD继续使用原始锁定轮廓和纹理择优。
+> A版`v2.2.0`使用设置V5保存纸张方向。竖放映射210×297mm，横放映射297×210mm，黄色视觉区域默认等于完整蓝色A4区域；230×230mm机械行程由F4按实际零点独立限位。正常界面只显示标定A4纸面；选择模式/材料后必须点击`START`，连续3帧后锁定一次轮廓。WHITE依次执行整边`GRAPH_AUTO`、普通UNKNOWN内部四片`FOURFAST`和FALLBACK，独立`FOUR`仍保留自己的尺寸规则。
 
 ## 当前功能
 

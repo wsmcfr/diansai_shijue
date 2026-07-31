@@ -322,6 +322,27 @@ def test_runtime_debug_log_reports_snapshot_graph_and_result(capsys):
     assert "layouts=" in output
     assert "[SOLVER] RESULT" in output
     assert "reason=ok" in output
+    assert "reliable=1" in output
+
+
+def test_runtime_debug_result_marks_best_effort_as_unreliable(capsys):
+    """最佳回退的电脑日志必须显示reliable=0，便于与可靠PLAN区分。"""
+    from maixcam2_app_A_quad.assembly_planner import AssemblyPlan, AssemblyRuntime
+
+    runtime = AssemblyRuntime(stable_frames=1, debug_enabled=True)
+    plan = AssemblyPlan(
+        True,
+        placements=[object()],
+        reason="best_effort",
+        reliable=False,
+        diagnostics={"best_effort": 1, "fill_permille": 810},
+    )
+
+    runtime._debug_result(plan, "fallback")
+
+    output = capsys.readouterr().out
+    assert "[SOLVER] RESULT source=FALLBACK success=1 reliable=0" in output
+    assert "reason=best_effort" in output
 
 
 def test_runtime_debug_log_reports_four_fast_geometry_counts(capsys):

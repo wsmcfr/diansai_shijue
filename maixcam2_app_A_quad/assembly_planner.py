@@ -4481,6 +4481,7 @@ class AssemblyRuntime:
             "RESULT",
             lambda: (
                 f"source={str(source).upper()} success={int(bool(plan.success))} "
+                f"reliable={int(bool(getattr(plan, 'reliable', False)))} "
                 f"reason={plan.reason} nodes={int(plan.search_nodes)} "
                 f"fill={int(diagnostics.get('fill_permille', 0)) / 10.0:.1f}% "
                 f"overlap={int(diagnostics.get('overlap_permille', 0)) / 10.0:.1f}% "
