@@ -1095,11 +1095,12 @@ def handle_calibration_action(
     frame_bgr=None,
     serial_runtime=None,
 ):
-    """处理五页调参动作、A4发送和两组互不覆盖的持久化。
+    """处理五页调参动作、蓝框AUTO/MANUAL、A4发送和两组独立持久化。
 
-    主要流程：顶部动作切换页面；底部固定槽先由会话映射为AUTO ROI、工作区、LOCK、
-    SEND A4或ADV参数动作。LOCK只合并纸张字段，ADV SAVE只合并分割字段，SEND A4
-    只排队协议帧且不写设置。frame_bgr仅在AUTO ROI单次点击时使用。
+    主要流程：顶部动作切换页面；ROI页把减加号映射为蓝框模式、像素步进或几何，
+    MASK/RESULT保留黄色毫米工作区，ADV保留分割参数。LOCK只合并纸张字段，ADV
+    SAVE只合并分割字段，SEND A4只排队协议帧且不写设置。frame_bgr仅在AUTO ROI
+    单次点击时使用。
     返回值为 ``(运行参数, 状态文字)``。
     """
     if not interface_state.is_calibrating:
@@ -1138,6 +1139,21 @@ def handle_calibration_action(
         return runtime_settings, session.status_text
     if logical_action == "work_value":
         return runtime_settings, f"WORK {session.cycle_work_item()}"
+    if logical_action in ("paper_dec", "paper_inc"):
+        # ROI页复用同一对减加按钮：MODE切换AUTO/MANUAL，STEP循环像素步进，
+        # X/Y/W/H才进入蓝框几何。分支按当前项显式路由，避免像素值落入毫米工作区。
+        direction = -1 if logical_action == "paper_dec" else 1
+        paper_item = session.current_roi_item
+        if paper_item == "MODE":
+            target_mode = "MANUAL" if session.roi_mode == "AUTO" else "AUTO"
+            session.set_roi_mode(target_mode)
+        elif paper_item == "STEP":
+            session.cycle_manual_step(direction)
+        else:
+            session.adjust_paper_quad(paper_item, direction)
+        return runtime_settings, session.status_text
+    if logical_action == "paper_value":
+        return runtime_settings, f"ROI {session.cycle_roi_item()}"
     if logical_action == "lock_roi":
         if not session.can_lock_roi(detection):
             return runtime_settings, session.status_text

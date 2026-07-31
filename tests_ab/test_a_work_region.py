@@ -201,6 +201,16 @@ def test_a_simple_calibration_cycles_and_adjusts_six_work_values():
 
     assert session.bottom_actions() == (
         "auto_roi",
+        "paper_dec",
+        "paper_value",
+        "paper_inc",
+        "lock_roi",
+        "send_a4",
+    )
+    assert session.current_item == "MODE"
+    session.select_view("mask")
+    assert session.bottom_actions() == (
+        "auto_roi",
         "work_dec",
         "work_value",
         "work_inc",
@@ -362,6 +372,7 @@ def test_a_work_value_action_cycles_selected_parameter():
     runtime = settings_store.build_default_runtime_settings(DEFAULT_CONFIG)
     interface = main.InterfaceState()
     interface.toggle_calibration(runtime, (640, 480))
+    interface.calibration_session.select_view("mask")
 
     unchanged, message = main.handle_calibration_action(
         "control_3",

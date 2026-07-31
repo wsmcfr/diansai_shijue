@@ -421,7 +421,13 @@ class CalibrationSession:
 
     @property
     def current_item(self):
-        """ADV页返回当前分割参数，其余简化页返回当前机械毫米参数。"""
+        """按当前页面返回蓝框、分割或黄色毫米工作区参数。
+
+        ROI页使用独立像素参数；ADV使用分割参数；MASK、RESULT和MEASURE继续返回
+        黄色毫米工作区参数，防止同名X/Y在入口层被错误解释。
+        """
+        if self.view == VIEW_ROI:
+            return self.current_roi_item
         if self.view == VIEW_ADV:
             return SEGMENT_ITEMS[self._segment_item_index]
         return WORK_ITEMS[self._work_item_index]
@@ -470,6 +476,15 @@ class CalibrationSession:
                 "save_segmentation",
                 "disabled",
             )
+        if self.view == VIEW_ROI:
+            return (
+                "auto_roi",
+                "paper_dec",
+                "paper_value",
+                "paper_inc",
+                "lock_roi",
+                "send_a4",
+            )
         return (
             "auto_roi",
             "work_dec",
@@ -482,7 +497,7 @@ class CalibrationSession:
     def cycle_work_item(self):
         """按X、Y、W、H、SPLIT、PAPER顺序循环机械参数并返回新名称。"""
         self._work_item_index = (self._work_item_index + 1) % len(WORK_ITEMS)
-        return self.current_item
+        return WORK_ITEMS[self._work_item_index]
 
     def cycle_roi_item(self):
         """循环ROI页的MODE、蓝框几何和STEP参数并返回新名称。
@@ -673,7 +688,8 @@ class CalibrationSession:
         direction = int(direction)
         if direction not in (-1, 1):
             raise ValueError("调节方向必须是-1或1")
-        if self.current_item == "PAPER":
+        work_item = WORK_ITEMS[self._work_item_index]
+        if work_item == "PAPER":
             # PAPER是二值选项，左右两个按钮都执行V/H切换，避免在小屏上引入第三种状态。
             self.settings = self._switch_paper_orientation()
             self.measurement_tracker.reset()
@@ -684,7 +700,7 @@ class CalibrationSession:
             )
             self.status_text = f"PAPER {orientation_label}"
             return True
-        key = WORK_SETTING_KEYS[self.current_item]
+        key = WORK_SETTING_KEYS[work_item]
         updated = dict(self.settings)
         updated[key] = round(float(updated[key]) + direction * WORK_STEP_MM, 1)
         try:
@@ -694,7 +710,7 @@ class CalibrationSession:
             return False
         self.settings = normalized
         self.measurement_tracker.reset()
-        self.status_text = f"WORK {self.current_item} {self.settings[key]:.1f}mm"
+        self.status_text = f"WORK {work_item} {self.settings[key]:.1f}mm"
         return True
 
     def resolve_control_action(self, control_name):
@@ -745,6 +761,7 @@ class CalibrationSession:
         )
         # 复用完整设置校验，确保候选四角在保存前已经满足画面边界与凸性约束。
         self.settings = validate_runtime_settings(updated, self.frame_size)
+        self.roi_mode = ROI_MODE_AUTO
         self.measurement_tracker.reset()
         self.paper_confidence = float(location.confidence)
         # AUTO成功后把方向直接显示在屏幕状态栏：H表示297mm长边水平，V表示长边
@@ -1424,8 +1441,28 @@ def _draw_measurement_preview(frame_bgr, result, session, measurement, display_s
 
 
 def _current_value_label(session, result):
-    """根据当前参数项生成底部中间按钮的简短数值标签。"""
+    """根据当前页面和参数项生成底部中间按钮的简短数值标签。
+
+    ROI页显示AUTO/MANUAL、蓝框中心、平均宽高或像素步进；其他页面保持已有毫米
+    工作区和分割参数格式。关键参数result只在阈值标签中使用。返回ASCII短文本，
+    便于640×480小屏通过自适应字号完整显示。
+    """
     item = session.current_item
+    if session.view == VIEW_ROI:
+        if item == "MODE":
+            return session.roi_mode
+        if item == "STEP":
+            return f"{session.manual_roi_step_px}px"
+        paper_quad = session.settings.get("paper_quad")
+        if paper_quad is None:
+            return "--"
+        quad = np.asarray(paper_quad, dtype=np.float64)
+        if item == "X":
+            return f"{float(np.mean(quad[:, 0])):.0f}px"
+        if item == "Y":
+            return f"{float(np.mean(quad[:, 1])):.0f}px"
+        mean_width, mean_height = _paper_quad_mean_size(quad)
+        return f"{mean_width if item == 'W' else mean_height:.0f}px"
     if item == "PAPER":
         return (
             "H"

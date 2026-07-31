@@ -144,6 +144,15 @@ def test_calibration_session_maps_simple_and_advanced_bottom_actions(package_nam
     if package_name.endswith("A_quad"):
         assert session.bottom_actions() == (
             "auto_roi",
+            "paper_dec",
+            "paper_value",
+            "paper_inc",
+            "lock_roi",
+            "send_a4",
+        )
+        session.select_view("mask")
+        assert session.bottom_actions() == (
+            "auto_roi",
             "work_dec",
             "work_value",
             "work_inc",
@@ -243,6 +252,55 @@ def test_a_switching_back_to_auto_keeps_manual_quad_available_for_retry():
     assert session.roi_mode == "AUTO"
     np.testing.assert_allclose(session.settings["paper_quad"], old_quad, atol=0.01)
     assert session.status_text == "ROI AUTO"
+
+
+def test_a_auto_roi_success_returns_session_to_auto_mode():
+    """MANUAL中重新执行AUTO成功后应切回AUTO，避免减加号继续误改新蓝框。"""
+    modules, session = _make_a_session()
+    session.set_roi_mode("MANUAL")
+    location = modules.locator.PaperLocation(
+        True,
+        paper_quad=np.float32([[120, 80], [500, 60], [530, 410], [90, 430]]),
+        paper_orientation=modules.locator.PAPER_ORIENTATION_PORTRAIT,
+        confidence=0.91,
+        threshold=120.0,
+        reason="ok",
+    )
+
+    assert session.apply_auto_roi(location) is True
+
+    assert session.roi_mode == "AUTO"
+
+
+def test_a_auto_roi_failure_keeps_manual_mode_and_current_quad(monkeypatch, tmp_path):
+    """MANUAL中AUTO失败必须保留模式和蓝框，用户可继续按减加号精调。"""
+    modules = _variant_modules("maixcam2_app_A_quad")
+    runtime = modules.settings.build_default_runtime_settings(modules.config.DEFAULT_CONFIG)
+    interface = modules.main.InterfaceState()
+    interface.toggle_calibration(runtime, (640, 480))
+    session = interface.calibration_session
+    session.set_roi_mode("MANUAL")
+    before = session.snapshot()
+    monkeypatch.setattr(
+        modules.main,
+        "locate_black_paper",
+        lambda *_args, **_kwargs: modules.locator.PaperLocation.failed("no_candidate"),
+    )
+
+    unchanged, message = modules.main.handle_calibration_action(
+        "control_1",
+        interface,
+        runtime,
+        _make_detection(1),
+        tmp_path / "settings.json",
+        (640, 480),
+        frame_bgr=np.zeros((480, 640, 3), dtype=np.uint8),
+    )
+
+    assert unchanged is runtime
+    assert message == "AUTO ROI FAIL"
+    assert session.roi_mode == "MANUAL"
+    assert session.settings["paper_quad"] == before["paper_quad"]
 
 
 def test_a_manual_xy_translates_every_corner_by_selected_step():
@@ -349,6 +407,121 @@ def test_a_manual_adjustment_rejects_out_of_frame_or_too_small_quad(
 
     assert session.settings["paper_quad"] == before["paper_quad"]
     assert session.status_text == "ROI LIMIT"
+
+
+def test_a_roi_minus_plus_actions_switch_mode_and_move_selected_geometry(tmp_path):
+    """ROI六槽应先用加号切到MANUAL，再通过中间按钮选X并移动蓝框。"""
+    modules = _variant_modules("maixcam2_app_A_quad")
+    runtime = modules.settings.build_default_runtime_settings(modules.config.DEFAULT_CONFIG)
+    interface = modules.main.InterfaceState()
+    interface.toggle_calibration(runtime, (640, 480))
+    session = interface.calibration_session
+    detection = _make_detection(1)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    unchanged, message = modules.main.handle_calibration_action(
+        "control_4",
+        interface,
+        runtime,
+        detection,
+        tmp_path / "settings.json",
+        (640, 480),
+        frame_bgr=frame,
+    )
+    assert unchanged is runtime
+    assert message == "ROI MANUAL"
+    before = np.asarray(session.settings["paper_quad"], dtype=float)
+
+    unchanged, message = modules.main.handle_calibration_action(
+        "control_3",
+        interface,
+        runtime,
+        detection,
+        tmp_path / "settings.json",
+        (640, 480),
+        frame_bgr=frame,
+    )
+    assert unchanged is runtime
+    assert message == "ROI X"
+
+    unchanged, message = modules.main.handle_calibration_action(
+        "control_4",
+        interface,
+        runtime,
+        detection,
+        tmp_path / "settings.json",
+        (640, 480),
+        frame_bgr=frame,
+    )
+    assert unchanged is runtime
+    assert message == "MAN X +5px"
+    after = np.asarray(session.settings["paper_quad"], dtype=float)
+    np.testing.assert_allclose(after, before + (5.0, 0.0), atol=1e-6)
+
+
+def test_a_lock_roi_persists_current_manual_quad(tmp_path):
+    """手动移动后的蓝框只有按LOCK ROI才应合并进运行设置并写入磁盘。"""
+    modules = _variant_modules("maixcam2_app_A_quad")
+    runtime = modules.settings.build_default_runtime_settings(modules.config.DEFAULT_CONFIG)
+    interface = modules.main.InterfaceState()
+    interface.toggle_calibration(runtime, (640, 480))
+    session = interface.calibration_session
+    session.set_roi_mode("MANUAL")
+    assert session.adjust_paper_quad("X", 1) is True
+    expected_quad = session.snapshot()["paper_quad"]
+
+    updated, message = modules.main.handle_calibration_action(
+        "control_5",
+        interface,
+        runtime,
+        _make_detection(1),
+        tmp_path / "settings.json",
+        (640, 480),
+        frame_bgr=np.zeros((480, 640, 3), dtype=np.uint8),
+    )
+
+    assert message == "ROI LOCKED"
+    assert updated["paper_quad"] == expected_quad
+
+
+def test_a_roi_draws_blue_control_label_while_mask_keeps_work_mm_label(monkeypatch):
+    """ROI中间槽必须显示蓝框模式，MASK中间槽仍显示黄色毫米工作区。"""
+    modules, session = _make_a_session(
+        paper_quad=[[120, 80], [500, 60], [530, 410], [90, 430]]
+    )
+    detection = _make_detection(1)
+    detection.mask = np.zeros((480, 640), dtype=np.uint8)
+    detection.roi = (0, 0, 640, 480)
+    quality = modules.calibration.evaluate_calibration(detection)
+    buttons = modules.touch.build_calibration_layout(640, 480)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    drawn_labels = []
+
+    def capture_button(_image, _button, label, active=False, enabled=True):
+        """记录按钮标签和状态，避免测试依赖OpenCV字体的具体像素。"""
+        drawn_labels.append((label, bool(active), bool(enabled)))
+
+    monkeypatch.setattr(modules.calibration, "_draw_button", capture_button)
+
+    modules.calibration.draw_calibration_frame(
+        frame,
+        detection,
+        session,
+        buttons,
+        quality,
+    )
+    assert any(label == "MODE AUTO" for label, _active, _enabled in drawn_labels)
+
+    drawn_labels.clear()
+    session.select_view("mask")
+    modules.calibration.draw_calibration_frame(
+        frame,
+        detection,
+        session,
+        buttons,
+        quality,
+    )
+    assert any(label == "X 0.0mm" for label, _active, _enabled in drawn_labels)
 
 
 def test_a_send_a4_button_is_enabled_only_after_paper_quad_exists(monkeypatch):
@@ -593,6 +766,7 @@ def test_a_roi_page_can_switch_paper_v_h_and_reset_default_work_region():
     modules = _variant_modules("maixcam2_app_A_quad")
     saved = modules.settings.build_default_runtime_settings(modules.config.DEFAULT_CONFIG)
     session = modules.calibration.CalibrationSession(saved, (640, 480))
+    session.select_view("mask")
 
     # 默认项目为X；循环五次依次越过Y/W/H/SPLIT后应到达PAPER。
     for _ in range(5):
