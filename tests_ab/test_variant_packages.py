@@ -186,3 +186,23 @@ def test_package_script_release_file_order_matches_each_manifest():
     for package_name, spec in module_globals["RELEASE_SPECS"].items():
         manifest_files = read_manifest_files(PROJECT_ROOT / package_name / "app.yaml")
         assert tuple(spec["files"]) == manifest_files
+
+
+def test_a_field_guide_documents_manual_paper_roi_workflow():
+    """正式A版手册必须完整说明蓝框手动标定，避免现场仍按旧黄色参数操作。"""
+    guide_text = (
+        PROJECT_ROOT / "maixcam2_app_A_quad" / "A版实机调试手册.md"
+    ).read_text(encoding="utf-8")
+
+    required_phrases = (
+        "MODE AUTO",
+        "MODE MANUAL",
+        "MODE → X → Y → W → H → STEP",
+        "1px、5px、10px",
+        "优先使用上次保存的蓝框",
+        "居中的A4比例初始框",
+        "蓝框和黄色框默认完全重合",
+        "按下LOCK ROI才会保存",
+    )
+    for phrase in required_phrases:
+        assert phrase in guide_text
