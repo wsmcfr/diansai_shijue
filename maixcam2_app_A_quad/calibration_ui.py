@@ -75,6 +75,66 @@ ROI_MODES = (ROI_MODE_AUTO, ROI_MODE_MANUAL)
 PAPER_ROI_ITEMS = ("MODE", "X", "Y", "W", "H", "STEP")
 MANUAL_ROI_STEPS_PX = (1, 5, 10)
 MANUAL_INITIAL_FRAME_FRACTION = 0.80
+MIN_MANUAL_PAPER_EDGE_PX = 80.0
+
+
+def _paper_quad_mean_size(paper_quad):
+    """返回四边形的平均宽度和平均高度，单位为相机分析像素。
+
+    主要流程：宽度取上下边长度平均值，高度取左右边长度平均值。关键参数
+    paper_quad必须为按边连续排列的四个二维角点。返回``(平均宽, 平均高)``；
+    形状错误时抛出ValueError，避免后续缩放使用错误点序。
+    """
+    quad = np.asarray(paper_quad, dtype=np.float64)
+    if quad.shape != (4, 2) or not np.all(np.isfinite(quad)):
+        raise ValueError("手动paper_quad必须是4x2有限坐标")
+    mean_width = (
+        np.linalg.norm(quad[1] - quad[0])
+        + np.linalg.norm(quad[2] - quad[3])
+    ) / 2.0
+    mean_height = (
+        np.linalg.norm(quad[3] - quad[0])
+        + np.linalg.norm(quad[2] - quad[1])
+    ) / 2.0
+    return float(mean_width), float(mean_height)
+
+
+def _scale_paper_quad_width(paper_quad, delta_px):
+    """围绕上下边各自中点对称缩放蓝框宽度并保留两条边方向。
+
+    关键参数delta_px表示每侧移动的像素量，所以平均总宽变化约为其两倍。
+    返回新的float64四角数组，不修改输入；目标宽度非正时抛出ValueError。
+    """
+    quad = np.asarray(paper_quad, dtype=np.float64).copy()
+    mean_width, _ = _paper_quad_mean_size(quad)
+    target_width = mean_width + 2.0 * float(delta_px)
+    if target_width <= 0.0:
+        raise ValueError("手动蓝框目标宽度必须大于零")
+    scale = target_width / mean_width
+    for first_index, second_index in ((0, 1), (3, 2)):
+        midpoint = (quad[first_index] + quad[second_index]) / 2.0
+        quad[first_index] = midpoint + (quad[first_index] - midpoint) * scale
+        quad[second_index] = midpoint + (quad[second_index] - midpoint) * scale
+    return quad
+
+
+def _scale_paper_quad_height(paper_quad, delta_px):
+    """围绕左右边各自中点对称缩放蓝框高度并保留两条边方向。
+
+    关键参数delta_px表示每侧移动的像素量，所以平均总高变化约为其两倍。
+    返回新的float64四角数组，不修改输入；目标高度非正时抛出ValueError。
+    """
+    quad = np.asarray(paper_quad, dtype=np.float64).copy()
+    _, mean_height = _paper_quad_mean_size(quad)
+    target_height = mean_height + 2.0 * float(delta_px)
+    if target_height <= 0.0:
+        raise ValueError("手动蓝框目标高度必须大于零")
+    scale = target_height / mean_height
+    for first_index, second_index in ((0, 3), (1, 2)):
+        midpoint = (quad[first_index] + quad[second_index]) / 2.0
+        quad[first_index] = midpoint + (quad[first_index] - midpoint) * scale
+        quad[second_index] = midpoint + (quad[second_index] - midpoint) * scale
+    return quad
 
 # RESULT页面使用稳定BGR颜色区分轮廓去留原因。
 COLOR_VALID = (0, 210, 0)
@@ -435,6 +495,21 @@ class CalibrationSession:
         ) % len(PAPER_ROI_ITEMS)
         return self.current_roi_item
 
+    def cycle_manual_step(self, direction):
+        """按指定方向在1、5、10px之间循环并返回新步进。
+
+        关键参数direction只接受-1或1；正方向按1→5→10→1循环，负方向反向循环。
+        步进是会话参数，不写设置JSON，也不会改变当前蓝框。
+        """
+        direction = int(direction)
+        if direction not in (-1, 1):
+            raise ValueError("步进切换方向必须是-1或1")
+        self._manual_roi_step_index = (
+            self._manual_roi_step_index + direction
+        ) % len(MANUAL_ROI_STEPS_PX)
+        self.status_text = f"STEP {self.manual_roi_step_px}px"
+        return self.manual_roi_step_px
+
     def _build_centered_paper_quad(self):
         """按当前PAPER方向生成画面中央的A4比例初始蓝框。
 
@@ -505,6 +580,63 @@ class CalibrationSession:
         self.roi_mode = normalized_mode
         self.measurement_tracker.reset()
         self.status_text = f"ROI {normalized_mode}"
+        return True
+
+    def adjust_paper_quad(self, item, direction):
+        """在MANUAL模式下按X/Y/W/H调整完整A4蓝框。
+
+        主要流程：按当前像素步进生成平移或透视保持缩放候选，先检查80px最小平均
+        边长，再复用完整设置校验检查画面边界、点序和凸性；任何失败都原子保留旧
+        四角并显示ROI LIMIT。关键参数item只接受X/Y/W/H，direction只接受-1或1。
+        成功返回True，受限或仍在AUTO模式返回False；本函数不持久化设置。
+        """
+        normalized_item = str(item).strip().upper()
+        if normalized_item not in ("X", "Y", "W", "H"):
+            raise ValueError("手动蓝框项目必须是X、Y、W或H")
+        direction = int(direction)
+        if direction not in (-1, 1):
+            raise ValueError("手动蓝框方向必须是-1或1")
+        if self.roi_mode != ROI_MODE_MANUAL:
+            self.status_text = "SWITCH MANUAL"
+            return False
+
+        paper_quad = self.settings.get("paper_quad")
+        if paper_quad is None:
+            # 正常流程切入MANUAL时一定会创建初始框；保留该保护可防止损坏会话崩溃。
+            self.status_text = "ROI LIMIT"
+            return False
+
+        delta_px = float(direction * self.manual_roi_step_px)
+        candidate = np.asarray(paper_quad, dtype=np.float64).copy()
+        if normalized_item == "X":
+            candidate[:, 0] += delta_px
+        elif normalized_item == "Y":
+            candidate[:, 1] += delta_px
+        elif normalized_item == "W":
+            candidate = _scale_paper_quad_width(candidate, delta_px)
+        else:
+            candidate = _scale_paper_quad_height(candidate, delta_px)
+
+        try:
+            mean_width, mean_height = _paper_quad_mean_size(candidate)
+            if (
+                mean_width < MIN_MANUAL_PAPER_EDGE_PX
+                or mean_height < MIN_MANUAL_PAPER_EDGE_PX
+            ):
+                raise ValueError("手动蓝框小于最小边长")
+            updated = dict(self.settings)
+            updated["paper_quad"] = candidate.tolist()
+            normalized = validate_runtime_settings(updated, self.frame_size)
+        except ValueError:
+            self.status_text = "ROI LIMIT"
+            return False
+
+        self.settings = normalized
+        self.paper_confidence = None
+        self.measurement_tracker.reset()
+        self.status_text = (
+            f"MAN {normalized_item} {direction * self.manual_roi_step_px:+d}px"
+        )
         return True
 
     def _switch_paper_orientation(self):

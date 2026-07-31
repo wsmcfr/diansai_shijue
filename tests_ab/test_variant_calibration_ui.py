@@ -66,6 +66,40 @@ def _session_work_region(session):
     )
 
 
+def _paper_mean_size(paper_quad):
+    """计算四边形上下边平均宽和左右边平均高，匹配手动W/H的定义。"""
+    quad = np.asarray(paper_quad, dtype=float)
+    mean_width = (
+        np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])
+    ) / 2.0
+    mean_height = (
+        np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])
+    ) / 2.0
+    return mean_width, mean_height
+
+
+def _paper_edge_directions(paper_quad):
+    """返回上下左右四条边的单位方向，用于证明缩放没有抹掉透视斜率。"""
+    quad = np.asarray(paper_quad, dtype=float)
+    edge_vectors = (
+        quad[1] - quad[0],
+        quad[2] - quad[3],
+        quad[3] - quad[0],
+        quad[2] - quad[1],
+    )
+    return np.asarray(
+        [vector / np.linalg.norm(vector) for vector in edge_vectors],
+        dtype=float,
+    )
+
+
+def _make_a_manual_session(paper_quad, frame_size=(640, 480)):
+    """以指定透视蓝框创建A版MANUAL会话，供几何和边界测试复用。"""
+    modules, session = _make_a_session(frame_size=frame_size, paper_quad=paper_quad)
+    session.set_roi_mode("MANUAL")
+    return modules, session
+
+
 @pytest.mark.parametrize("package_name", VARIANTS)
 def test_calibration_layout_keeps_variant_specific_fixed_controls(package_name):
     """验证A版使用六槽发送A4，B版继续保持原五槽且所有槽互不重叠。"""
@@ -209,6 +243,112 @@ def test_a_switching_back_to_auto_keeps_manual_quad_available_for_retry():
     assert session.roi_mode == "AUTO"
     np.testing.assert_allclose(session.settings["paper_quad"], old_quad, atol=0.01)
     assert session.status_text == "ROI AUTO"
+
+
+def test_a_manual_xy_translates_every_corner_by_selected_step():
+    """X/Y必须按分析像素刚性平移全部四角，不能改变纸面形状。"""
+    paper_quad = np.float32([[120, 80], [500, 60], [530, 410], [90, 430]])
+    _modules, session = _make_a_manual_session(paper_quad)
+    before = np.asarray(session.settings["paper_quad"], dtype=float)
+
+    assert session.adjust_paper_quad("X", 1) is True
+    after_x = np.asarray(session.settings["paper_quad"], dtype=float)
+    np.testing.assert_allclose(after_x, before + (5.0, 0.0), atol=1e-6)
+
+    assert session.adjust_paper_quad("Y", -1) is True
+    after_y = np.asarray(session.settings["paper_quad"], dtype=float)
+    np.testing.assert_allclose(after_y, before + (5.0, -5.0), atol=1e-6)
+
+
+def test_a_manual_width_preserves_top_and_bottom_perspective_directions():
+    """W缩放应保持上下边方向和梯形关系，同时增加平均宽度10px。"""
+    paper_quad = np.float32([[120, 80], [500, 60], [530, 410], [90, 430]])
+    _modules, session = _make_a_manual_session(paper_quad)
+    before = np.asarray(session.settings["paper_quad"], dtype=float)
+    before_width, before_height = _paper_mean_size(before)
+    before_directions = _paper_edge_directions(before)
+
+    assert session.adjust_paper_quad("W", 1) is True
+
+    after = np.asarray(session.settings["paper_quad"], dtype=float)
+    after_width, after_height = _paper_mean_size(after)
+    np.testing.assert_allclose(
+        _paper_edge_directions(after)[:2],
+        before_directions[:2],
+        atol=1e-6,
+    )
+    assert after_width == pytest.approx(before_width + 10.0, abs=0.01)
+    # 透视梯形的上下边长度不同，沿两条斜边分别扩宽会产生亚像素级高度耦合；
+    # 只要求它小于0.1px，远低于现场最小1px步进，同时严格保留上下边方向。
+    assert abs(after_height - before_height) < 0.1
+
+
+def test_a_manual_height_preserves_left_and_right_perspective_directions():
+    """H缩放应保持左右边方向和梯形关系，同时减少平均高度10px。"""
+    paper_quad = np.float32([[120, 80], [500, 60], [530, 410], [90, 430]])
+    _modules, session = _make_a_manual_session(paper_quad)
+    before = np.asarray(session.settings["paper_quad"], dtype=float)
+    before_width, before_height = _paper_mean_size(before)
+    before_directions = _paper_edge_directions(before)
+
+    assert session.adjust_paper_quad("H", -1) is True
+
+    after = np.asarray(session.settings["paper_quad"], dtype=float)
+    after_width, after_height = _paper_mean_size(after)
+    np.testing.assert_allclose(
+        _paper_edge_directions(after)[2:],
+        before_directions[2:],
+        atol=1e-6,
+    )
+    assert after_height == pytest.approx(before_height - 10.0, abs=0.01)
+    assert after_width == pytest.approx(before_width, abs=0.01)
+
+
+def test_a_manual_step_cycles_in_both_directions():
+    """STEP应在1/5/10px之间双向循环，便于快速移动后再做1px精调。"""
+    _modules, session = _make_a_session()
+
+    assert session.manual_roi_step_px == 5
+    assert session.cycle_manual_step(1) == 10
+    assert session.cycle_manual_step(1) == 1
+    assert session.cycle_manual_step(-1) == 10
+    assert session.cycle_manual_step(-1) == 5
+
+
+def test_a_auto_mode_rejects_manual_geometry_without_changing_quad():
+    """AUTO模式下误触X/Y/W/H必须提示切换模式，不能暗中移动蓝框。"""
+    paper_quad = np.float32([[120, 80], [500, 60], [530, 410], [90, 430]])
+    _modules, session = _make_a_session(paper_quad=paper_quad)
+    before = session.snapshot()
+
+    assert session.adjust_paper_quad("X", 1) is False
+
+    assert session.settings["paper_quad"] == before["paper_quad"]
+    assert session.status_text == "SWITCH MANUAL"
+
+
+@pytest.mark.parametrize(
+    ("paper_quad", "item", "direction"),
+    [
+        ([[0, 60], [220, 50], [230, 350], [0, 360]], "X", -1),
+        ([[100, 0], [500, 0], [500, 300], [100, 300]], "Y", -1),
+        ([[200, 100], [280, 100], [280, 320], [200, 320]], "W", -1),
+        ([[200, 100], [420, 100], [420, 180], [200, 180]], "H", -1),
+    ],
+)
+def test_a_manual_adjustment_rejects_out_of_frame_or_too_small_quad(
+    paper_quad,
+    item,
+    direction,
+):
+    """越界或平均边长将小于80px时必须原子拒绝，不得留下半更新四角。"""
+    _modules, session = _make_a_manual_session(paper_quad)
+    before = session.snapshot()
+
+    assert session.adjust_paper_quad(item, direction) is False
+
+    assert session.settings["paper_quad"] == before["paper_quad"]
+    assert session.status_text == "ROI LIMIT"
 
 
 def test_a_send_a4_button_is_enabled_only_after_paper_quad_exists(monkeypatch):
