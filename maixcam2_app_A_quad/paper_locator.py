@@ -587,6 +587,125 @@ def _validate_paper_quad_epsilon_ratios(raw_ratios):
     return ratios
 
 
+def _validate_threshold_offsets(raw_offsets):
+    """校验并规范化AUTO ROI多阈值偏移序列。
+
+    关键参数raw_offsets必须是非空、非字符串的可迭代对象；每项必须是有限整数且位于
+    ``[-127, 127]``。返回值会按用户顺序去重，并在缺少0时把0插入首位，确保严格
+    Otsu阈值也能进入后续宽松验收。非法配置明确指出配置键名，避免现场静默失效。
+    """
+    if isinstance(raw_offsets, (str, bytes)):
+        raise ValueError("paper_auto_threshold_offsets必须是整数序列")
+    try:
+        raw_values = tuple(raw_offsets)
+    except TypeError as error:
+        raise ValueError("paper_auto_threshold_offsets必须是整数序列") from error
+    if not raw_values:
+        raise ValueError("paper_auto_threshold_offsets不能为空")
+
+    offsets = []
+    for raw_value in raw_values:
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "paper_auto_threshold_offsets必须只包含有限整数"
+            ) from error
+        if not np.isfinite(numeric_value) or not numeric_value.is_integer():
+            raise ValueError("paper_auto_threshold_offsets必须只包含有限整数")
+        offset = int(numeric_value)
+        if not -127 <= offset <= 127:
+            raise ValueError("paper_auto_threshold_offsets每项必须位于-127到127")
+        if offset not in offsets:
+            offsets.append(offset)
+    if 0 not in offsets:
+        offsets.insert(0, 0)
+    return tuple(offsets)
+
+
+def _validate_ratio_config(config, key, allow_zero=True, upper=1.0):
+    """校验配置中的有限比例并返回浮点值。
+
+    关键参数key用于读取配置并构造可定位的错误信息；allow_zero决定下界是否允许0；
+    upper为闭区间上界。返回值是规范浮点数，非法值抛出ValueError。
+    """
+    try:
+        value = float(config[key])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{key}必须是有限比例") from error
+    lower_valid = value >= 0.0 if allow_zero else value > 0.0
+    if not np.isfinite(value) or not lower_valid or value > float(upper):
+        lower_text = "0到" if allow_zero else "大于0且不超过"
+        raise ValueError(f"{key}必须位于{lower_text}{float(upper):g}")
+    return value
+
+
+def _validate_auto_roi_recovery_config(config):
+    """一次性校验多阈值、宽松安全门和旧ROI兜底配置。
+
+    主要流程：规范阈值偏移，逐项校验0～1比例，再校验单边数量和每掩膜候选上限。
+    返回规范化字段字典供定位主流程复用；在处理图像前失败，避免非法宏运行到一半。
+    """
+    validated = {
+        "threshold_offsets": _validate_threshold_offsets(
+            config["paper_auto_threshold_offsets"]
+        ),
+        "relaxed_min_area_ratio": _validate_ratio_config(
+            config,
+            "paper_auto_relaxed_min_area_ratio",
+            allow_zero=False,
+        ),
+        "min_area_to_largest": _validate_ratio_config(
+            config,
+            "paper_auto_min_area_to_largest",
+            allow_zero=False,
+        ),
+        "relaxed_min_rectangularity": _validate_ratio_config(
+            config,
+            "paper_auto_relaxed_min_rectangularity",
+        ),
+        "relaxed_min_aspect_score": _validate_ratio_config(
+            config,
+            "paper_auto_relaxed_min_aspect_score",
+        ),
+        "relaxed_min_darkness": _validate_ratio_config(
+            config,
+            "paper_auto_relaxed_min_darkness",
+        ),
+        "min_edge_support": _validate_ratio_config(
+            config,
+            "paper_auto_min_edge_support",
+        ),
+        "prior_min_iou": _validate_ratio_config(
+            config,
+            "paper_auto_prior_min_iou",
+        ),
+        "prior_max_shift_ratio": _validate_ratio_config(
+            config,
+            "paper_auto_prior_max_shift_ratio",
+            allow_zero=False,
+            upper=0.25,
+        ),
+    }
+
+    integer_specs = (
+        ("paper_auto_min_supported_sides", 1, 4, "min_supported_sides"),
+        ("paper_auto_max_contours_per_mask", 1, 64, "max_contours_per_mask"),
+    )
+    for key, minimum, maximum, output_key in integer_specs:
+        try:
+            raw_value = float(config[key])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"{key}必须是整数") from error
+        if not np.isfinite(raw_value) or not raw_value.is_integer():
+            raise ValueError(f"{key}必须是整数")
+        value = int(raw_value)
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{key}必须位于{minimum}到{maximum}")
+        validated[output_key] = value
+    return validated
+
+
 def _candidate_quad_with_vertex_count(hull, epsilon_ratios):
     """按严格到宽松的多个epsilon拟合四边形，并返回本次诊断信息。
 
@@ -691,54 +810,51 @@ def _score_candidate(contour, hull, quad, gray, area_ratio, config):
     return confidence, rectangularity, metrics
 
 
-def locate_black_paper(frame_bgr, config=None):
-    """在整帧中定位最符合黑色A4纸的四边形候选。
+def _build_dark_mask(blurred_gray, threshold, close_kernel_size):
+    """按显式阈值生成暗色掩膜并执行一次闭运算。
 
-    主要流程：灰度与反向Otsu分割、闭运算、外轮廓提取、凸包四角拟合和加权评分。
-    关键参数：config 可覆盖 DEFAULT_CONFIG 中 ``paper_*`` 参数。
-    返回值：成功时返回 PaperLocation 四角与置信度；失败时返回不含四角的失败对象。
+    关键参数blurred_gray必须是已模糊的二维灰度图；threshold会限制到1～254，避免
+    极端偏移把整帧变成同一颜色；close_kernel_size必须是正奇数。返回值为uint8二值
+    掩膜，黑纸和其它暗色结构为255，供严格与宽松候选路径共用。
     """
-    _validate_frame(frame_bgr)
-    merged_config = dict(DEFAULT_CONFIG)
-    if config:
-        merged_config.update(config)
-
-    close_kernel_size = int(merged_config["paper_close_kernel"])
-    if close_kernel_size <= 0 or close_kernel_size % 2 == 0:
-        raise ValueError("paper_close_kernel 必须是正奇数")
-    epsilon_ratios = _validate_paper_quad_epsilon_ratios(
-        merged_config["paper_quad_epsilon_ratios"]
-    )
-
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    threshold, dark_mask = cv2.threshold(
-        blurred,
-        0,
+    clipped_threshold = float(np.clip(float(threshold), 1.0, 254.0))
+    _, dark_mask = cv2.threshold(
+        blurred_gray,
+        clipped_threshold,
         255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        cv2.THRESH_BINARY_INV,
     )
     close_kernel = cv2.getStructuringElement(
         cv2.MORPH_RECT,
-        (close_kernel_size, close_kernel_size),
+        (int(close_kernel_size), int(close_kernel_size)),
     )
-    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, close_kernel)
+    return cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, close_kernel)
+
+
+def _find_mask_contours(dark_mask):
+    """提取暗色外轮廓，并返回与轮廓顺序一致的面积列表。
+
+    使用RETR_EXTERNAL保持旧AUTO行为：白色碎片只形成黑纸内部孔洞，不应被当成纸张
+    候选。返回值为``(轮廓列表, 面积列表)``，调用方据此计算本掩膜最大暗区。
+    """
     contours, _ = cv2.findContours(
         dark_mask,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE,
     )
+    areas = [float(cv2.contourArea(contour)) for contour in contours]
+    return contours, areas
 
-    frame_area = float(frame_bgr.shape[0] * frame_bgr.shape[1])
-    min_area_ratio = float(merged_config["paper_min_area_ratio"])
-    max_area_ratio = float(merged_config["paper_max_area_ratio"])
-    best_quad = None
-    best_confidence = 0.0
 
-    # 诊断统计覆盖每一道硬门，但只在单次AUTO结束后由main.py打印一行，不在轮廓循环
-    # 中直接输出，避免现场控制台被逐候选日志淹没。
-    diagnostics = {
-        "contour_count": int(len(contours)),
+def _new_paper_diagnostics(contour_count, source="STRICT"):
+    """建立字段稳定的AUTO ROI候选诊断字典。
+
+    关键参数contour_count是当前严格掩膜的外轮廓数；source标记候选路径。返回字典
+    继续兼容旧日志字段，并预留后续宽松路径拒绝计数，避免失败分支缺键。
+    """
+    return {
+        "source": str(source),
+        "contour_count": int(contour_count),
         "area_small_count": 0,
         "area_large_count": 0,
         "not_quad_count": 0,
@@ -747,11 +863,39 @@ def locate_black_paper(frame_bgr, config=None):
         "largest_area_ratio": 0.0,
         "approx_vertex_counts": {},
         "best_candidate": None,
+        "relaxed_area_reject_count": 0,
+        "relaxed_rectangularity_reject_count": 0,
+        "relaxed_aspect_reject_count": 0,
+        "relaxed_darkness_reject_count": 0,
+        "relaxed_edge_reject_count": 0,
+        "prior_mismatch_reject_count": 0,
     }
+
+
+def _search_strict_paper_candidate(
+    gray,
+    dark_mask,
+    threshold,
+    config,
+    epsilon_ratios,
+):
+    """使用旧硬门搜索当前掩膜中的严格A4候选。
+
+    主要流程完整保留旧面积、凸包四角、矩形度、加权置信度和诊断排序；只把原先
+    位于``locate_black_paper``中的循环提取为可测试单元。返回
+    ``(最佳四角或None, 最佳置信度, 诊断字典)``，低置信度候选仍返回四角供调用方
+    区分``low_confidence``与``no_candidate``。
+    """
+    contours, contour_areas = _find_mask_contours(dark_mask)
+    diagnostics = _new_paper_diagnostics(len(contours), source="STRICT")
+    frame_area = float(gray.shape[0] * gray.shape[1])
+    min_area_ratio = float(config["paper_min_area_ratio"])
+    max_area_ratio = float(config["paper_max_area_ratio"])
+    best_quad = None
+    best_confidence = 0.0
     diagnostic_best_confidence = -1.0
 
-    for contour in contours:
-        contour_area = float(cv2.contourArea(contour))
+    for contour, contour_area in zip(contours, contour_areas):
         area_ratio = contour_area / frame_area
         diagnostics["largest_area_ratio"] = max(
             float(diagnostics["largest_area_ratio"]),
@@ -774,30 +918,75 @@ def locate_black_paper(frame_bgr, config=None):
             vertex_counts = diagnostics["approx_vertex_counts"]
             vertex_counts[vertex_count] = int(vertex_counts.get(vertex_count, 0)) + 1
             continue
+
         confidence, rectangularity, metrics = _score_candidate(
             contour,
             hull,
             quad,
             gray,
             area_ratio,
-            merged_config,
+            config,
         )
-        # 记录严格路径看到的顶点数和最终采用的epsilon；二者只进入调试日志，不参与
-        # 评分。现场可据此确认容错是否确实把5/6角恢复成了四角。
         metrics["strict_vertex_count"] = int(vertex_count)
         metrics["quad_epsilon_ratio"] = float(selected_epsilon)
-        # 即使候选随后因矩形度被拒绝，也保留分数最高的一组指标，便于现场区分
-        # “已经得到四角但矩形度不足”和“从未得到四角”。
+        metrics["used_threshold"] = float(threshold)
         if confidence > diagnostic_best_confidence:
             diagnostics["best_candidate"] = dict(metrics)
             diagnostic_best_confidence = float(confidence)
-        if rectangularity < float(merged_config["paper_min_rectangularity"]):
+        if rectangularity < float(config["paper_min_rectangularity"]):
             diagnostics["rectangularity_reject_count"] += 1
             continue
         diagnostics["eligible_count"] += 1
         if confidence > best_confidence:
             best_quad = quad
             best_confidence = confidence
+
+    return best_quad, float(best_confidence), diagnostics
+
+
+def locate_black_paper(frame_bgr, config=None):
+    """在整帧中定位最符合黑色A4纸的四边形候选。
+
+    主要流程：校验配置，使用反向Otsu取得基准阈值，再调用严格候选路径执行旧面积、
+    四角、矩形度和置信度验收。后续多阈值恢复会在严格失败后接入，不改变严格成功
+    行为。关键参数config可覆盖DEFAULT_CONFIG中的``paper_*``参数。
+    返回值：成功时返回 PaperLocation 四角与置信度；失败时返回不含四角的失败对象。
+    """
+    _validate_frame(frame_bgr)
+    merged_config = dict(DEFAULT_CONFIG)
+    if config:
+        merged_config.update(config)
+
+    close_kernel_size = int(merged_config["paper_close_kernel"])
+    if close_kernel_size <= 0 or close_kernel_size % 2 == 0:
+        raise ValueError("paper_close_kernel 必须是正奇数")
+    epsilon_ratios = _validate_paper_quad_epsilon_ratios(
+        merged_config["paper_quad_epsilon_ratios"]
+    )
+    # 即使本阶段尚未使用宽松结果，也必须在处理图像前验证全部现场宏；这样下一阶段
+    # 接入多阈值时不会改变非法配置的失败时机。
+    _validate_auto_roi_recovery_config(merged_config)
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    threshold, _ = cv2.threshold(
+        blurred,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    dark_mask = _build_dark_mask(
+        blurred,
+        threshold,
+        close_kernel_size,
+    )
+    best_quad, best_confidence, diagnostics = _search_strict_paper_candidate(
+        gray,
+        dark_mask,
+        threshold,
+        merged_config,
+        epsilon_ratios,
+    )
 
     min_confidence = float(merged_config["paper_min_confidence"])
     if best_quad is None:

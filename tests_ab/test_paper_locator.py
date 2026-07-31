@@ -251,6 +251,53 @@ def test_a_locator_rejects_invalid_paper_quad_epsilon_ratios(epsilon_ratios):
         )
 
 
+@pytest.mark.parametrize(
+    "threshold_offsets",
+    (
+        (),
+        (float("nan"), 0),
+        (-128, 0),
+        (0, 128),
+        "invalid",
+    ),
+)
+def test_a_locator_rejects_invalid_auto_threshold_offsets(threshold_offsets):
+    """多阈值偏移必须非空、有限且位于安全范围，非法宏不能静默运行。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+
+    with pytest.raises(ValueError, match="paper_auto_threshold_offsets"):
+        module.locate_black_paper(
+            make_paper_scene(DEFAULT_PAPER_QUAD),
+            {"paper_auto_threshold_offsets": threshold_offsets},
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_key", "invalid_value"),
+    (
+        ("paper_auto_relaxed_min_area_ratio", 0.0),
+        ("paper_auto_min_area_to_largest", 1.1),
+        ("paper_auto_relaxed_min_rectangularity", -0.1),
+        ("paper_auto_relaxed_min_aspect_score", 1.1),
+        ("paper_auto_relaxed_min_darkness", float("nan")),
+        ("paper_auto_min_edge_support", -0.1),
+        ("paper_auto_min_supported_sides", 5),
+        ("paper_auto_max_contours_per_mask", 0),
+        ("paper_auto_prior_min_iou", 1.1),
+        ("paper_auto_prior_max_shift_ratio", 0.0),
+    ),
+)
+def test_a_locator_rejects_invalid_relaxed_gate_config(config_key, invalid_value):
+    """所有宽松与旧ROI安全门必须在处理图像前完成范围校验。"""
+    module = importlib.import_module("maixcam2_app_A_quad.paper_locator")
+
+    with pytest.raises(ValueError, match=config_key):
+        module.locate_black_paper(
+            make_paper_scene(DEFAULT_PAPER_QUAD),
+            {config_key: invalid_value},
+        )
+
+
 def test_locator_variants_return_equivalent_results():
     """验证A/B共享定位算法对同一帧给出等价角点、阈值和置信度。"""
     scene = make_scene_with_piece_count(DEFAULT_PAPER_QUAD, 4, add_dark_rod=True)
