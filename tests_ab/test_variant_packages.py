@@ -172,3 +172,17 @@ def test_package_script_exposes_two_explicit_release_specs():
         "maixcam2_app_A_quad",
         "maixcam2_app_B_warp",
     }
+
+
+def test_package_script_release_file_order_matches_each_manifest():
+    """打包白名单顺序必须与各变体app.yaml完全一致。
+
+    ZIP按白名单顺序写入；集合相同但顺序漂移会让正式打包命令在发布阶段失败，因此
+    这里直接复用脚本的manifest解析函数，防止只靠运行打包命令才发现配置失配。
+    """
+    module_globals = runpy.run_path(str(PROJECT_ROOT / "tools" / "package_variants.py"))
+    read_manifest_files = module_globals["_read_manifest_files"]
+
+    for package_name, spec in module_globals["RELEASE_SPECS"].items():
+        manifest_files = read_manifest_files(PROJECT_ROOT / package_name / "app.yaml")
+        assert tuple(spec["files"]) == manifest_files

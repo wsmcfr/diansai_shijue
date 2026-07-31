@@ -13,7 +13,6 @@ RELEASE_SPECS = {
         "files": (
             "__init__.py",
             "A版实机调试手册.md",
-            "MaixCAM2与STM32F4串口协议说明.md",
             "app.yaml",
             "assembly_planner.py",
             "calibration_ui.py",
@@ -21,6 +20,7 @@ RELEASE_SPECS = {
             "four_piece_solver.py",
             "four_piece_vision.py",
             "main.py",
+            "MaixCAM2与STM32F4串口协议说明.md",
             "paper_locator.py",
             "puzzle_vision.py",
             "serial_protocol.py",

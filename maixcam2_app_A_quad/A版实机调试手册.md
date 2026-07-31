@@ -444,7 +444,7 @@ v2.0.1继续使用v1.9.2的三层WHITE求解器，不修改三片和四片算法
 
 | 日志事件 | 关键字段 | 如何判断 |
 |---|---|---|
-| `[ROI] AUTO` | `result`、`gates`、`confidence`、`threshold`、`quad_vertices`、`strict_vertices`、`quad_eps`、`edges_px` | `quad_eps=0.020`表示严格四角；0.025～0.050表示5/6角经自适应简化后仍通过全部旧门；失败时按gates定位面积、四角、矩形度或置信度 |
+| `[ROI] AUTO` | `result`、`source`、`gates`、`confidence`、`threshold`、`used_threshold`、`area_to_largest`、`edge_support`、`edge_sides`、`prior_iou`、`quad_eps`、`edges_px` | `STRICT`表示旧严格路径；`TH_SCAN`表示多阈值恢复；`PRIOR_EDGE`表示旧蓝框附近边缘修正。成功仍须核对蓝框四边，失败时按gates定位 |
 | `[SOLVER] SNAPSHOT` | `mode`、`profile`、`count`、两个填充门 | 确认本次锁定材料模式和片数正确 |
 | `[SOLVER] PIECE` | `center_mm`、`vertices_mm`、`edges_mm` | 核对毫米映射、错误角点、过短边和粘连轮廓 |
 | `[SOLVER] CLEAN` | `vertices=A→B`、`removed`、`min_edge`、`cleaned_min` | 只说明WHITE图快路径清理了几个伪角；B不得小于3，当前清理阈值为8mm，以文件顶部宏为准 |
@@ -464,6 +464,40 @@ PAPER_QUAD_EPSILON_RATIOS = (0.020, 0.025, 0.030, 0.035, 0.040, 0.050)
 因此这不是无条件把任意5/6角物体改成A4。现场调整必须保持正数、严格递增且不超过
 0.10；通常不要扩大0.050上限。`strict_vertices=5/6 quad_eps=0.030 result=OK`表示
 额外角已被正确消除；若仍为`result=FAIL`，继续根据`quad_vertices`和`gates`处理。
+
+严格路径失败后，AUTO会以Otsu阈值为中心扫描有限灰度偏移：
+
+```python
+PAPER_AUTO_THRESHOLD_OFFSETS = (-24, -12, 0, 12, 24)
+PAPER_AUTO_RELAXED_MIN_AREA_RATIO = 0.08
+PAPER_AUTO_MIN_AREA_TO_LARGEST = 0.55
+PAPER_AUTO_RELAXED_MIN_RECTANGULARITY = 0.35
+PAPER_AUTO_RELAXED_MIN_ASPECT_SCORE = 0.70
+PAPER_AUTO_RELAXED_MIN_DARKNESS = 0.42
+PAPER_AUTO_MIN_EDGE_SUPPORT = 0.55
+PAPER_AUTO_MIN_SUPPORTED_SIDES = 3
+```
+
+正偏移用于补回受反光影响而偏亮的黑纸，负偏移用于断开黑纸与阴影或龙门架暗区。
+宽松候选必须同时满足绝对面积、相对本帧最大暗区面积、A4比例、内部暗度以及至少
+三条真实纸边。不能只降低`PAPER_AUTO_RELAXED_MIN_RECTANGULARITY`；否则小黑框和
+龙门架轮廓可能重新通过。`area_to_largest`低于0.55时优先检查是否锁到了小物体；
+`edge_sides<3`表示候选四边多数没有实际图像边缘。
+
+相机和纸张位置固定且已有旧蓝框时，多阈值仍失败才进入`PRIOR_EDGE`。程序只在旧
+四边附近小范围寻找当前帧边缘，并要求`prior_iou>=0.55`；没有当前图像证据时仍返回
+`AUTO ROI FAIL`，不会直接复用历史角点。失败继续保留旧ROI，用户可以重试或手动
+微调。三种成功日志的判读如下：
+
+| `source` | 含义 | 现场重点 |
+|---|---|---|
+| `STRICT` | 当前Otsu和旧硬门直接成功 | `quad_eps`应优先为0.020，蓝框四边贴纸边 |
+| `TH_SCAN` | 亮度不均或暗区粘连由其它阈值恢复 | 核对`used_threshold`、`area_to_largest`和`edge_sides` |
+| `PRIOR_EDGE` | 在上次蓝框附近重新找到当前四边 | 核对`prior_iou`和四角没有被碎片边缘拉偏 |
+
+新增拒绝门含义：`RELAX_AREA`表示候选过小或远小于主暗区；`RELAX_RECT`表示宽松
+矩形度仍不足；`RELAX_ASPECT`表示A4比例不符；`RELAX_DARK`表示候选内部不够暗；
+`EDGE_LOW`表示真实纸边不足；`PRIOR_MISMATCH`表示旧ROI附近没有一致的当前候选。
 
 排查时把同一次锁定从`SNAPSHOT`到`RESULT`的完整日志保存到电脑。`PIECE`毫米尺寸正确但`GRAPH fill_reject`集中在86%～92%之间，才是调整容错门的典型场景；毫米尺寸本身错误时，先重做AUTO ROI和五点RECT。
 
@@ -652,7 +686,7 @@ motor_y = work_height - (paper_y - work_y)
 |---|---|---|
 | `PRESS START` | 正常页完全待机，不执行碎片分析 | 选择模式和材料后点击START；若要重拍也点击START |
 | `AUTO ROI OK H/V xx%` | 本次找到A4四角并给出横/竖方向 | 先核对H/V是否符合实物，再看蓝框是否贴纸边；置信度不是唯一标准 |
-| `AUTO ROI FAIL` | 本次没有可靠A4候选 | 四角遮挡、反光、纸边出画、背景有大黑矩形；旧ROI仍保留 |
+| `AUTO ROI FAIL` | 严格、多阈值和可选旧ROI边缘路径都没有可靠A4候选 | 根据电脑日志的`RELAX_*`、`EDGE_LOW`和`PRIOR_MISMATCH`处理；旧ROI仍保留 |
 | `WORK LIMIT` | X/Y/W/H/SPLIT已到合法边界 | 切换参数或反方向调整 |
 | `ROI NEEDS 1-4 COMPLETE` | 当前不满足ROI锁定门槛 | 保证1～4片完整且无EDGE/LARGE |
 | `ROI LOCKED` | 纸张和机械区域已保存 | 继续保存ADV参数并重启复查 |
